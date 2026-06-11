@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>tt-trading-mcp</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen" x-data="app()">
+
+  <!-- Header -->
+  <header class="border-b border-gray-800 px-6 py-4 flex items-center justify-between">
+    <div>
+      <h1 class="text-lg font-semibold tracking-tight">tt-trading-mcp</h1>
+      <p class="text-xs text-gray-500 mt-0.5">Stock watchlist manager</p>
+    </div>
+    <div class="flex items-center gap-3">
+      <span class="text-xs text-gray-500">
+        {{ status.ohlcv_tickers }} tickers &middot; data up to
+        <span class="text-gray-300">{{ status.ohlcv_latest }}</span>
+      </span>
+      <button @click="triggerUpdate()"
+        class="text-xs px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 transition disabled:opacity-40"
+        :disabled="updating">
+        <span x-show="!updating">&#8635; Update Data</span>
+        <span x-show="updating">Updating&hellip;</span>
+      </button>
+    </div>
+  </header>
+
+  <div class="max-w-5xl mx-auto px-6 py-8 space-y-8">
+
+    <!-- Add ticker -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      <h2 class="text-sm font-medium text-gray-300 mb-3">Add Ticker</h2>
+      <div class="flex gap-2">
+        <input x-model="newTicker"
+          @keydown.enter="addTicker()"
+          type="text" placeholder="e.g. AAPL"
+          class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500 uppercase placeholder-gray-600"
+          :disabled="adding">
+        <button @click="addTicker()"
+          class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-medium transition disabled:opacity-40"
+          :disabled="adding || !newTicker.trim()">
+          <span x-show="!adding">Add</span>
+          <span x-show="adding">Adding&hellip;</span>
+        </button>
+      </div>
+      <p x-show="addMsg" x-text="addMsg"
+        :class="addOk ? 'text-green-400' : 'text-red-400'"
+        class="mt-2 text-xs"></p>
+    </div>
+
+    <!-- Sector filter -->
+    <div class="flex items-center gap-2 flex-wrap">
+      <span class="text-xs text-gray-500">Sector:</span>
+      <a href="/"
+        class="text-xs px-2.5 py-1 rounded-full transition {{ 'bg-indigo-600 text-white' if not selected else 'bg-gray-800 text-gray-400 hover:bg-gray-700' }}">
+        All
+      </a>
+      {% for s in sectors %}
+      <a href="/?sector={{ s | urlencode }}"
+        class="text-xs px-2.5 py-1 rounded-full transition {{ 'bg-indigo-600 text-white' if selected == s else 'bg-gray-800 text-gray-400 hover:bg-gray-700' }}">
+        {{ s }}
+      </a>
+      {% endfor %}
+    </div>
+
+    <!-- Watchlist table -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+      {% if watchlist %}
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="border-b border-gray-800 text-xs text-gray-500">
+            <th class="text-left px-4 py-3 font-medium">Ticker</th>
+            <th class="text-left px-4 py-3 font-medium">Company</th>
+            <th class="text-left px-4 py-3 font-medium">Sector</th>
+            <th class="text-right px-4 py-3 font-medium">Price</th>
+            <th class="text-right px-4 py-3 font-medium">RSI</th>
+            <th class="text-right px-4 py-3 font-medium">1D%</th>
+            <th class="px-4 py-3"></th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-800">
+          {% for t in watchlist %}
+          <tr class="hover:bg-gray-800/50 transition">
+            <td class="px-4 py-3 font-semibold text-white">{{ t.ticker }}</td>
+            <td class="px-4 py-3 text-gray-400 max-w-[180px] truncate">{{ t.company_name or '—' }}</td>
+            <td class="px-4 py-3">
+              {% if t.sector %}
+              <span class="text-xs px-2 py-0.5 rounded-full bg-gray-800 text-gray-400">{{ t.sector }}</span>
+              {% else %}
+              <span class="text-gray-600">—</span>
+              {% endif %}
+            </td>
+            <td class="px-4 py-3 text-right font-mono">
+              {% if t.close %}${{ "%.2f" | format(t.close) }}{% else %}—{% endif %}
+            </td>
+            <td class="px-4 py-3 text-right font-mono">
+              {% if t.rsi_14 %}
+              <span class="{% if t.rsi_14 > 70 %}text-red-400{% elif t.rsi_14 < 30 %}text-green-400{% else %}text-gray-300{% endif %}">
+                {{ "%.1f" | format(t.rsi_14) }}
+              </span>
+              {% else %}—{% endif %}
+            </td>
+            <td class="px-4 py-3 text-right font-mono">
+              {% if t.pct_chg is not none %}
+              <span class="{{ 'text-green-400' if t.pct_chg >= 0 else 'text-red-400' }}">
+                {% if t.pct_chg >= 0 %}+{% endif %}{{ "%.2f" | format(t.pct_chg) }}%
+              </span>
+              {% else %}—{% endif %}
+            </td>
+            <td class="px-4 py-3 text-right">
+              <button @click="removeTicker('{{ t.ticker }}')"
+                class="text-xs text-gray-600 hover:text-red-400 transition px-2 py-1 rounded hover:bg-gray-800">
+                Remove
+              </button>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <div class="text-center py-16 text-gray-600">
+        <p class="text-4xl mb-3">&#128331;</p>
+        <p class="text-sm">No tickers yet. Add one above.</p>
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- DB Stats -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div class="bg-gray-900 border border-gray-800 rounded-lg px-4 py-3">
+        <p class="text-xs text-gray-500">Watchlist</p>
+        <p class="text-sm font-semibold mt-0.5">{{ status.tickers }} tickers</p>
+      </div>
+      <div class="bg-gray-900 border border-gray-800 rounded-lg px-4 py-3">
+        <p class="text-xs text-gray-500">OHLCV rows</p>
+        <p class="text-sm font-semibold mt-0.5">{{ "{:,}".format(status.ohlcv_rows) }}</p>
+      </div>
+      <div class="bg-gray-900 border border-gray-800 rounded-lg px-4 py-3">
+        <p class="text-xs text-gray-500">News articles</p>
+        <p class="text-sm font-semibold mt-0.5">{{ "{:,}".format(status.news_count) }}</p>
+      </div>
+      <div class="bg-gray-900 border border-gray-800 rounded-lg px-4 py-3">
+        <p class="text-xs text-gray-500">Latest news</p>
+        <p class="text-sm font-semibold mt-0.5">{{ status.news_latest }}</p>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Toast -->
+  <div x-show="toast" x-transition
+    class="fixed bottom-6 right-6 bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm shadow-xl"
+    x-text="toast"></div>
+
+  <script>
+    function app() {
+      return {
+        newTicker: '',
+        adding: false,
+        addMsg: '',
+        addOk: false,
+        updating: false,
+        toast: '',
+
+        showToast(msg) {
+          this.toast = msg
+          setTimeout(() => this.toast = '', 3000)
+        },
+
+        async addTicker() {
+          const t = this.newTicker.trim().toUpperCase()
+          if (!t) return
+          this.adding = true
+          this.addMsg = ''
+          try {
+            const fd = new FormData()
+            fd.append('ticker', t)
+            const res = await fetch('/ticker/add', { method: 'POST', body: fd })
+            const data = await res.json()
+            if (data.ok) {
+              this.addOk = true
+              this.addMsg = '✓ Added ' + data.ticker + ' — ' + data.name + ' (' + (data.sector || 'no sector') + ')'
+              this.newTicker = ''
+              setTimeout(() => location.reload(), 1000)
+            } else {
+              this.addOk = false
+              this.addMsg = '✗ ' + data.error
+            }
+          } catch(e) {
+            this.addOk = false
+            this.addMsg = '✗ Network error'
+          }
+          this.adding = false
+        },
+
+        async removeTicker(ticker) {
+          if (!confirm('Remove ' + ticker + ' from watchlist?')) return
+          const fd = new FormData()
+          fd.append('ticker', ticker)
+          await fetch('/ticker/remove', { method: 'POST', body: fd })
+          location.reload()
+        },
+
+        async triggerUpdate() {
+          this.updating = true
+          try {
+            const res = await fetch('/update', { method: 'POST' })
+            const data = await res.json()
+            this.showToast(data.ok ? '↻ Update started in background' : '✗ ' + data.error)
+          } catch(e) {
+            this.showToast('✗ Network error')
+          }
+          setTimeout(() => this.updating = false, 3000)
+        }
+      }
+    }
+  </script>
+</body>
+</html>

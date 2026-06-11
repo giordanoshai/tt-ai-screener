@@ -1,0 +1,6 @@
+.env
+*.duckdb
+.venv/
+__pycache__/
+*.pyc
+logs/
