@@ -1,32 +1,15 @@
 """
-First-time data fetch: OHLCV (yfinance) + Fundamentals & News (Finnhub)
+First-time data fetch using provider abstraction.
 Designed to run once during setup. Progress is printed to console.
 """
-
-import time
-import json
-import requests
-from datetime import datetime, timedelta, date
+from datetime import datetime, date
 
 import pandas as pd
 import pandas_ta as ta
-import yfinance as yf
-import duckdb
 
-from config import DB_PATH, FINNHUB_KEY, NEWS_DAYS
+from config import DB_PATH, FINNHUB_KEY, NEWS_DAYS, OHLCV_BATCH_SIZE
 from db.init import get_conn
-
-FINNHUB_BASE = "https://finnhub.io/api/v1"
-RATE_LIMIT_SLEEP = 1.1  # seconds between Finnhub calls (max 60/min)
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _finnhub(path: str, params: dict) -> dict | list:
-    params["token"] = FINNHUB_KEY
-    r = requests.get(f"{FINNHUB_BASE}{path}", params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()
+from data_sources.registry import ProviderRegistry
 
 
 def _calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -49,193 +32,141 @@ def _calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ── OHLCV ─────────────────────────────────────────────────────────────────────
+OHLCV_COLS = [
+    "ticker","date","open","high","low","close","volume",
+    "ma_20","ma_50","ma_200","vol_ma_20","rsi_14","atr_14",
+    "dist_ma20_pct","dist_ma50_pct","high_20","high_55",
+    "vol_ratio","atr_pct","pct_chg",
+]
 
-def fetch_ohlcv(tickers: list[str], years: int = 2):
-    print(f"\n[OHLCV] Fetching {len(tickers)} tickers ({years}y history) via yfinance...")
+
+def fetch_ohlcv(tickers: list[str]):
+    print(f"\n[OHLCV] Fetching {len(tickers)} tickers via providers...")
+    registry = ProviderRegistry()
     con = get_conn()
 
-    for i, ticker in enumerate(tickers, 1):
+    for i in range(0, len(tickers), OHLCV_BATCH_SIZE):
+        batch = tickers[i:i + OHLCV_BATCH_SIZE]
+        batch_num = i // OHLCV_BATCH_SIZE + 1
+        print(f"  Batch {batch_num}: {len(batch)} tickers...")
+
         try:
-            raw = yf.download(ticker, period=f"{years}y", auto_adjust=True, progress=False)
+            provider = registry.get_ohlcv_provider("US")
+            raw = provider.fetch_ohlcv(batch)
             if raw.empty:
-                print(f"  [{i}/{len(tickers)}] {ticker}: no data")
+                print(f"  Batch {batch_num}: no data")
                 continue
 
-            df = raw.reset_index()
-            # yfinance returns MultiIndex columns like ('Close', 'AAPL') — flatten them
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [c[0].lower() for c in df.columns]
-            else:
-                df.columns = [c.lower() for c in df.columns]
-            df["ticker"] = ticker
-            df["volume"] = df["volume"].astype("int64")
-
-            df = _calc_indicators(df)
-            df = df.dropna(subset=["ma_20"])
-
-            cols = ["ticker","date","open","high","low","close","volume",
-                    "ma_20","ma_50","ma_200","vol_ma_20","rsi_14","atr_14",
-                    "dist_ma20_pct","dist_ma50_pct","high_20","high_55",
-                    "vol_ratio","atr_pct","pct_chg"]
-            df = df[cols]
-
-            con.execute("DELETE FROM stock_ohlcv_daily WHERE ticker = ?", [ticker])
-            con.execute("INSERT INTO stock_ohlcv_daily SELECT * FROM df")
-            print(f"  [{i}/{len(tickers)}] {ticker}: {len(df)} rows")
+            for ticker in batch:
+                sub = raw[raw["ticker"] == ticker].copy()
+                if sub.empty:
+                    continue
+                sub = _calc_indicators(sub)
+                sub = sub.dropna(subset=["ma_20"])
+                if sub.empty:
+                    continue
+                sub = sub[OHLCV_COLS]
+                con.execute(f"DELETE FROM stock_ohlcv_daily WHERE ticker = ?", [ticker])
+                con.execute("INSERT INTO stock_ohlcv_daily SELECT * FROM sub")
+                print(f"    {ticker}: {len(sub)} rows")
 
         except Exception as e:
-            print(f"  [{i}/{len(tickers)}] {ticker}: ERROR - {e}")
+            print(f"  Batch {batch_num}: ERROR - {e}")
 
     con.close()
     print("[OHLCV] Done.")
 
-
-# ── Fundamentals ──────────────────────────────────────────────────────────────
 
 def fetch_fundamentals(tickers: list[str]):
     if not FINNHUB_KEY:
         print("[Fundamentals] Skipped — no FINNHUB_KEY")
         return
 
-    print(f"\n[Fundamentals] Fetching {len(tickers)} tickers via Finnhub...")
+    print(f"\n[Fundamentals] Fetching {len(tickers)} tickers via providers...")
+    registry = ProviderRegistry()
     con = get_conn()
 
     for i, ticker in enumerate(tickers, 1):
         try:
-            data = _finnhub("/stock/metric", {"symbol": ticker, "metric": "all"})
-            m = data.get("metric", {})
-            profile = _finnhub("/stock/profile2", {"symbol": ticker})
-            time.sleep(RATE_LIMIT_SLEEP)
-
-            def g(key):
-                v = m.get(key)
-                return float(v) if v is not None else None
-
-            def gp(key):
-                # Finnhub returns growth/margin as percentage (70.68 = 70.68%) → store as decimal (0.7068)
-                v = m.get(key)
-                return float(v) / 100.0 if v is not None else None
-
-            record = {
-                "ticker":               ticker,
-                "pe_ratio":             g("peExclExtraTTM"),
-                "ps_ratio":             g("psTTM"),
-                "pb_ratio":             g("pbQuarterly"),
-                "peg_ratio":            g("pegAnnual"),
-                "market_cap":           g("marketCapitalization"),
-                "revenue_growth_yoy":   gp("revenueGrowthTTMYoy"),
-                "earnings_growth_yoy":  gp("epsGrowthTTMYoy"),
-                "gross_margin":         gp("grossMarginTTM"),
-                "roe":                  g("roeTTM"),
-                "fcf_yield":            g("fcfYieldTTM"),
-                "analyst_rating":       profile.get("finnhubIndustry"),
-                "analyst_target_price": None,
-                "analyst_count":        None,
-                "next_earnings_date":   None,
-                "last_earnings_date":   None,
-                "mspr":                 None,
-                "updated_at":           date.today().isoformat(),
-            }
+            provider = registry.get_fundamentals_provider("US")
+            data = provider.fetch_fundamentals(ticker)
 
             con.execute("""
-                INSERT INTO stock_fundamentals VALUES (
-                    $ticker, $pe_ratio, $ps_ratio, $pb_ratio, $peg_ratio,
-                    $market_cap, $revenue_growth_yoy, $earnings_growth_yoy,
-                    $gross_margin, $roe, $fcf_yield, $analyst_rating,
-                    $analyst_target_price, $analyst_count,
-                    $next_earnings_date, $last_earnings_date,
-                    $mspr, $updated_at
-                )
+                INSERT INTO stock_fundamentals (
+                    ticker, pe_ratio, ps_ratio, pb_ratio, peg_ratio, market_cap,
+                    revenue_growth_yoy, earnings_growth_yoy, gross_margin,
+                    roe, fcf_yield, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (ticker) DO UPDATE SET
-                    pe_ratio = EXCLUDED.pe_ratio,
+                    pe_ratio = EXCLUDED.pe_ratio, ps_ratio = EXCLUDED.ps_ratio,
+                    pb_ratio = EXCLUDED.pb_ratio, peg_ratio = EXCLUDED.peg_ratio,
+                    market_cap = EXCLUDED.market_cap,
                     revenue_growth_yoy = EXCLUDED.revenue_growth_yoy,
                     earnings_growth_yoy = EXCLUDED.earnings_growth_yoy,
                     gross_margin = EXCLUDED.gross_margin,
+                    roe = EXCLUDED.roe, fcf_yield = EXCLUDED.fcf_yield,
                     updated_at = EXCLUDED.updated_at
-            """, record)
+            """, [
+                ticker, data.get("pe_ratio"), data.get("ps_ratio"),
+                data.get("pb_ratio"), data.get("peg_ratio"), data.get("market_cap"),
+                data.get("revenue_growth_yoy"), data.get("earnings_growth_yoy"),
+                data.get("gross_margin"), data.get("roe"), data.get("fcf_yield"),
+                date.today().isoformat(),
+            ])
 
             con.execute("""
-                INSERT INTO stocks_meta VALUES ($ticker, $company_name, $exchange, $sector, $industry)
+                INSERT INTO stocks_meta (ticker, company_name, exchange, sector, industry)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT (ticker) DO UPDATE SET
-                    company_name = EXCLUDED.company_name
-            """, {
-                "ticker":       ticker,
-                "company_name": profile.get("name", ""),
-                "exchange":     profile.get("exchange", ""),
-                "sector":       profile.get("finnhubIndustry", ""),
-                "industry":     profile.get("finnhubIndustry", ""),
-            })
+                    company_name = EXCLUDED.company_name,
+                    sector = EXCLUDED.sector,
+                    industry = EXCLUDED.industry
+            """, [
+                ticker, data.get("company_name", ""), data.get("exchange", ""),
+                data.get("sector", ""), data.get("industry", ""),
+            ])
 
             print(f"  [{i}/{len(tickers)}] {ticker}: OK")
-
         except Exception as e:
             print(f"  [{i}/{len(tickers)}] {ticker}: ERROR - {e}")
-        finally:
-            time.sleep(RATE_LIMIT_SLEEP)
 
     con.close()
     print("[Fundamentals] Done.")
 
-
-# ── News ──────────────────────────────────────────────────────────────────────
 
 def fetch_news(tickers: list[str], days: int = NEWS_DAYS):
     if not FINNHUB_KEY:
         print("[News] Skipped — no FINNHUB_KEY")
         return
 
-    date_to   = date.today().isoformat()
-    date_from = (date.today() - timedelta(days=days)).isoformat()
-    print(f"\n[News] Fetching {len(tickers)} tickers ({date_from} → {date_to})...")
+    print(f"\n[News] Fetching {len(tickers)} tickers ({days} days)...")
+    registry = ProviderRegistry()
     con = get_conn()
 
     for i, ticker in enumerate(tickers, 1):
         try:
-            articles = _finnhub("/company-news", {
-                "symbol": ticker,
-                "from":   date_from,
-                "to":     date_to,
-            })
-            time.sleep(RATE_LIMIT_SLEEP)
-
-            if not isinstance(articles, list):
-                print(f"  [{i}/{len(tickers)}] {ticker}: unexpected response")
-                continue
+            provider = registry.get_news_provider("US")
+            articles = provider.fetch_news(ticker, days=days)
 
             count = 0
             for art in articles:
-                art_id = art.get("id")
-                if not art_id:
-                    continue
-                published = datetime.fromtimestamp(art["datetime"]).isoformat() if art.get("datetime") else None
                 con.execute("""
                     INSERT INTO news (id, ticker, headline, summary, source, url, published_at, sentiment_label)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (id) DO NOTHING
                 """, [
-                    art_id, ticker,
-                    art.get("headline", ""),
-                    art.get("summary", ""),
-                    art.get("source", ""),
-                    art.get("url", ""),
-                    published,
-                    None,
+                    art["id"], ticker, art["headline"], art["summary"],
+                    art["source"], art["url"], art["published_at"], art["sentiment_label"],
                 ])
                 count += 1
 
             print(f"  [{i}/{len(tickers)}] {ticker}: {count} articles")
-
         except Exception as e:
             print(f"  [{i}/{len(tickers)}] {ticker}: ERROR - {e}")
-        finally:
-            time.sleep(RATE_LIMIT_SLEEP)
 
     con.close()
     print("[News] Done.")
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 def fetch_all(tickers: list[str]):
     start = datetime.now()
