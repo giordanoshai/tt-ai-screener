@@ -50,6 +50,19 @@ def _get_sectors():
     return [r[0] for r in rows]
 
 
+def _get_all_sectors():
+    con = get_conn()
+    rows = con.execute("""
+        SELECT sector, COUNT(*) as cnt
+        FROM stocks_meta
+        WHERE sector IS NOT NULL AND sector != ''
+        GROUP BY sector
+        ORDER BY cnt DESC
+    """).fetchall()
+    con.close()
+    return [r[0] for r in rows]
+
+
 def _get_db_status():
     con = get_conn()
     ohlcv  = con.execute("SELECT COUNT(*), COUNT(DISTINCT ticker), MAX(date) FROM stock_ohlcv_daily").fetchone()
@@ -99,6 +112,14 @@ async def index(request: Request, sector: str = ""):
         "sectors":   sectors,
         "selected":  sector,
         "status":    status,
+    })
+
+
+@app.get("/screener", response_class=HTMLResponse)
+async def screener(request: Request):
+    sectors = _get_all_sectors()
+    return templates.TemplateResponse(request, "screener.html", {
+        "sectors": sectors,
     })
 
 

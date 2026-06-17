@@ -10,10 +10,13 @@
 <body class="bg-gray-950 text-gray-100 min-h-screen" x-data="app()">
 
   <!-- Header -->
-  <header class="border-b border-gray-800 px-6 py-4 flex items-center justify-between">
-    <div>
-      <h1 class="text-lg font-semibold tracking-tight">tt-trading-mcp</h1>
-      <p class="text-xs text-gray-500 mt-0.5">Stock watchlist manager</p>
+  <header class="border-b border-gray-800 px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-6">
+      <a href="/" class="text-sm font-semibold tracking-tight text-gray-300 hover:text-white transition">tt-trading-mcp</a>
+      <nav class="flex gap-1">
+        <a href="/" class="text-xs px-3 py-1.5 rounded-md bg-gray-800 text-white">Watchlist</a>
+        <a href="/screener" class="text-xs px-3 py-1.5 rounded-md text-gray-400 hover:text-white hover:bg-gray-800 transition">Screener</a>
+      </nav>
     </div>
     <div class="flex items-center gap-3">
       <span class="text-xs text-gray-500">

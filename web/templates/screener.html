@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Screener — tt-trading-mcp</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .mono { font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code', ui-monospace, monospace; }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    input[type=number] { -moz-appearance: textfield; }
+    .slide-panel { transition: transform 0.25s ease; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen" x-data="screener()" x-cloak>
+
+  <!-- Nav -->
+  <header class="border-b border-gray-800 px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-6">
+      <a href="/" class="text-sm font-semibold tracking-tight text-gray-300 hover:text-white transition">tt-trading-mcp</a>
+      <nav class="flex gap-1">
+        <a href="/" class="text-xs px-3 py-1.5 rounded-md text-gray-400 hover:text-white hover:bg-gray-800 transition">Watchlist</a>
+        <a href="/screener" class="text-xs px-3 py-1.5 rounded-md bg-gray-800 text-white">Screener</a>
+      </nav>
+    </div>
+    <span class="text-xs text-gray-500 mono" x-text="dataDate ? 'Data: ' + dataDate : ''"></span>
+  </header>
+
+  <div class="flex h-[calc(100vh-49px)]">
+
+    <!-- ════ LEFT: Filter Panel ════ -->
+    <aside class="w-72 flex-shrink-0 border-r border-gray-800 overflow-y-auto p-4 space-y-5">
+
+      <!-- Sector -->
+      <div>
+        <h3 class="text-[11px] font-medium text-gray-500 uppercase tracking-wider mb-2">Sector</h3>
+        <div class="flex flex-wrap gap-1.5">
+          {% for s in sectors %}
+          <button
+            @click="toggleSector('{{ s }}')"
+            :class="selectedSectors.includes('{{ s }}')
+              ? 'bg-indigo-600 text-white border-indigo-500'
+              : 'bg-gray-900 text-gray-400 border-gray-700 hover:border-gray-500'"
+            class="text-[11px] px-2 py-1 rounded border transition">
+            {{ s }}
+          </button>
+          {% endfor %}
+        </div>
+      </div>
+
+      <!-- Trend -->
+      <div>
+        <h3 class="text-[11px] font-medium text-gray-500 uppercase tracking-wider mb-2">Trend</h3>
+        <label class="flex items-center gap-2 text-xs text-gray-300 mb-1.5 cursor-pointer">
+          <input type="checkbox" x-model="filters.above_ma200" class="rounded bg-gray-800 border-gray-600 text-indigo-500 focus:ring-0 focus:ring-offset-0">
+          Price &gt; MA200
+        </label>
+        <label class="flex items-center gap-2 text-xs text-gray-300 mb-1.5 cursor-pointer">
+          <input type="checkbox" x-model="filters.above_ma50" class="rounded bg-gray-800 border-gray-600 text-indigo-500 focus:ring-0 focus:ring-offset-0">
+          Price &gt; MA50
+        </label>
+        <label class="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+          <input type="checkbox" x-model="filters.bull_alignment" class="rounded bg-gray-800 border-gray-600 text-indigo-500 focus:ring-0 focus:ring-offset-0">
+          Bull Alignment (MA20&gt;50&gt;200)
+        </label>
+      </div>
+
+      <!-- RSI -->
+      <div>
+        <h3 class="text-[11px] font-medium text-gray-500 uppercase tracking-wider mb-2">RSI (14)</h3>
+        <div class="flex gap-2">
+          <div class="flex-1">
+            <input type="number" x-model.number="filters.rsi_min" placeholder="Min" step="1"
+              class="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mono focus:outline-none focus:border-indigo-500">
+          </div>
+          <span class="text-gray-600 self-center text-xs">–</span>
+          <div class="flex-1">
+            <input type="number" x-model.number="filters.rsi_max" placeholder="Max" step="1"
+              class="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mono focus:outline-none focus:border-indigo-500">
+          </div>
+        </div>
+        <div class="flex gap-1.5 mt-1.5">
+          <button @click="filters.rsi_min=null;filters.rsi_max=30" class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-green-400 hover:bg-gray-700 transition">Oversold &lt;30</button>
+          <button @click="filters.rsi_min=40;filters.rsi_max=60" class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 hover:bg-gray-700 transition">Neutral</button>
+          <button @click="filters.rsi_min=70;filters.rsi_max=null" class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-red-400 hover:bg-gray-700 transition">Overbought &gt;70</button>
+        </div>
+      </div>
+
+      <!-- Dist MA20 -->
+      <div>
+        <h3 class="text-[11px] font-medium text-gray-500 uppercase tracking-wider mb-2">Distance from MA20 (%)</h3>
+        <div class="flex gap-2">
+          <input type="number" x-model.number="filters.dist_ma20_min" placeholder="Min %" step="0.5"
+            class="flex-1 bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mono focus:outline-none focus:border-indigo-500">
+          <span class="text-gray-600 self-center text-xs">–</span>
+          <input type="number" x-model.number="filters.dist_ma20_max" placeholder="Max %" step="0.5"
+            class="flex-1 bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mono focus:outline-none focus:border-indigo-500">
+        </div>
+        <div class="flex gap-1.5 mt-1.5">
+          <button @click="filters.dist_ma20_min=-5;filters.dist_ma20_max=0" class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-green-400 hover:bg-gray-700 transition">Pullback -5~0%</button>
+          <button @click="filters.dist_ma20_min=0;filters.dist_ma20_max=5" class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 hover:bg-gray-700 transition">Breakout 0~5%</button>
+        </div>
+      </div>
+
+      <!-- Volume & Volatility -->
+      <div>
+        <h3 class="text-[11px] font-medium text-gray-500 uppercase tracking-wider mb-2">Volume & Volatility</h3>
+        <div class="space-y-2">
+          <div>
+            <label class="text-[11px] text-gray-500">Min Vol Ratio</label>
+            <input type="number" x-model.number="filters.vol_ratio_min" placeholder="e.g. 1.5" step="0.1"
+              class="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mono focus:outline-none focus:border-indigo-500">
+          </div>
+          <div>
+            <label class="text-[11px] text-gray-500">Min ATR%</label>
+            <input type="number" x-model.number="filters.atr_pct_min" placeholder="e.g. 2.0" step="0.1"
+              class="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mono focus:outline-none focus:border-indigo-500">
+          </div>
+          <label class="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+            <input type="checkbox" x-model="filters.near_20d_high" class="rounded bg-gray-800 border-gray-600 text-indigo-500 focus:ring-0 focus:ring-offset-0">
+            Near 20-day High (&ge;95%)
+          </label>
+        </div>
+      </div>
+
+      <!-- Price Change -->
+      <div>
+        <h3 class="text-[11px] font-medium text-gray-500 uppercase tracking-wider mb-2">1D Price Change (%)</h3>
+        <div class="flex gap-2">
+          <input type="number" x-model.number="filters.pct_chg_min" placeholder="Min %" step="0.5"
+            class="flex-1 bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mono focus:outline-none focus:border-indigo-500">
+          <span class="text-gray-600 self-center text-xs">–</span>
+          <input type="number" x-model.number="filters.pct_chg_max" placeholder="Max %" step="0.5"
+            class="flex-1 bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs mono focus:outline-none focus:border-indigo-500">
+        </div>
+      </div>
+
+      <!-- Tier -->
+      <div>
+        <h3 class="text-[11px] font-medium text-gray-500 uppercase tracking-wider mb-2">Tier</h3>
+        <select x-model="filters.tier"
+          class="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs focus:outline-none focus:border-indigo-500">
+          <option value="all">All</option>
+          <option value="core">Core (Watchlist)</option>
+          <option value="universe">Universe</option>
+        </select>
+      </div>
+
+      <!-- Limit -->
+      <div>
+        <h3 class="text-[11px] font-medium text-gray-500 uppercase tracking-wider mb-2">Results Limit</h3>
+        <select x-model.number="filters.limit"
+          class="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs focus:outline-none focus:border-indigo-500">
+          <option value="25">25</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+          <option value="200">200</option>
+        </select>
+      </div>
+
+      <!-- Actions -->
+      <div class="pt-2 space-y-2">
+        <button @click="runScreen()"
+          class="w-full py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-sm font-medium transition disabled:opacity-40"
+          :disabled="loading">
+          <span x-show="!loading">Search</span>
+          <span x-show="loading">Searching...</span>
+        </button>
+        <button @click="resetFilters()"
+          class="w-full py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-xs text-gray-400 transition">
+          Reset Filters
+        </button>
+      </div>
+    </aside>
+
+    <!-- ════ MAIN: Results ════ -->
+    <main class="flex-1 overflow-y-auto">
+
+      <!-- Results header -->
+      <div class="px-5 py-3 border-b border-gray-800 flex items-center justify-between bg-gray-950/80 sticky top-0 z-10 backdrop-blur-sm">
+        <div class="flex items-center gap-3">
+          <h2 class="text-sm font-medium text-gray-200">Results</h2>
+          <span x-show="results.length" class="text-xs text-gray-500 mono" x-text="results.length + ' stocks'"></span>
+          <template x-if="activeSectorCount > 0">
+            <span class="text-xs text-indigo-400" x-text="activeSectorCount + ' sector' + (activeSectorCount > 1 ? 's' : '')"></span>
+          </template>
+        </div>
+        <div class="flex items-center gap-4">
+          <template x-if="activeFilterCount > 0">
+            <span class="text-[11px] text-gray-500" x-text="activeFilterCount + ' filter' + (activeFilterCount > 1 ? 's' : '') + ' active'"></span>
+          </template>
+          <button x-show="results.length" @click="exportCSV()"
+            class="text-[11px] text-gray-500 hover:text-gray-300 transition">Export CSV</button>
+        </div>
+      </div>
+
+      <!-- Empty state -->
+      <div x-show="!results.length && !loading" class="flex flex-col items-center justify-center h-96 text-gray-600">
+        <svg class="w-12 h-12 mb-3 text-gray-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+        </svg>
+        <p class="text-sm">Set your filters and click Search</p>
+      </div>
+
+      <!-- Results table -->
+      <div x-show="results.length" class="overflow-x-auto">
+        <table class="w-full text-xs">
+          <thead>
+            <tr class="border-b border-gray-800 text-[11px] text-gray-500 uppercase tracking-wider">
+              <th class="text-left pl-5 pr-2 py-2.5 font-medium cursor-pointer hover:text-gray-300" @click="sortBy('ticker')">
+                Ticker <span x-show="sortCol==='ticker'" x-text="sortDir==='asc'?'▲':'▼'" class="text-indigo-400"></span>
+              </th>
+              <th class="text-left px-2 py-2.5 font-medium">Company</th>
+              <th class="text-left px-2 py-2.5 font-medium cursor-pointer hover:text-gray-300" @click="sortBy('sector')">
+                Sector <span x-show="sortCol==='sector'" x-text="sortDir==='asc'?'▲':'▼'" class="text-indigo-400"></span>
+              </th>
+              <th class="text-right px-2 py-2.5 font-medium cursor-pointer hover:text-gray-300" @click="sortBy('close')">
+                Price <span x-show="sortCol==='close'" x-text="sortDir==='asc'?'▲':'▼'" class="text-indigo-400"></span>
+              </th>
+              <th class="text-right px-2 py-2.5 font-medium cursor-pointer hover:text-gray-300" @click="sortBy('pct_chg')">
+                Chg% <span x-show="sortCol==='pct_chg'" x-text="sortDir==='asc'?'▲':'▼'" class="text-indigo-400"></span>
+              </th>
+              <th class="text-right px-2 py-2.5 font-medium cursor-pointer hover:text-gray-300" @click="sortBy('rsi_14')">
+                RSI <span x-show="sortCol==='rsi_14'" x-text="sortDir==='asc'?'▲':'▼'" class="text-indigo-400"></span>
+              </th>
+              <th class="text-right px-2 py-2.5 font-medium cursor-pointer hover:text-gray-300" @click="sortBy('vol_ratio')">
+                Vol <span x-show="sortCol==='vol_ratio'" x-text="sortDir==='asc'?'▲':'▼'" class="text-indigo-400"></span>
+              </th>
+              <th class="text-right pr-5 pl-2 py-2.5 font-medium cursor-pointer hover:text-gray-300" @click="sortBy('dist_ma20_pct')">
+                MA20% <span x-show="sortCol==='dist_ma20_pct'" x-text="sortDir==='asc'?'▲':'▼'" class="text-indigo-400"></span>
+              </th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-gray-800/50">
+            <template x-for="r in sortedResults" :key="r.ticker">
+              <tr class="hover:bg-gray-800/40 transition cursor-pointer"
+                  @click="openDetail(r.ticker)"
+                  :class="selectedTicker === r.ticker ? 'bg-gray-800/60' : ''">
+                <td class="pl-5 pr-2 py-2.5 font-semibold text-white mono">
+                  <span x-text="r.ticker"></span>
+                  <span x-show="r.is_core" class="ml-1 text-[9px] text-indigo-400 font-normal">CORE</span>
+                </td>
+                <td class="px-2 py-2.5 text-gray-400 max-w-[180px] truncate" x-text="r.company_name || '—'"></td>
+                <td class="px-2 py-2.5">
+                  <span x-show="r.sector" class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-400" x-text="r.sector"></span>
+                  <span x-show="!r.sector" class="text-gray-600">—</span>
+                </td>
+                <td class="px-2 py-2.5 text-right mono text-gray-200" x-text="r.close != null ? '$' + r.close.toFixed(2) : '—'"></td>
+                <td class="px-2 py-2.5 text-right mono"
+                    :class="r.pct_chg >= 0 ? 'text-green-400' : 'text-red-400'">
+                  <span x-text="r.pct_chg != null ? (r.pct_chg >= 0 ? '+' : '') + r.pct_chg.toFixed(2) + '%' : '—'"></span>
+                </td>
+                <td class="px-2 py-2.5 text-right mono"
+                    :class="r.rsi_14 > 70 ? 'text-red-400' : r.rsi_14 < 30 ? 'text-green-400' : 'text-gray-300'">
+                  <span x-text="r.rsi_14 != null ? r.rsi_14.toFixed(1) : '—'"></span>
+                </td>
+                <td class="px-2 py-2.5 text-right mono"
+                    :class="r.vol_ratio > 2 ? 'text-amber-400' : 'text-gray-400'">
+                  <span x-text="r.vol_ratio != null ? r.vol_ratio.toFixed(2) + 'x' : '—'"></span>
+                </td>
+                <td class="pr-5 pl-2 py-2.5 text-right mono"
+                    :class="r.dist_ma20_pct > 0 ? 'text-green-400' : r.dist_ma20_pct < -3 ? 'text-red-400' : 'text-gray-400'">
+                  <span x-text="r.dist_ma20_pct != null ? (r.dist_ma20_pct >= 0 ? '+' : '') + r.dist_ma20_pct.toFixed(1) + '%' : '—'"></span>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </main>
+
+    <!-- ════ RIGHT: Detail Panel ════ -->
+    <aside
+      class="slide-panel w-80 flex-shrink-0 border-l border-gray-800 overflow-y-auto bg-gray-950"
+      :class="detailOpen ? 'translate-x-0' : 'translate-x-full hidden'"
+      x-show="detailOpen" x-transition>
+
+      <!-- Detail header -->
+      <div class="sticky top-0 bg-gray-950 border-b border-gray-800 px-4 py-3 flex items-center justify-between z-10">
+        <div>
+          <h3 class="text-sm font-semibold mono" x-text="detail?.ticker || ''"></h3>
+          <p class="text-[11px] text-gray-500 mt-0.5" x-text="detail?.company_name || ''"></p>
+        </div>
+        <button @click="detailOpen = false" class="text-gray-500 hover:text-white p-1 rounded hover:bg-gray-800 transition">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="p-4 space-y-4">
+
+        <!-- Meta -->
+        <div x-show="detail?.sector" class="flex gap-2 flex-wrap">
+          <span class="text-[10px] px-2 py-0.5 rounded-full bg-gray-800 text-gray-400" x-text="detail?.sector"></span>
+          <span x-show="detail?.industry" class="text-[10px] px-2 py-0.5 rounded-full bg-gray-800 text-gray-400" x-text="detail?.industry"></span>
+        </div>
+
+        <!-- Loading -->
+        <div x-show="detailLoading" class="py-8 text-center text-gray-600 text-xs">Loading...</div>
+
+        <!-- Fundamentals -->
+        <div x-show="!detailLoading && detail?.fundamentals">
+          <h4 class="text-[11px] font-medium text-gray-500 uppercase tracking-wider mb-2">Fundamentals</h4>
+          <div class="grid grid-cols-2 gap-1.5">
+            <template x-for="[label, key] in fundFields" :key="key">
+              <div class="bg-gray-900 rounded px-2.5 py-2 border border-gray-800/50">
+                <p class="text-[10px] text-gray-500" x-text="label"></p>
+                <p class="text-xs mono mt-0.5" x-text="formatFund(detail?.fundamentals?.[key])"></p>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <div x-show="!detailLoading && !detail?.fundamentals" class="text-xs text-gray-600 py-2">
+          No fundamentals data
+        </div>
+
+        <!-- News -->
+        <div x-show="!detailLoading">
+          <h4 class="text-[11px] font-medium text-gray-500 uppercase tracking-wider mb-2">
+            News
+            <span x-show="detail?.news?.length" class="text-gray-600 normal-case" x-text="'(' + detail.news.length + ')'"></span>
+          </h4>
+          <div x-show="detail?.news?.length" class="space-y-2">
+            <template x-for="(n, i) in detail?.news || []" :key="i">
+              <div class="bg-gray-900 border border-gray-800/50 rounded px-3 py-2.5">
+                <p class="text-xs text-gray-200 leading-relaxed" x-text="n.headline"></p>
+                <div class="flex items-center gap-2 mt-1.5">
+                  <span class="text-[10px] text-gray-500" x-text="n.source"></span>
+                  <span class="text-[10px] text-gray-600" x-text="formatDate(n.published_at)"></span>
+                  <span x-show="n.sentiment_label"
+                    class="text-[10px] px-1.5 py-0.5 rounded"
+                    :class="n.sentiment_label === 'positive' ? 'bg-green-900/30 text-green-400'
+                          : n.sentiment_label === 'negative' ? 'bg-red-900/30 text-red-400'
+                          : 'bg-gray-800 text-gray-400'"
+                    x-text="n.sentiment_label"></span>
+                </div>
+              </div>
+            </template>
+          </div>
+          <p x-show="!detail?.news?.length" class="text-xs text-gray-600">No recent news</p>
+        </div>
+      </div>
+    </aside>
+
+  </div>
+
+  <script>
+    function screener() {
+      return {
+        // State
+        selectedSectors: [],
+        filters: {
+          above_ma200: false,
+          above_ma50: false,
+          bull_alignment: false,
+          rsi_min: null,
+          rsi_max: null,
+          dist_ma20_min: null,
+          dist_ma20_max: null,
+          vol_ratio_min: null,
+          atr_pct_min: null,
+          near_20d_high: false,
+          pct_chg_min: null,
+          pct_chg_max: null,
+          tier: 'all',
+          limit: 50,
+        },
+        results: [],
+        loading: false,
+        dataDate: '',
+        sortCol: 'vol_ratio',
+        sortDir: 'desc',
+
+        // Detail panel
+        detailOpen: false,
+        detailLoading: false,
+        detail: null,
+        selectedTicker: '',
+
+        fundFields: [
+          ['P/E', 'pe_ratio'],
+          ['P/S', 'ps_ratio'],
+          ['P/B', 'pb_ratio'],
+          ['PEG', 'peg_ratio'],
+          ['Market Cap', 'market_cap'],
+          ['Rev Growth', 'revenue_growth_yoy'],
+          ['EPS Growth', 'earnings_growth_yoy'],
+          ['Gross Margin', 'gross_margin'],
+          ['ROE', 'roe'],
+          ['FCF Yield', 'fcf_yield'],
+        ],
+
+        get activeSectorCount() {
+          return this.selectedSectors.length
+        },
+
+        get activeFilterCount() {
+          let c = this.selectedSectors.length
+          if (this.filters.above_ma200) c++
+          if (this.filters.above_ma50) c++
+          if (this.filters.bull_alignment) c++
+          if (this.filters.rsi_min != null) c++
+          if (this.filters.rsi_max != null) c++
+          if (this.filters.dist_ma20_min != null) c++
+          if (this.filters.dist_ma20_max != null) c++
+          if (this.filters.vol_ratio_min != null) c++
+          if (this.filters.atr_pct_min != null) c++
+          if (this.filters.near_20d_high) c++
+          if (this.filters.pct_chg_min != null) c++
+          if (this.filters.pct_chg_max != null) c++
+          if (this.filters.tier !== 'all') c++
+          return c
+        },
+
+        get sortedResults() {
+          const col = this.sortCol
+          const dir = this.sortDir === 'asc' ? 1 : -1
+          return [...this.results].sort((a, b) => {
+            const av = a[col], bv = b[col]
+            if (av == null && bv == null) return 0
+            if (av == null) return 1
+            if (bv == null) return -1
+            if (typeof av === 'string') return dir * av.localeCompare(bv)
+            return dir * (av - bv)
+          })
+        },
+
+        toggleSector(s) {
+          const i = this.selectedSectors.indexOf(s)
+          if (i >= 0) this.selectedSectors.splice(i, 1)
+          else this.selectedSectors.push(s)
+        },
+
+        sortBy(col) {
+          if (this.sortCol === col) {
+            this.sortDir = this.sortDir === 'asc' ? 'desc' : 'asc'
+          } else {
+            this.sortCol = col
+            this.sortDir = col === 'ticker' || col === 'sector' ? 'asc' : 'desc'
+          }
+        },
+
+        resetFilters() {
+          this.selectedSectors = []
+          this.filters = {
+            above_ma200: false, above_ma50: false, bull_alignment: false,
+            rsi_min: null, rsi_max: null,
+            dist_ma20_min: null, dist_ma20_max: null,
+            vol_ratio_min: null, atr_pct_min: null, near_20d_high: false,
+            pct_chg_min: null, pct_chg_max: null,
+            tier: 'all', limit: 50,
+          }
+        },
+
+        async runScreen() {
+          this.loading = true
+          const body = { ...this.filters, sectors: this.selectedSectors, market: 'US' }
+          // clean nulls
+          for (const [k, v] of Object.entries(body)) {
+            if (v === null || v === '') body[k] = undefined
+          }
+          try {
+            const res = await fetch('/screen', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(body),
+            })
+            const data = await res.json()
+            this.results = data.results || []
+            this.dataDate = data.date || ''
+          } catch (e) {
+            console.error(e)
+          }
+          this.loading = false
+        },
+
+        async openDetail(ticker) {
+          this.selectedTicker = ticker
+          this.detailOpen = true
+          this.detailLoading = true
+          this.detail = null
+          try {
+            const res = await fetch('/ticker/' + ticker)
+            this.detail = await res.json()
+          } catch (e) {
+            console.error(e)
+            this.detail = { ticker, company_name: '', fundamentals: null, news: [] }
+          }
+          this.detailLoading = false
+        },
+
+        formatFund(v) {
+          if (v == null) return '—'
+          if (typeof v === 'number') {
+            if (Math.abs(v) >= 1e9) return '$' + (v / 1e9).toFixed(1) + 'B'
+            if (Math.abs(v) >= 1e6) return '$' + (v / 1e6).toFixed(1) + 'M'
+            if (Math.abs(v) < 1) return (v * 100).toFixed(1) + '%'
+            return v.toFixed(2)
+          }
+          return String(v)
+        },
+
+        formatDate(d) {
+          if (!d) return ''
+          try {
+            return new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+          } catch { return d }
+        },
+
+        exportCSV() {
+          const cols = ['ticker','company_name','sector','close','pct_chg','rsi_14','vol_ratio','dist_ma20_pct']
+          const header = cols.join(',')
+          const rows = this.sortedResults.map(r =>
+            cols.map(c => {
+              const v = r[c]
+              if (v == null) return ''
+              if (typeof v === 'string' && v.includes(',')) return '"' + v + '"'
+              return v
+            }).join(',')
+          )
+          const csv = [header, ...rows].join('\n')
+          const blob = new Blob([csv], { type: 'text/csv' })
+          const url = URL.createObjectURL(blob)
+          const a = document.createElement('a')
+          a.href = url
+          a.download = 'screen_' + this.dataDate + '.csv'
+          a.click()
+          URL.revokeObjectURL(url)
+        },
+      }
+    }
+  </script>
+</body>
+</html>
