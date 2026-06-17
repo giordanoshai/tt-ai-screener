@@ -2,8 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
-### [2026-06-17] 添加数据管道配置常量
-* **新增 (Added)**: 在 `config.py` 中添加了 4 个新的配置常量：`FUNDAMENTALS_STALE_DAYS`（基本面数据过期阈值，默认 7 天）、`NEWS_MOVER_PCT_THRESHOLD`（新闻驱动价格变动阈值，默认 5.0%）、`NEWS_MOVER_VOLRATIO_THRESHOLD`（新闻驱动成交量比率阈值，默认 2.0x）、`OHLCV_BATCH_SIZE`（批量更新大小，默认 200）。这些常量支持数据管道重新设计中的增量更新和新闻驱动筛选功能。
+### [2026-06-17] 数据管道架构重设计
+* **新增 (Added)**: Provider 抽象层 (`data_sources/base.py`, `data_sources/us_market.py`, `data_sources/registry.py`)，支持按市场字段插拔数据源
+* **新增 (Added)**: `stocks_meta` 表新增 `market` 和 `tier` 字段，支持 core/universe 分层
+* **新增 (Added)**: CSV 股票池导入脚本 (`db/universe.py`)，支持导入数千支 ticker
+* **新增 (Added)**: Web 筛选端点 `POST /screen`（按板块+技术条件本地 DB 筛选）和 `GET /ticker/{ticker}`（cache-first 详情）
+* **新增 (Added)**: Windows 每日更新批处理脚本 (`db/run_daily_update.bat`)
+* **修改 (Changed)**: `db/update.py` 重写为批量 OHLCV 下载 + 7 天 fundamentals 缓存 + tier 门槛新闻拉取
+* **修改 (Changed)**: `db/fetch.py` 重写为基于 Provider 抽象层的初始数据拉取
+* **修改 (Changed)**: `config.py` 新增 `FUNDAMENTALS_STALE_DAYS`、`NEWS_MOVER_PCT_THRESHOLD`、`NEWS_MOVER_VOLRATIO_THRESHOLD`、`OHLCV_BATCH_SIZE` 配置项
 
 ### [2026-06-11] 更新 OpenClaw 配置文件
 * **修改 (Changed)**: 修改了 [openclaw.json](file:///D:/Dev_project/Python_Project/tt-trading-mcp/openclaw.json)，移除了已失效或不再使用的 `minimax` 与 `tencent` 提供商及其关联模型，新增了阿里云 `aliyun` 提供商，配置了 DashScope 兼容接口及 API Key，并增加了 `deepseek-v4-flash`、`deepseek-v4-pro`、`qwen3.7-plus`、`qwen3.7-max` 模型支持，同时将默认主模型（primary）设为 `aliyun/qwen3.7-plus`。
