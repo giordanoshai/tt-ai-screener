@@ -113,7 +113,90 @@ schtasks (每日触发)
 - 集成测试：`update_ohlcv` 批量下载分批逻辑（mock yfinance，验证分批大小和合并结果）
 - 手动验证：用现有 4 个测试 ticker（AAPL/NVDA/MSFT/TSLA）跑一次完整 `update.py`，确认行为与重写前一致（回归）
 
+### 4. 板块 + 前端筛选层（请求侧）
+
+本节是对第 3 节"更新侧 gating"的"请求侧"补充，解决用户在 Claude 对话或 Web UI 中调用选股时因候选池过大导致的 token / API 调用爆炸问题。
+
+**核心思路**：先用纯本地 DB 查询按板块 + 技术条件缩小候选池 → 再对少量结果按需取新闻 / fundamentals（cache-first，没有就实时拉 Finnhub）。
+
+#### 4.1 板块数据来源
+
+`stocks_meta` 表中 `sector` 和 `industry` 字段已存在，但现有 `fetch_fundamentals` 里写入的是 `finnhubIndustry`（细分行业），字段映射需修正：
+
+- `stocks_meta.sector` ← Finnhub `profile2.finnhubIndustry`（如 `Technology`，偏粗分类）
+- `stocks_meta.industry` ← 同字段（暂时相同；未来可引入 SIC/GICS 细分）
+- **不新增任何 API 调用**：`profile2` 已在 `fetch_fundamentals` 流程中拉取，只需确保写入时字段映射正确
+
+#### 4.2 Web 筛选端点
+
+`web/app.py` 新增两个端点：
+
+```
+POST /screen            纯本地 DB 查询，返回候选列表，不调用任何外部 API
+GET  /ticker/{ticker}   单 ticker 详情：fundamentals + news，cache-first + Finnhub fallback
+```
+
+`POST /screen` 接受的筛选参数（完全基于现有 schema，不引入未存储的 MACD/KDJ/Bollinger）：
+
+| 类别 | 参数 | 对应 DB 字段 |
+|------|------|-------------|
+| 板块 | `sectors[]` | `stocks_meta.sector` |
+| 趋势 | `above_ma200`, `above_ma50`, `bull_alignment` | `close > ma_200` 等 |
+| 距离 | `dist_ma20_min/max` | `dist_ma20_pct` |
+| 动量 | `rsi_min/max` | `rsi_14` |
+| 成交量 | `vol_ratio_min` | `vol_ratio` |
+| 结构 | `near_20d_high`（close/high_20 ≥ 0.95） | `close`, `high_20` |
+| 波动 | `atr_pct_min` | `atr_pct` |
+| 涨跌 | `pct_chg_min/max` | `pct_chg` |
+| 市场 | `market`（默认 `US`） | `stocks_meta.market` |
+| 分层 | `tier`（`all`/`core`/`universe`） | `stocks_meta.tier` |
+
+返回格式（轻量，**不含新闻 / fundamentals**）：`ticker`, `company_name`, `sector`, `close`, `pct_chg`, `rsi_14`, `vol_ratio`, `dist_ma20_pct`, `is_core`。
+
+#### 4.3 单 ticker 详情端点（cache-first）
+
+`GET /ticker/{ticker}` 执行顺序：
+
+```
+fundamentals:
+  1. 查 stock_fundamentals WHERE ticker=? AND updated_at >= (today-7d)
+  2. 命中 → 直接返回
+  3. 未命中 → 实时 Finnhub /stock/metric → 写入 DB → 返回
+
+news:
+  1. 查 news WHERE ticker=? AND published_at >= (today-14d) ORDER BY published_at DESC LIMIT 20
+  2. 命中 → 直接返回
+  3. 未命中 → 实时 Finnhub /company-news → 写入 DB → 返回
+```
+
+单 ticker 按需拉取每次仅 1–2 个 Finnhub 请求，不触发限速，是"将批量成本推迟到用户实际需要时"的核心机制。
+
+## 整体数据流（更新后）
+
+```
+每日定时任务（更新侧）
+  → OHLCV 全量批量更新（yfinance 分批，不限速）
+  → fundamentals 7天缓存更新（Finnhub 限速队列）
+  → news：core必拉 + universe异动门槛拉（Finnhub 限速队列，规模可控）
+
+用户请求（请求侧）
+  → 前端/Claude 按板块 + 技术条件筛选 → POST /screen → 纯 DB 查询，返回轻量候选列表
+  → 用户点开某支股票 → GET /ticker/{ticker}
+      → fundamentals：DB 缓存（7天内） → 实时 Finnhub fallback → 写 DB
+      → news：DB 缓存（14天内） → 实时 Finnhub fallback → 写 DB
+```
+
+## 测试策略
+
+- 单元测试：`registry.py` 路由逻辑（给定 market 字段返回正确 provider 实例）
+- 单元测试：异动门槛筛选函数（给定一批 OHLCV 行，正确筛出超阈值的 ticker）
+- 单元测试：`POST /screen` 各筛选参数的 SQL 生成逻辑（覆盖 sector、bull_alignment、near_20d_high 等复合条件）
+- 单元测试：`GET /ticker/{ticker}` cache-first 逻辑（新鲜缓存直接返回；过期缓存触发 Finnhub 调用）
+- 集成测试：`update_ohlcv` 批量下载分批逻辑（mock yfinance，验证分批大小和合并结果）
+- 手动验证：用现有 4 个测试 ticker（AAPL/NVDA/MSFT/TSLA）跑一次完整 `update.py`，确认行为与重写前一致（回归）
+
 ## 风险与权衡
 
 - 异动门槛会漏掉"价格还没反应但已经有重大新闻"的极少数情况（用户已知悉并接受，这是新闻驱动行情通常伴随价量异动这一前提下的合理折衷）
 - yfinance 批量下载在网络异常时整批失败的影响面比单 ticker 请求大，需要批次级别的 try/except（不细化到逐 ticker 重试，超出本次范围）
+- `GET /ticker/{ticker}` 实时 Finnhub fallback 在极端情况下（API 超时/限速）会让前端等待；可在后续版本加超时上限 + 友好错误提示，当前版本直接返回空值即可
