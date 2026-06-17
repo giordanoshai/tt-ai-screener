@@ -74,26 +74,35 @@ def update_ohlcv(tickers: list[str], registry: ProviderRegistry):
                 continue
 
             inserted = 0
+            errors = 0
             for ticker in batch:
-                sub = raw[raw["ticker"] == ticker].copy()
-                if sub.empty:
-                    continue
-                sub = _calc_indicators(sub)
-                sub = sub.dropna(subset=["ma_20"])
-                if sub.empty:
-                    continue
+                try:
+                    sub = raw[raw["ticker"] == ticker].copy()
+                    if sub.empty:
+                        continue
+                    sub = _calc_indicators(sub)
+                    if "ma_20" not in sub.columns or sub["ma_20"].isna().all():
+                        continue
+                    sub = sub.dropna(subset=["ma_20"])
+                    if sub.empty:
+                        continue
 
-                last_date = last_dates.get(ticker)
-                if last_date:
-                    sub = sub[sub["date"].astype(str) > str(last_date)]
-                if sub.empty:
-                    continue
+                    last_date = last_dates.get(ticker)
+                    if last_date:
+                        sub = sub[sub["date"].astype(str) > str(last_date)]
+                    if sub.empty:
+                        continue
 
-                sub = sub[OHLCV_COLS]
-                con.execute("INSERT OR REPLACE INTO stock_ohlcv_daily SELECT * FROM sub")
-                inserted += len(sub)
+                    sub = sub[OHLCV_COLS]
+                    con.execute("INSERT OR REPLACE INTO stock_ohlcv_daily SELECT * FROM sub")
+                    inserted += len(sub)
+                except Exception:
+                    errors += 1
 
-            print(f"  Batch {batch_num}: {len(batch)} tickers, +{inserted} rows")
+            msg = f"  Batch {batch_num}: {len(batch)} tickers, +{inserted} rows"
+            if errors:
+                msg += f" ({errors} skipped)"
+            print(msg)
         except Exception as e:
             print(f"  Batch {batch_num}: ERROR - {e}")
 
