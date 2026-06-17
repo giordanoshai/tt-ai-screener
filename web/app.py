@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 from datetime import datetime
@@ -248,6 +249,105 @@ async def screen_stocks(req: ScreenRequest):
         cols = ["ticker","company_name","sector","close","pct_chg","rsi_14","vol_ratio","dist_ma20_pct","is_core"]
         results = [dict(zip(cols, r)) for r in rows]
         return JSONResponse({"results": results, "total": len(results), "date": str(max_date)})
+    finally:
+        con.close()
+
+
+@app.get("/ticker/{ticker}")
+async def ticker_detail(ticker: str):
+    ticker = ticker.strip().upper()
+    con = get_conn()
+    try:
+        fund_row = con.execute("""
+            SELECT pe_ratio, ps_ratio, pb_ratio, peg_ratio, market_cap,
+                   revenue_growth_yoy, earnings_growth_yoy, gross_margin,
+                   roe, fcf_yield, updated_at
+            FROM stock_fundamentals
+            WHERE ticker = ? AND updated_at >= CURRENT_DATE - INTERVAL '7 days'
+        """, [ticker]).fetchone()
+
+        fundamentals = None
+        if fund_row:
+            fund_cols = ["pe_ratio","ps_ratio","pb_ratio","peg_ratio","market_cap",
+                         "revenue_growth_yoy","earnings_growth_yoy","gross_margin",
+                         "roe","fcf_yield","updated_at"]
+            fundamentals = dict(zip(fund_cols, fund_row))
+        else:
+            try:
+                from data_sources.registry import ProviderRegistry
+                registry = ProviderRegistry()
+                provider = registry.get_fundamentals_provider("US")
+                data = provider.fetch_fundamentals(ticker)
+                con.execute("""
+                    INSERT INTO stock_fundamentals (
+                        ticker, pe_ratio, ps_ratio, pb_ratio, peg_ratio, market_cap,
+                        revenue_growth_yoy, earnings_growth_yoy, gross_margin,
+                        roe, fcf_yield, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_DATE)
+                    ON CONFLICT (ticker) DO UPDATE SET
+                        pe_ratio=EXCLUDED.pe_ratio, ps_ratio=EXCLUDED.ps_ratio,
+                        pb_ratio=EXCLUDED.pb_ratio, peg_ratio=EXCLUDED.peg_ratio,
+                        market_cap=EXCLUDED.market_cap,
+                        revenue_growth_yoy=EXCLUDED.revenue_growth_yoy,
+                        earnings_growth_yoy=EXCLUDED.earnings_growth_yoy,
+                        gross_margin=EXCLUDED.gross_margin,
+                        roe=EXCLUDED.roe, fcf_yield=EXCLUDED.fcf_yield,
+                        updated_at=EXCLUDED.updated_at
+                """, [
+                    ticker, data.get("pe_ratio"), data.get("ps_ratio"),
+                    data.get("pb_ratio"), data.get("peg_ratio"), data.get("market_cap"),
+                    data.get("revenue_growth_yoy"), data.get("earnings_growth_yoy"),
+                    data.get("gross_margin"), data.get("roe"), data.get("fcf_yield"),
+                ])
+                fundamentals = {k: v for k, v in data.items()
+                                if k in ["pe_ratio","ps_ratio","pb_ratio","peg_ratio","market_cap",
+                                         "revenue_growth_yoy","earnings_growth_yoy","gross_margin",
+                                         "roe","fcf_yield"]}
+            except Exception:
+                pass
+
+        news_rows = con.execute("""
+            SELECT headline, summary, source, published_at, sentiment_label
+            FROM news
+            WHERE ticker = ? AND published_at >= CURRENT_TIMESTAMP - INTERVAL '14 days'
+            ORDER BY published_at DESC LIMIT 20
+        """, [ticker]).fetchall()
+
+        news = []
+        if news_rows:
+            news_cols = ["headline","summary","source","published_at","sentiment_label"]
+            news = [dict(zip(news_cols, r)) for r in news_rows]
+        else:
+            try:
+                from data_sources.registry import ProviderRegistry
+                registry = ProviderRegistry()
+                provider = registry.get_news_provider("US")
+                articles = provider.fetch_news(ticker, days=14)
+                for art in articles:
+                    con.execute("""
+                        INSERT INTO news (id, ticker, headline, summary, source, url, published_at, sentiment_label)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (id) DO NOTHING
+                    """, [art["id"], ticker, art["headline"], art["summary"],
+                          art["source"], art["url"], art["published_at"], art["sentiment_label"]])
+                news_cols = ["headline","summary","source","published_at","sentiment_label"]
+                news = [{k: art.get(k) for k in news_cols} for art in articles[:20]]
+            except Exception:
+                pass
+
+        meta_row = con.execute(
+            "SELECT company_name, sector, industry FROM stocks_meta WHERE ticker = ?", [ticker]
+        ).fetchone()
+
+        return JSONResponse(content=json.loads(json.dumps({
+            "ticker": ticker,
+            "company_name": meta_row[0] if meta_row else "",
+            "sector": meta_row[1] if meta_row else "",
+            "industry": meta_row[2] if meta_row else "",
+            "fundamentals": fundamentals,
+            "news": news,
+        }, default=str)))
+
     finally:
         con.close()
 
