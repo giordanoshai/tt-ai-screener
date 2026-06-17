@@ -79,6 +79,7 @@ class FinnhubFundamentalsProvider(FundamentalsProvider):
         return r.json()
 
     def fetch_fundamentals(self, ticker: str) -> dict:
+        # --- Finnhub metrics + profile ---
         data = self._get("/stock/metric", {"symbol": ticker, "metric": "all"})
         m = data.get("metric", {})
         time.sleep(RATE_LIMIT_SLEEP)
@@ -94,7 +95,7 @@ class FinnhubFundamentalsProvider(FundamentalsProvider):
             v = m.get(key)
             return float(v) / 100.0 if v is not None else None
 
-        return {
+        result = {
             "ticker": ticker,
             "pe_ratio": g("peExclExtraTTM"),
             "ps_ratio": g("psTTM"),
@@ -110,7 +111,103 @@ class FinnhubFundamentalsProvider(FundamentalsProvider):
             "exchange": profile.get("exchange", ""),
             "sector": profile.get("finnhubIndustry", ""),
             "industry": profile.get("finnhubIndustry", ""),
+            # placeholders filled below
+            "analyst_rating": None,
+            "analyst_target_price": None,
+            "analyst_count": None,
+            "next_earnings_date": None,
+            "last_earnings_date": None,
+            "mspr": None,
         }
+
+        # --- yfinance: analyst data ---
+        try:
+            info = yf.Ticker(ticker).info
+            if info:
+                result["analyst_rating"] = info.get("recommendationKey")
+                result["analyst_target_price"] = info.get("targetMeanPrice")
+                result["analyst_count"] = info.get("numberOfAnalystOpinions")
+
+                pe_yf = info.get("trailingPE")
+                if pe_yf and not result["pe_ratio"]:
+                    result["pe_ratio"] = pe_yf
+                ps_yf = info.get("priceToSalesTrailing12Months")
+                if ps_yf and not result["ps_ratio"]:
+                    result["ps_ratio"] = ps_yf
+                pb_yf = info.get("priceToBook")
+                if pb_yf and not result["pb_ratio"]:
+                    result["pb_ratio"] = pb_yf
+
+                if not result["peg_ratio"]:
+                    earn_growth = info.get("earningsGrowth")
+                    if result["pe_ratio"] and earn_growth and earn_growth > 0:
+                        result["peg_ratio"] = round(result["pe_ratio"] / (earn_growth * 100), 2)
+
+                if not result["fcf_yield"]:
+                    fcf = info.get("freeCashflow")
+                    mcap = info.get("marketCap")
+                    if fcf and mcap:
+                        result["fcf_yield"] = round(fcf / mcap, 4)
+        except Exception:
+            pass
+
+        # --- Finnhub: earnings calendar ---
+        try:
+            today = date.today()
+            cal = self._get("/calendar/earnings", {
+                "symbol": ticker,
+                "from": (today - timedelta(days=90)).isoformat(),
+                "to": (today + timedelta(days=90)).isoformat(),
+            })
+            time.sleep(RATE_LIMIT_SLEEP)
+
+            for e in cal.get("earningsCalendar", []):
+                ed = e.get("date")
+                if not ed:
+                    continue
+                if ed >= today.isoformat():
+                    if not result["next_earnings_date"] or ed < result["next_earnings_date"]:
+                        result["next_earnings_date"] = ed
+                else:
+                    if not result["last_earnings_date"] or ed > result["last_earnings_date"]:
+                        result["last_earnings_date"] = ed
+        except Exception:
+            pass
+
+        # --- Finnhub: insider transactions (Form 4) → compute MSPR ---
+        try:
+            today_dt = date.today()
+            ninety_days_ago = today_dt - timedelta(days=90)
+            txn_data = self._get("/stock/insider-transactions", {"symbol": ticker})
+            time.sleep(RATE_LIMIT_SLEEP)
+
+            records = txn_data.get("data", []) if isinstance(txn_data, dict) else []
+            total_buy = 0.0
+            total_sell = 0.0
+
+            for r in records:
+                filing = r.get("filingDate", "")
+                if filing < ninety_days_ago.isoformat():
+                    continue
+                change = r.get("change")
+                if change is None:
+                    continue
+                try:
+                    change_val = float(change)
+                except (ValueError, TypeError):
+                    continue
+                if change_val > 0:
+                    total_buy += change_val
+                elif change_val < 0:
+                    total_sell += abs(change_val)
+
+            total_shares = total_buy + total_sell
+            if total_shares > 0:
+                result["mspr"] = round(((total_buy - total_sell) / total_shares) * 100, 4)
+        except Exception:
+            pass
+
+        return result
 
 
 class FinnhubNewsProvider(NewsProvider):

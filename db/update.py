@@ -6,6 +6,8 @@ Daily incremental update with tier-based news gating.
 
 Usage: python -m db.update
 """
+import sys
+import time
 from datetime import datetime, date, timedelta
 
 import pandas as pd
@@ -18,6 +20,13 @@ from config import (
 from db.init import get_conn
 from db.fetch import _calc_indicators, OHLCV_COLS
 from data_sources.registry import ProviderRegistry
+
+
+def _elapsed(start: float) -> str:
+    s = int(time.time() - start)
+    if s < 60:
+        return f"{s}s"
+    return f"{s // 60}m{s % 60:02d}s"
 
 
 def find_movers(
@@ -49,8 +58,12 @@ def _load_all_tickers(con) -> list[dict]:
 
 
 def update_ohlcv(tickers: list[str], registry: ProviderRegistry):
-    print(f"[OHLCV] Updating {len(tickers)} tickers in batches of {OHLCV_BATCH_SIZE}...")
+    t0 = time.time()
+    total_batches = (len(tickers) + OHLCV_BATCH_SIZE - 1) // OHLCV_BATCH_SIZE
+    print(f"\n[OHLCV] {len(tickers)} tickers, {total_batches} batches", flush=True)
     con = get_conn()
+    total_inserted = 0
+    total_errors = 0
 
     for i in range(0, len(tickers), OHLCV_BATCH_SIZE):
         batch = tickers[i:i + OHLCV_BATCH_SIZE]
@@ -70,7 +83,7 @@ def update_ohlcv(tickers: list[str], registry: ProviderRegistry):
             raw = provider.fetch_ohlcv(batch, since=earliest)
 
             if raw.empty:
-                print(f"  Batch {batch_num}: no data")
+                print(f"  [{batch_num}/{total_batches}] no data ({_elapsed(t0)})", flush=True)
                 continue
 
             inserted = 0
@@ -99,24 +112,29 @@ def update_ohlcv(tickers: list[str], registry: ProviderRegistry):
                 except Exception:
                     errors += 1
 
-            msg = f"  Batch {batch_num}: {len(batch)} tickers, +{inserted} rows"
-            if errors:
-                msg += f" ({errors} skipped)"
-            print(msg)
+            total_inserted += inserted
+            total_errors += errors
+            print(f"  [{batch_num}/{total_batches}] +{inserted} rows, {errors} err ({_elapsed(t0)})", flush=True)
         except Exception as e:
-            print(f"  Batch {batch_num}: ERROR - {e}")
+            print(f"  [{batch_num}/{total_batches}] ERROR: {e} ({_elapsed(t0)})", flush=True)
 
     con.close()
-    print("[OHLCV] Done.")
+    print(f"[OHLCV] Done: +{total_inserted} rows, {total_errors} errors in {_elapsed(t0)}", flush=True)
 
 
 def update_fundamentals(tickers: list[str], registry: ProviderRegistry):
     if not FINNHUB_KEY:
-        print("[Fundamentals] Skipped — no FINNHUB_KEY")
+        print("[Fundamentals] Skipped — no FINNHUB_KEY", flush=True)
         return
 
-    print(f"[Fundamentals] Refreshing (stale > {FUNDAMENTALS_STALE_DAYS} days)...")
+    t0 = time.time()
     con = get_conn()
+    total = len(tickers)
+    fetched = 0
+    skipped = 0
+    errors = 0
+
+    print(f"\n[Fundamentals] {total} tickers (stale > {FUNDAMENTALS_STALE_DAYS}d)", flush=True)
 
     for i, ticker in enumerate(tickers, 1):
         try:
@@ -127,6 +145,9 @@ def update_fundamentals(tickers: list[str], registry: ProviderRegistry):
                 try:
                     last_update = date.fromisoformat(str(row[0])[:10])
                     if (date.today() - last_update).days < FUNDAMENTALS_STALE_DAYS:
+                        skipped += 1
+                        if skipped % 200 == 0:
+                            print(f"  [{i}/{total}] skipped {skipped} (fresh) ({_elapsed(t0)})", flush=True)
                         continue
                 except (ValueError, TypeError):
                     pass
@@ -138,8 +159,11 @@ def update_fundamentals(tickers: list[str], registry: ProviderRegistry):
                 INSERT INTO stock_fundamentals (
                     ticker, pe_ratio, ps_ratio, pb_ratio, peg_ratio, market_cap,
                     revenue_growth_yoy, earnings_growth_yoy, gross_margin,
-                    roe, fcf_yield, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    roe, fcf_yield,
+                    analyst_rating, analyst_target_price, analyst_count,
+                    next_earnings_date, last_earnings_date, mspr,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (ticker) DO UPDATE SET
                     pe_ratio = EXCLUDED.pe_ratio, ps_ratio = EXCLUDED.ps_ratio,
                     pb_ratio = EXCLUDED.pb_ratio, peg_ratio = EXCLUDED.peg_ratio,
@@ -148,12 +172,22 @@ def update_fundamentals(tickers: list[str], registry: ProviderRegistry):
                     earnings_growth_yoy = EXCLUDED.earnings_growth_yoy,
                     gross_margin = EXCLUDED.gross_margin,
                     roe = EXCLUDED.roe, fcf_yield = EXCLUDED.fcf_yield,
+                    analyst_rating = EXCLUDED.analyst_rating,
+                    analyst_target_price = EXCLUDED.analyst_target_price,
+                    analyst_count = EXCLUDED.analyst_count,
+                    next_earnings_date = EXCLUDED.next_earnings_date,
+                    last_earnings_date = EXCLUDED.last_earnings_date,
+                    mspr = EXCLUDED.mspr,
                     updated_at = EXCLUDED.updated_at
             """, [
                 ticker, data.get("pe_ratio"), data.get("ps_ratio"),
                 data.get("pb_ratio"), data.get("peg_ratio"), data.get("market_cap"),
                 data.get("revenue_growth_yoy"), data.get("earnings_growth_yoy"),
                 data.get("gross_margin"), data.get("roe"), data.get("fcf_yield"),
+                data.get("analyst_rating"), data.get("analyst_target_price"),
+                data.get("analyst_count"),
+                data.get("next_earnings_date"), data.get("last_earnings_date"),
+                data.get("mspr"),
                 date.today().isoformat(),
             ])
 
@@ -169,20 +203,29 @@ def update_fundamentals(tickers: list[str], registry: ProviderRegistry):
                 data.get("sector", ""), data.get("industry", ""),
             ])
 
-            print(f"  [{i}/{len(tickers)}] {ticker}: OK")
+            fetched += 1
+            if fetched % 50 == 0:
+                print(f"  [{i}/{total}] fetched {fetched}, skipped {skipped}, err {errors} ({_elapsed(t0)})", flush=True)
         except Exception as e:
-            print(f"  [{i}/{len(tickers)}] {ticker}: ERROR - {e}")
+            errors += 1
+            if errors <= 5 or errors % 20 == 0:
+                print(f"  [{i}/{total}] {ticker}: ERROR - {e} ({_elapsed(t0)})", flush=True)
 
     con.close()
-    print("[Fundamentals] Done.")
+    print(f"[Fundamentals] Done: {fetched} fetched, {skipped} skipped, {errors} errors in {_elapsed(t0)}", flush=True)
 
 
 def update_news(tickers: list[str], registry: ProviderRegistry, days: int = 3):
     if not FINNHUB_KEY:
-        print("[News] Skipped — no FINNHUB_KEY")
+        print("[News] Skipped — no FINNHUB_KEY", flush=True)
         return
 
-    print(f"[News] Fetching {len(tickers)} tickers ({days} days)...")
+    t0 = time.time()
+    total = len(tickers)
+    total_articles = 0
+    errors = 0
+
+    print(f"\n[News] {total} tickers ({days} days)", flush=True)
     con = get_conn()
 
     for i, ticker in enumerate(tickers, 1):
@@ -202,16 +245,21 @@ def update_news(tickers: list[str], registry: ProviderRegistry, days: int = 3):
                 ])
                 count += 1
 
-            print(f"  [{i}/{len(tickers)}] {ticker}: +{count}")
+            total_articles += count
         except Exception as e:
-            print(f"  [{i}/{len(tickers)}] {ticker}: ERROR - {e}")
+            errors += 1
+            if errors <= 5 or errors % 20 == 0:
+                print(f"  [{i}/{total}] {ticker}: ERROR - {e}", flush=True)
+
+        if i % 50 == 0 or i == total:
+            print(f"  [{i}/{total}] +{total_articles} articles, {errors} err ({_elapsed(t0)})", flush=True)
 
     con.close()
-    print("[News] Done.")
+    print(f"[News] Done: +{total_articles} articles, {errors} errors in {_elapsed(t0)}", flush=True)
 
 
 def run():
-    start = datetime.now()
+    t_start = time.time()
     registry = ProviderRegistry()
     con = get_conn()
 
@@ -226,8 +274,9 @@ def run():
     all_ticker_names = [t["ticker"] for t in all_tickers]
     core_tickers = [t["ticker"] for t in all_tickers if t["tier"] == "core"]
 
-    print(f"\n[Update] {date.today()} — {len(all_tickers)} tickers ({len(core_tickers)} core)")
-    print("=" * 55)
+    print(f"\n{'=' * 55}")
+    print(f"[Update] {date.today()} — {len(all_tickers)} tickers ({len(core_tickers)} core)")
+    print(f"{'=' * 55}", flush=True)
 
     # 1. OHLCV: all tickers, batch
     update_ohlcv(all_ticker_names, registry)
@@ -250,11 +299,12 @@ def run():
     ]
     movers = find_movers(universe_rows, NEWS_MOVER_PCT_THRESHOLD, NEWS_MOVER_VOLRATIO_THRESHOLD)
     news_tickers = list(set(core_tickers + movers))
-    print(f"[News] {len(core_tickers)} core + {len(movers)} movers = {len(news_tickers)} total")
+    print(f"\n[News Gate] {len(core_tickers)} core + {len(movers)} movers = {len(news_tickers)} total", flush=True)
     update_news(news_tickers, registry)
 
-    elapsed = datetime.now() - start
-    print(f"\n✓ Update complete in {elapsed}.")
+    print(f"\n{'=' * 55}")
+    print(f"Update complete in {_elapsed(t_start)}")
+    print(f"{'=' * 55}", flush=True)
 
 
 if __name__ == "__main__":

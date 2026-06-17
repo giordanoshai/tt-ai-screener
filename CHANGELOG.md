@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+### [2026-06-17] Fundamentals 数据补全：分析师、财报日期、内部人交易
+* **新增 (Added)**: `analyst_rating`、`analyst_target_price`、`analyst_count` 字段，数据来自 yfinance
+* **新增 (Added)**: `next_earnings_date`、`last_earnings_date` 字段，数据来自 Finnhub earnings calendar API
+* **新增 (Added)**: `mspr`（内部人净买入比率），基于 Finnhub Form 4 insider transactions 原始数据自主计算 90 天滚动 MSPR
+* **修改 (Changed)**: `FinnhubFundamentalsProvider` 重写为混合数据源（Finnhub metrics/profile + yfinance analyst + Finnhub earnings/insider），每 ticker 5 次 API 调用
+* **修改 (Changed)**: `update_fundamentals` SQL 扩展为 18 字段完整写入，与老项目 TTAiTradingSystem 数据结构对齐
+
 ### [2026-06-17] 新增前端股票筛选页面
 * **新增 (Added)**: `/screener` 页面，支持按板块、趋势（MA200/MA50/均线多头排列）、RSI、距MA20距离、成交量比率、ATR波动率、近期涨跌幅等多维条件筛选全部 2150+ 支股票
 * **新增 (Added)**: 筛选结果表格支持列排序、CSV 导出、点击行查看个股详情（Fundamentals + 新闻）侧边栏
