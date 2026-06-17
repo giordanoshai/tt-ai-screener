@@ -9,6 +9,10 @@ BASE_DIR = Path(__file__).parent
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "trading.duckdb"))
 FINNHUB_KEY = os.getenv("FINNHUB_KEY", "")
 NEWS_DAYS = int(os.getenv("NEWS_DAYS", "30"))
+FUNDAMENTALS_STALE_DAYS = int(os.getenv("FUNDAMENTALS_STALE_DAYS", "7"))
+NEWS_MOVER_PCT_THRESHOLD = float(os.getenv("NEWS_MOVER_PCT_THRESHOLD", "5.0"))
+NEWS_MOVER_VOLRATIO_THRESHOLD = float(os.getenv("NEWS_MOVER_VOLRATIO_THRESHOLD", "2.0"))
+OHLCV_BATCH_SIZE = int(os.getenv("OHLCV_BATCH_SIZE", "200"))
 TICKERS_FILE = BASE_DIR / "tickers.txt"
 
 
