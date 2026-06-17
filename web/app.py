@@ -7,6 +7,8 @@ import yfinance as yf
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from db.init import get_conn, init_db
@@ -61,6 +63,25 @@ def _get_db_status():
         "news_count":    news[0],
         "news_latest":   str(news[1]) if news[1] else "—",
     }
+
+
+class ScreenRequest(BaseModel):
+    sectors: list[str] = []
+    above_ma200: bool = False
+    above_ma50: bool = False
+    bull_alignment: bool = False
+    dist_ma20_min: Optional[float] = None
+    dist_ma20_max: Optional[float] = None
+    rsi_min: Optional[float] = None
+    rsi_max: Optional[float] = None
+    vol_ratio_min: Optional[float] = None
+    near_20d_high: bool = False
+    atr_pct_min: Optional[float] = None
+    pct_chg_min: Optional[float] = None
+    pct_chg_max: Optional[float] = None
+    market: str = "US"
+    tier: str = "all"
+    limit: int = 50
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -142,6 +163,93 @@ async def trigger_update():
 @app.get("/status")
 async def get_status():
     return JSONResponse(_get_db_status())
+
+
+@app.post("/screen")
+async def screen_stocks(req: ScreenRequest):
+    con = get_conn()
+    try:
+        max_date_row = con.execute("SELECT MAX(date) FROM stock_ohlcv_daily").fetchone()
+        if not max_date_row or not max_date_row[0]:
+            return JSONResponse({"results": [], "total": 0, "date": None})
+        max_date = max_date_row[0]
+
+        where = ["o.date = ?"]
+        params: list = [max_date]
+
+        if req.sectors:
+            placeholders = ",".join(["?"] * len(req.sectors))
+            where.append(f"m.sector IN ({placeholders})")
+            params.extend(req.sectors)
+
+        if req.above_ma200:
+            where.append("o.close > o.ma_200")
+        if req.above_ma50:
+            where.append("o.close > o.ma_50")
+        if req.bull_alignment:
+            where.append("o.ma_20 > o.ma_50 AND o.ma_50 > o.ma_200")
+
+        if req.dist_ma20_min is not None:
+            where.append("o.dist_ma20_pct >= ?")
+            params.append(req.dist_ma20_min)
+        if req.dist_ma20_max is not None:
+            where.append("o.dist_ma20_pct <= ?")
+            params.append(req.dist_ma20_max)
+
+        if req.rsi_min is not None:
+            where.append("o.rsi_14 >= ?")
+            params.append(req.rsi_min)
+        if req.rsi_max is not None:
+            where.append("o.rsi_14 <= ?")
+            params.append(req.rsi_max)
+
+        if req.vol_ratio_min is not None:
+            where.append("o.vol_ratio >= ?")
+            params.append(req.vol_ratio_min)
+
+        if req.near_20d_high:
+            where.append("o.high_20 IS NOT NULL AND o.close / o.high_20 >= 0.95")
+
+        if req.atr_pct_min is not None:
+            where.append("o.atr_pct >= ?")
+            params.append(req.atr_pct_min)
+
+        if req.pct_chg_min is not None:
+            where.append("o.pct_chg >= ?")
+            params.append(req.pct_chg_min)
+        if req.pct_chg_max is not None:
+            where.append("o.pct_chg <= ?")
+            params.append(req.pct_chg_max)
+
+        if req.market != "all":
+            where.append("COALESCE(m.market, 'US') = ?")
+            params.append(req.market)
+
+        if req.tier != "all":
+            where.append("COALESCE(m.tier, 'core') = ?")
+            params.append(req.tier)
+
+        params.append(req.limit)
+
+        sql = f"""
+            SELECT
+                o.ticker, m.company_name, m.sector,
+                o.close, o.pct_chg, o.rsi_14, o.vol_ratio, o.dist_ma20_pct,
+                CASE WHEN w.ticker IS NOT NULL THEN true ELSE false END AS is_core
+            FROM stock_ohlcv_daily o
+            LEFT JOIN stocks_meta m ON o.ticker = m.ticker
+            LEFT JOIN user_watchlist w ON o.ticker = w.ticker
+            WHERE {' AND '.join(where)}
+            ORDER BY o.vol_ratio DESC NULLS LAST
+            LIMIT ?
+        """
+
+        rows = con.execute(sql, params).fetchall()
+        cols = ["ticker","company_name","sector","close","pct_chg","rsi_14","vol_ratio","dist_ma20_pct","is_core"]
+        results = [dict(zip(cols, r)) for r in rows]
+        return JSONResponse({"results": results, "total": len(results), "date": str(max_date)})
+    finally:
+        con.close()
 
 
 if __name__ == "__main__":
