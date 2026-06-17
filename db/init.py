@@ -16,7 +16,9 @@ def init_db():
             company_name VARCHAR,
             exchange    VARCHAR,
             sector      VARCHAR,
-            industry    VARCHAR
+            industry    VARCHAR,
+            market      VARCHAR DEFAULT 'US',
+            tier        VARCHAR DEFAULT 'core'
         )
     """)
 
