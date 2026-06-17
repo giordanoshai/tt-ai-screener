@@ -89,3 +89,63 @@ def test_yfinance_ohlcv_empty_result(mock_download):
     provider = YFinanceOHLCVProvider()
     result = provider.fetch_ohlcv(["FAKE"])
     assert result.empty
+
+
+from data_sources.us_market import FinnhubFundamentalsProvider, FinnhubNewsProvider
+
+
+@patch("data_sources.us_market.requests.get")
+def test_finnhub_fundamentals_returns_dict(mock_get):
+    mock_metric_resp = MagicMock()
+    mock_metric_resp.json.return_value = {
+        "metric": {
+            "peExclExtraTTM": 28.5,
+            "psTTM": 7.2,
+            "pbQuarterly": 45.0,
+            "pegAnnual": 1.5,
+            "marketCapitalization": 3000000,
+            "revenueGrowthTTMYoy": 12.5,
+            "epsGrowthTTMYoy": 15.3,
+            "grossMarginTTM": 46.2,
+            "roeTTM": 160.0,
+            "fcfYieldTTM": 3.5,
+        }
+    }
+    mock_metric_resp.raise_for_status = MagicMock()
+
+    mock_profile_resp = MagicMock()
+    mock_profile_resp.json.return_value = {
+        "name": "Apple Inc",
+        "exchange": "NASDAQ",
+        "finnhubIndustry": "Technology",
+    }
+    mock_profile_resp.raise_for_status = MagicMock()
+
+    mock_get.side_effect = [mock_metric_resp, mock_profile_resp]
+
+    provider = FinnhubFundamentalsProvider(api_key="test_key")
+    result = provider.fetch_fundamentals("AAPL")
+
+    assert result["pe_ratio"] == 28.5
+    assert result["revenue_growth_yoy"] == pytest.approx(0.125)
+    assert result["company_name"] == "Apple Inc"
+    assert result["sector"] == "Technology"
+
+
+@patch("data_sources.us_market.requests.get")
+def test_finnhub_news_returns_list(mock_get):
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = [
+        {"id": 1, "headline": "Test", "summary": "s", "source": "src",
+         "url": "http://x", "datetime": 1718550000, "related": "AAPL"},
+    ]
+    mock_resp.raise_for_status = MagicMock()
+    mock_get.return_value = mock_resp
+
+    provider = FinnhubNewsProvider(api_key="test_key")
+    result = provider.fetch_news("AAPL", days=3)
+
+    assert len(result) == 1
+    assert result[0]["id"] == 1
+    assert result[0]["headline"] == "Test"
+    assert "published_at" in result[0]

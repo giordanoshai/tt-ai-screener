@@ -1,9 +1,15 @@
-from datetime import date, timedelta
+import time
+from datetime import date, datetime, timedelta
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 from data_sources.base import OHLCVProvider, FundamentalsProvider, NewsProvider
+
+
+FINNHUB_BASE = "https://finnhub.io/api/v1"
+RATE_LIMIT_SLEEP = 1.1
 
 
 class YFinanceOHLCVProvider(OHLCVProvider):
@@ -59,3 +65,96 @@ class YFinanceOHLCVProvider(OHLCVProvider):
             except Exception:
                 continue
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+class FinnhubFundamentalsProvider(FundamentalsProvider):
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def _get(self, path: str, params: dict) -> dict | list:
+        params["token"] = self.api_key
+        r = requests.get(f"{FINNHUB_BASE}{path}", params=params, timeout=15)
+        r.raise_for_status()
+        return r.json()
+
+    def fetch_fundamentals(self, ticker: str) -> dict:
+        data = self._get("/stock/metric", {"symbol": ticker, "metric": "all"})
+        m = data.get("metric", {})
+        time.sleep(RATE_LIMIT_SLEEP)
+
+        profile = self._get("/stock/profile2", {"symbol": ticker})
+        time.sleep(RATE_LIMIT_SLEEP)
+
+        def g(key):
+            v = m.get(key)
+            return float(v) if v is not None else None
+
+        def gp(key):
+            v = m.get(key)
+            return float(v) / 100.0 if v is not None else None
+
+        return {
+            "ticker": ticker,
+            "pe_ratio": g("peExclExtraTTM"),
+            "ps_ratio": g("psTTM"),
+            "pb_ratio": g("pbQuarterly"),
+            "peg_ratio": g("pegAnnual"),
+            "market_cap": g("marketCapitalization"),
+            "revenue_growth_yoy": gp("revenueGrowthTTMYoy"),
+            "earnings_growth_yoy": gp("epsGrowthTTMYoy"),
+            "gross_margin": gp("grossMarginTTM"),
+            "roe": g("roeTTM"),
+            "fcf_yield": g("fcfYieldTTM"),
+            "company_name": profile.get("name", ""),
+            "exchange": profile.get("exchange", ""),
+            "sector": profile.get("finnhubIndustry", ""),
+            "industry": profile.get("finnhubIndustry", ""),
+        }
+
+
+class FinnhubNewsProvider(NewsProvider):
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def _get(self, path: str, params: dict) -> dict | list:
+        params["token"] = self.api_key
+        r = requests.get(f"{FINNHUB_BASE}{path}", params=params, timeout=15)
+        r.raise_for_status()
+        return r.json()
+
+    def fetch_news(self, ticker: str, days: int = 3) -> list[dict]:
+        date_to = date.today().isoformat()
+        date_from = (date.today() - timedelta(days=days)).isoformat()
+
+        articles = self._get("/company-news", {
+            "symbol": ticker,
+            "from": date_from,
+            "to": date_to,
+        })
+        time.sleep(RATE_LIMIT_SLEEP)
+
+        if not isinstance(articles, list):
+            return []
+
+        result = []
+        for art in articles:
+            art_id = art.get("id")
+            if not art_id:
+                continue
+            published = (
+                datetime.fromtimestamp(art["datetime"]).isoformat()
+                if art.get("datetime") else None
+            )
+            result.append({
+                "id": art_id,
+                "ticker": ticker,
+                "headline": art.get("headline", ""),
+                "summary": art.get("summary", ""),
+                "source": art.get("source", ""),
+                "url": art.get("url", ""),
+                "published_at": published,
+                "sentiment_label": None,
+            })
+        return result
