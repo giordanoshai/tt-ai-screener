@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Settings — TT AI Screener</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .mono { font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code', ui-monospace, monospace; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen" x-data="settingsApp()" x-cloak>
+
+  {% include "header.html" %}
+
+  <div class="max-w-4xl mx-auto px-6 py-6 space-y-5">
+
+    <!-- ═══ Language ═══ -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl">
+      <div class="px-5 py-3 flex items-center justify-between">
+        <div>
+          <h3 class="text-sm font-medium text-gray-200">Language / 语言</h3>
+          <p class="text-[10px] text-gray-500 mt-0.5">Controls analysis output language and skill prompts</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <button @click="setLang('en')"
+            class="text-xs px-3 py-1.5 rounded-md transition"
+            :class="lang === 'en' ? 'bg-indigo-600 text-white' : 'bg-gray-800 text-gray-400 hover:text-white'">English</button>
+          <button @click="setLang('cn')"
+            class="text-xs px-3 py-1.5 rounded-md transition"
+            :class="lang === 'cn' ? 'bg-indigo-600 text-white' : 'bg-gray-800 text-gray-400 hover:text-white'">中文</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ Data Update Schedule ═══ -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl">
+      <div class="px-5 py-3 flex items-center justify-between">
+        <div>
+          <h3 class="text-sm font-medium text-gray-200">Data Update Schedule</h3>
+          <p class="text-[10px] text-gray-500 mt-0.5">Auto-update data daily at a fixed time (skips weekends)</p>
+        </div>
+        <div class="flex items-center gap-3">
+          <input type="time" x-model="scheduleTime"
+            class="bg-gray-800 border border-gray-700 rounded px-2.5 py-1.5 text-xs mono text-gray-200 focus:outline-none focus:border-indigo-500"
+            :disabled="!scheduleEnabled">
+          <button @click="scheduleEnabled = !scheduleEnabled; saveSchedule()"
+            class="relative w-10 h-5 rounded-full transition-colors duration-200"
+            :class="scheduleEnabled ? 'bg-indigo-600' : 'bg-gray-700'">
+            <span class="absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform duration-200"
+              :class="scheduleEnabled && 'translate-x-5'"></span>
+          </button>
+        </div>
+      </div>
+      <div x-show="scheduleEnabled" class="px-5 pb-3 flex items-center gap-2">
+        <button @click="saveSchedule()"
+          class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-xs font-medium transition">
+          Save Time
+        </button>
+        <span x-show="scheduleSaved" class="text-[10px] text-green-500">Saved</span>
+      </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════════════════════════ -->
+    <!-- AI Models (collapsible)                                              -->
+    <!-- ══════════════════════════════════════════════════════════════════════ -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl">
+      <div class="px-5 py-3 flex items-center justify-between cursor-pointer hover:bg-gray-800/30 transition" @click="modelsOpen = !modelsOpen">
+        <div class="flex items-center gap-3">
+          <h2 class="text-sm font-medium text-gray-200">AI Models</h2>
+          <span class="text-[10px] text-gray-600" x-text="models.length + ' configured'"></span>
+        </div>
+        <svg class="w-4 h-4 text-gray-600 transition" :class="modelsOpen && 'rotate-180'" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+      </div>
+
+      <div x-show="modelsOpen" x-transition class="border-t border-gray-800">
+        <!-- News Sentiment -->
+        <div class="px-5 py-2 border-b border-gray-800/50">
+          <h3 class="text-[11px] font-medium text-amber-400">News Sentiment</h3>
+          <p class="text-[9px] text-gray-600">Used during data update to score news articles. Prefer fast, cheap models.</p>
+        </div>
+        <div class="divide-y divide-gray-800/30">
+          <template x-for="m in sentimentModels" :key="m.id">
+            <div class="flex items-center gap-3 px-5 py-2.5 hover:bg-gray-800/30 transition cursor-pointer" @click="editModel(m)">
+              <button @click.stop="setDefault(m.id, 'sentiment')"
+                class="w-4 h-4 rounded-full border-2 flex-shrink-0 transition"
+                :class="m.is_default_sentiment ? 'border-amber-500 bg-amber-500' : 'border-gray-600 hover:border-gray-400'"></button>
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-2">
+                  <span class="text-xs font-medium text-gray-200" x-text="m.display_name"></span>
+                  <span class="text-[9px] px-1.5 py-0.5 rounded bg-gray-700 text-gray-400" x-text="m.api_format"></span>
+                  <span x-show="m.supports_thinking" class="text-[9px] px-1.5 py-0.5 rounded bg-purple-900/40 text-purple-400">thinking</span>
+                  <span x-show="m.is_default_sentiment" class="text-[9px] px-1.5 py-0.5 rounded bg-amber-900/40 text-amber-400">default</span>
+                </div>
+                <span class="text-[10px] text-gray-500 mono" x-text="m.model_id"></span>
+              </div>
+              <div class="flex items-center gap-2">
+                <span class="text-[10px]" :class="m.has_key ? 'text-green-500' : 'text-red-400'" x-text="m.has_key ? 'Key set' : 'No key'"></span>
+                <svg class="w-3.5 h-3.5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <!-- Stock Analysis -->
+        <div class="px-5 py-2 border-t border-b border-gray-800/50">
+          <h3 class="text-[11px] font-medium text-indigo-400">Stock Analysis</h3>
+          <p class="text-[9px] text-gray-600">Used by Long-Term, Swing, and Position Review skills. Prefer capable reasoning models.</p>
+        </div>
+        <div class="divide-y divide-gray-800/30">
+          <template x-for="m in analysisModels" :key="m.id">
+            <div class="flex items-center gap-3 px-5 py-2.5 hover:bg-gray-800/30 transition cursor-pointer" @click="editModel(m)">
+              <button @click.stop="setDefault(m.id, 'analysis')"
+                class="w-4 h-4 rounded-full border-2 flex-shrink-0 transition"
+                :class="m.is_default_analysis ? 'border-indigo-500 bg-indigo-500' : 'border-gray-600 hover:border-gray-400'"></button>
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-2">
+                  <span class="text-xs font-medium text-gray-200" x-text="m.display_name"></span>
+                  <span class="text-[9px] px-1.5 py-0.5 rounded bg-gray-700 text-gray-400" x-text="m.api_format"></span>
+                  <span x-show="m.supports_thinking" class="text-[9px] px-1.5 py-0.5 rounded bg-purple-900/40 text-purple-400">thinking</span>
+                  <span x-show="m.is_default_analysis" class="text-[9px] px-1.5 py-0.5 rounded bg-indigo-900/40 text-indigo-400">default</span>
+                </div>
+                <span class="text-[10px] text-gray-500 mono" x-text="m.model_id"></span>
+              </div>
+              <div class="flex items-center gap-2">
+                <span class="text-[10px]" :class="m.has_key ? 'text-green-500' : 'text-red-400'" x-text="m.has_key ? 'Key set' : 'No key'"></span>
+                <svg class="w-3.5 h-3.5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <!-- Add Model -->
+        <div class="px-5 py-3 border-t border-gray-800/50">
+          <button @click="startAddModel()"
+            class="w-full py-2.5 rounded-lg border border-dashed border-gray-700 text-xs text-gray-500 hover:text-white hover:border-gray-500 transition">
+            + Add Model
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════════════════════════ -->
+    <!-- Skill Prompts (collapsible)                                          -->
+    <!-- ══════════════════════════════════════════════════════════════════════ -->
+    <div id="skill-prompts" class="bg-gray-900 border border-gray-800 rounded-xl">
+      <div class="px-5 py-3 flex items-center justify-between cursor-pointer hover:bg-gray-800/30 transition" @click="promptsOpen = !promptsOpen">
+        <div class="flex items-center gap-3">
+          <h2 class="text-sm font-medium text-gray-200">Skill Prompts</h2>
+          <span class="text-[10px] text-gray-600" x-text="customCount + '/3 customized'"></span>
+        </div>
+        <svg class="w-4 h-4 text-gray-600 transition" :class="promptsOpen && 'rotate-180'" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+      </div>
+
+      <div x-show="promptsOpen" x-transition class="border-t border-gray-800">
+
+        <div class="px-5 py-2.5 text-[11px] text-gray-500 border-b border-gray-800/50">
+          Customize the analysis prompts. Data is injected automatically — focus on analysis logic and output format.
+          <span class="text-gray-600" x-text="'(' + (lang === 'cn' ? '当前：中文' : 'Current: English') + ')'"></span>
+        </div>
+
+        <!-- Prompt Design Guide -->
+        <div x-data="{ refOpen: false, copied: false }" class="border-b border-gray-800/50">
+          <div class="px-5 py-2.5 flex items-center justify-between cursor-pointer hover:bg-gray-800/20 transition" @click="refOpen = !refOpen">
+            <div class="flex items-center gap-2">
+              <svg class="w-3.5 h-3.5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>
+              <span class="text-xs text-gray-300">Prompt Design Guide</span>
+              <span class="text-[9px] px-1.5 py-0.5 rounded bg-indigo-900/40 text-indigo-400">copy &amp; send to AI</span>
+            </div>
+            <svg class="w-3.5 h-3.5 text-gray-600 transition" :class="refOpen && 'rotate-180'" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+          </div>
+          <div x-show="refOpen" x-transition class="border-t border-gray-800/30">
+            <div class="px-5 py-2 flex justify-end bg-gray-800/10">
+              <button @click="navigator.clipboard.writeText($refs.metaPrompt.innerText); copied=true; setTimeout(()=>copied=false, 2000)"
+                class="flex items-center gap-1.5 px-3 py-1 rounded text-[11px] transition"
+                :class="copied ? 'bg-green-900/40 text-green-400' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'">
+                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+                <span x-text="copied ? 'Copied!' : 'Copy All'"></span>
+              </button>
+            </div>
+            <div x-ref="metaPrompt" class="px-5 py-4 text-[11px] text-gray-400 leading-relaxed space-y-4 max-h-[70vh] overflow-y-auto">
+
+<p class="text-gray-300 font-medium text-xs">I need you to help me design stock analysis prompts for my trading system (TT AI Screener). The system feeds real market data as JSON to an AI model, and the AI follows my prompt to analyze stocks. Please design the prompt I describe — output ONLY the prompt text itself (in markdown), no wrapper explanation.</p>
+
+<p class="text-gray-300 font-medium text-xs">--- SYSTEM ARCHITECTURE ---</p>
+
+<p>The system has 3 analysis skills. Each skill receives a JSON data payload automatically — the prompt only needs to define the analysis logic and output format. The user DOES NOT need to write SQL or fetch data; the system handles all data assembly.</p>
+
+<p class="font-medium text-gray-300">Skill 1: Long-Term Screen (longterm_screen)</p>
+<p>Purpose: Screen for quality stocks worth holding 6-12 months. Fundamentals-driven.<br>
+Input JSON structure:</p>
+<pre class="bg-gray-950/50 rounded p-2 mono text-[10px] text-gray-500 overflow-x-auto">{
+  "date": "2026-06-17",
+  "source": "built-in criteria (...)" | "screener (N tickers)",
+  "candidates_count": 50,
+  "candidates": [
+    {
+      "ticker": "AAPL", "company_name": "Apple Inc.", "sector": "Technology",
+      // --- Fundamentals ---
+      "revenue_growth_yoy": 0.25,     // YoY revenue growth (0.25 = 25%)
+      "earnings_growth_yoy": 0.30,    // YoY earnings growth
+      "gross_margin": 0.45,           // Gross margin ratio
+      "pe_ratio": 28.5,               // Price-to-Earnings
+      "ps_ratio": 7.2,                // Price-to-Sales
+      "pb_ratio": 12.1,               // Price-to-Book
+      "peg_ratio": 1.1,               // PEG (PE / growth), &lt;1 = undervalued
+      "market_cap": 3200000000000,    // Market cap in USD
+      "roe": 0.35,                    // Return on Equity
+      "fcf_yield": 0.04,             // Free Cash Flow Yield
+      // --- Analyst ---
+      "analyst_rating": "buy",        // buy | hold | sell | strong_buy | strong_sell
+      "analyst_target_price": 210.0,  // Consensus target price
+      "analyst_count": 32,            // Number of analysts covering
+      // --- Insider ---
+      "mspr": 15.3,                   // Month Share Purchase Ratio (Finnhub)
+                                      // &gt;0 = net buying, &lt;0 = net selling, null = no data
+      // --- Earnings ---
+      "next_earnings_date": "2026-07-25",
+      "last_earnings_date": "2026-04-30",
+      // --- Technical (latest trading day) ---
+      "close": 195.5,                 // Latest close price
+      "ma_20": 190.0,                 // 20-day moving average
+      "ma_50": 185.0,                 // 50-day MA
+      "ma_200": 170.0,               // 200-day MA
+      "rsi_14": 55.2,                // RSI(14), 30=oversold, 70=overbought
+      "dist_ma20_pct": 0.029,        // Distance from MA20 (0.029 = +2.9%)
+      "dist_ma50_pct": 0.057,        // Distance from MA50
+      "vol_ratio": 1.35,             // Volume / 20-day avg volume
+      "atr_pct": 0.023,              // ATR(14) / close, daily volatility
+      "high_20": 198.0,              // 20-day high
+      "pct_chg": 0.012,              // Today's price change %
+      // --- News (last 30 days, up to 5 per ticker) ---
+      "recent_news": [
+        {
+          "headline": "Apple beats Q2 estimates...",
+          "sentiment_label": "positive",  // positive | negative | neutral
+          "sentiment_score": 0.72,        // AI score: -1.0 (very negative) to +1.0 (very positive)
+          "published_at": "2026-06-15 14:30:00"
+        }
+      ]
+    }
+  ]
+}</pre>
+
+<p class="font-medium text-gray-300">Skill 2: Swing Screen (swing_screen)</p>
+<p>Purpose: Find 2-20 day swing trade setups. Technically driven.<br>
+Input JSON structure:</p>
+<pre class="bg-gray-950/50 rounded p-2 mono text-[10px] text-gray-500 overflow-x-auto">{
+  "date": "2026-06-17",
+  "source": "built-in criteria (...)" | "screener (N tickers)",
+  "candidates_count": 100,
+  "candidates": [
+    {
+      "ticker": "NVDA", "company_name": "NVIDIA Corp", "sector": "Technology",
+      // --- Technical (primary, always present) ---
+      "close": 120.5, "ma_20": 118.0, "ma_50": 110.0, "ma_200": 95.0,
+      "rsi_14": 58.0,                // RSI(14), 30=oversold, 70=overbought
+      "vol_ratio": 1.8,             // volume / 20-day avg, &gt;1.5 = surge
+      "atr_pct": 0.03,              // ATR(14)/close, daily volatility
+      "dist_ma20_pct": 0.021,       // (close-MA20)/MA20, +=above MA
+      "dist_ma50_pct": 0.095,
+      "high_20": 122.0,             // 20-day high; close &ge; high_20*0.99 = breakout
+      "pct_chg": 0.015,             // today's price change %
+      // --- Fundamental risk check (may be null) ---
+      "next_earnings_date": "2026-07-10",  // within 7 days = earnings risk
+      "pe_ratio": 45.0,
+      "revenue_growth_yoy": 0.22,
+      // --- News (last 7 days, up to 3 per ticker) ---
+      "recent_news": [
+        { "headline": "...", "sentiment_label": "positive",
+          "sentiment_score": 0.6, "published_at": "2026-06-15 14:30:00" }
+      ]
+    }
+  ]
+}</pre>
+<p class="text-gray-500"><b class="text-gray-400">Source note:</b> When <b>built-in</b>, candidates are pre-filtered (close&gt;MA20 &amp; &gt;MA50, MA20&gt;MA50, vol_ratio&gt;1.2, RSI 45-75) and carry ONLY the fields above. When <b>screener</b>, candidates also include the full Long-Term fundamental block (analyst_*, mspr, gross_margin, peg_ratio, etc.) but are NOT trend-pre-filtered — the prompt should re-check trend itself.</p>
+
+<p class="font-medium text-gray-300">Skill 3: Position Review (position_review)</p>
+<p>Purpose: Evaluate existing holdings — continue, add, reduce, or exit.<br>
+Input JSON structure:</p>
+<pre class="bg-gray-950/50 rounded p-2 mono text-[10px] text-gray-500 overflow-x-auto">{
+  "date": "2026-06-17",
+  "positions_count": 3,
+  "positions": [
+    {
+      "ticker": "AAPL", "company_name": "Apple Inc.",
+      "sector": "Technology", "industry": "Consumer Electronics",
+      // All technical + fundamental fields (same as above)
+      // Plus:
+      "cost_basis": 150.0,    // User's average entry price
+      "shares": 20,           // Number of shares held
+      // news: last 30 days, up to 20 per ticker (more for holdings)
+      "news": [ { "headline": "...", "sentiment_label": "...", "sentiment_score": 0.5, "published_at": "..." } ]
+    }
+  ]
+}</pre>
+
+<p class="text-gray-300 font-medium text-xs">--- KEY DATA NOTES ---</p>
+
+<ul class="list-disc list-inside space-y-1 text-gray-500">
+  <li><b class="text-gray-400">mspr</b> (Month Share Purchase Ratio): Finnhub insider metric. Positive = insiders buying, negative = selling. Often NULL for small/mid-caps — treat null as neutral, not negative.</li>
+  <li><b class="text-gray-400">sentiment_score</b>: AI-scored from -1.0 to +1.0. Not all news has scores. Label can be positive/negative/neutral.</li>
+  <li><b class="text-gray-400">vol_ratio</b>: Today's volume divided by 20-day avg. &gt;1.5 = significant volume surge. &lt;0.5 = quiet day.</li>
+  <li><b class="text-gray-400">atr_pct</b>: ATR(14) / close price. Represents typical daily % move. Useful for stop-loss and target calculation.</li>
+  <li><b class="text-gray-400">dist_ma20_pct / dist_ma50_pct</b>: (close - MA) / MA. Positive = above MA, negative = below. Useful for mean-reversion and trend strength.</li>
+  <li><b class="text-gray-400">high_20</b>: 20-day high. close &ge; high_20 * 0.99 indicates breakout.</li>
+  <li><b class="text-gray-400">analyst_rating</b>: String: buy, hold, sell, strong_buy, strong_sell. Can be null.</li>
+  <li><b class="text-gray-400">peg_ratio</b>: PE / expected growth. &lt;1 = undervalued relative to growth. Can be null or negative (meaningless if earnings negative).</li>
+  <li><b class="text-gray-400">Null values</b>: Many fields can be null (especially for IPOs, small-caps, or tickers with limited coverage). Prompt should handle nulls gracefully.</li>
+</ul>
+
+<p class="text-gray-300 font-medium text-xs">--- PROMPT DESIGN RULES ---</p>
+
+<ul class="list-disc list-inside space-y-1 text-gray-500">
+  <li>The prompt is a system instruction given to an AI model. Data arrives in the user message as JSON.</li>
+  <li>DO NOT include SQL queries in the prompt — the system handles data fetching. The prompt only defines analysis logic.</li>
+  <li>Define clear scoring/rating criteria so the AI produces consistent, structured output.</li>
+  <li>Define an output format: per-ticker analysis blocks + a summary table. Use plain text (markdown-compatible), not HTML.</li>
+  <li>Keep the prompt under 6000 characters to leave room for data and AI response.</li>
+  <li>The AI has the role "professional stock analyst" — your prompt defines the methodology, not the persona.</li>
+  <li>Output language should match the prompt language (the system handles this automatically).</li>
+</ul>
+
+<p class="text-gray-300 font-medium text-xs">--- YOUR REQUEST ---</p>
+<p class="text-gray-500">[Tell the AI which skill you want to redesign (Long-Term / Swing / Position Review), your trading style, what you care about most, and any specific output format preferences. Examples:]</p>
+<ul class="list-disc list-inside space-y-0.5 text-gray-500 italic">
+  <li>"Design a Long-Term Screen prompt focused on value investing — I care about low PE, high FCF yield, and dividend growth more than revenue growth."</li>
+  <li>"Design a Swing Screen prompt for momentum breakout trading. I want clear entry/stop/target prices based on ATR."</li>
+  <li>"Design a Position Review prompt that emphasizes risk management — I want drawdown alerts, sector concentration warnings, and forced sell triggers."</li>
+  <li>"Redesign all 3 prompts in Chinese. My style is aggressive growth investing with 30% max drawdown tolerance."</li>
+</ul>
+
+            </div>
+          </div>
+        </div>
+
+        <!-- 3 Skill editors -->
+        <template x-for="sk in skillList" :key="sk.key">
+          <div class="border-b border-gray-800/30 last:border-b-0">
+            <div class="px-5 py-2.5 flex items-center justify-between cursor-pointer hover:bg-gray-800/20 transition"
+                 @click="toggleSkillEditor(sk.key)">
+              <div class="flex items-center gap-2">
+                <span class="text-xs font-medium" :class="sk.color" x-text="sk.label"></span>
+                <span x-show="prompts[sk.key]?.is_custom"
+                  class="text-[9px] px-1.5 py-0.5 rounded bg-orange-900/40 text-orange-400">custom</span>
+                <span x-show="!prompts[sk.key]?.is_custom"
+                  class="text-[9px] px-1.5 py-0.5 rounded bg-gray-700 text-gray-500">default</span>
+              </div>
+              <svg class="w-3.5 h-3.5 text-gray-600 transition" :class="promptOpen === sk.key && 'rotate-180'" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+            </div>
+            <div x-show="promptOpen === sk.key" x-transition class="px-5 pb-4 space-y-3">
+              <textarea
+                :id="'prompt-' + sk.key"
+                class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-xs mono leading-relaxed focus:outline-none focus:border-indigo-500 resize-y"
+                style="min-height: 320px; max-height: 70vh;"
+                :value="promptEdits[sk.key] ?? prompts[sk.key]?.active ?? ''"
+                @input="promptEdits[sk.key] = $event.target.value"
+              ></textarea>
+              <div class="flex items-center gap-2">
+                <button @click="savePrompt(sk.key)"
+                  class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-medium transition"
+                  :class="hasPromptChange(sk.key) ? '' : 'opacity-50 cursor-not-allowed'"
+                  :disabled="!hasPromptChange(sk.key)">Save</button>
+                <button @click="resetPrompt(sk.key)"
+                  x-show="prompts[sk.key]?.is_custom"
+                  class="px-4 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs text-gray-400 transition">Reset to Default</button>
+                <button @click="viewDefault(sk.key)"
+                  x-show="prompts[sk.key]?.is_custom"
+                  class="px-4 py-1.5 text-xs text-gray-500 hover:text-gray-300 transition">View Default</button>
+                <span x-show="promptSaved === sk.key" class="text-[10px] text-green-500 ml-2">Saved</span>
+              </div>
+            </div>
+          </div>
+        </template>
+
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ═══ Edit Model Modal ═══ -->
+  <div x-show="editOpen" x-transition.opacity class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+    <div class="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl w-[520px] p-6 space-y-4" @click.away="editOpen=false">
+      <div class="flex items-center justify-between">
+        <h3 class="text-sm font-medium" x-text="editForm._isEdit ? 'Edit Model' : 'Add Model'"></h3>
+        <button @click="editOpen=false" class="text-gray-500 hover:text-white">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="text-[10px] text-gray-500 block mb-1">ID</label>
+          <input x-model="editForm.id" :disabled="editForm._isEdit" type="text" placeholder="my-gpt4o"
+            class="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-2 text-xs mono focus:outline-none focus:border-indigo-500 disabled:opacity-50">
+        </div>
+        <div>
+          <label class="text-[10px] text-gray-500 block mb-1">Display Name</label>
+          <input x-model="editForm.display_name" type="text" placeholder="GPT-4o"
+            class="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-2 text-xs focus:outline-none focus:border-indigo-500">
+        </div>
+      </div>
+      <div>
+        <label class="text-[10px] text-gray-500 block mb-1">API Base URL</label>
+        <input x-model="editForm.api_base" type="text" placeholder="https://api.openai.com/v1"
+          class="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-2 text-xs mono focus:outline-none focus:border-indigo-500">
+      </div>
+      <div>
+        <label class="text-[10px] text-gray-500 block mb-1">API Key</label>
+        <input x-model="editForm.api_key" type="password" :placeholder="editForm._isEdit ? '(leave empty to keep current)' : 'sk-...'"
+          class="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-2 text-xs mono focus:outline-none focus:border-indigo-500">
+      </div>
+      <div class="grid grid-cols-3 gap-3">
+        <div>
+          <label class="text-[10px] text-gray-500 block mb-1">Model ID</label>
+          <input x-model="editForm.model_id" type="text" placeholder="gpt-4o"
+            class="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-2 text-xs mono focus:outline-none focus:border-indigo-500">
+        </div>
+        <div>
+          <label class="text-[10px] text-gray-500 block mb-1">API Format</label>
+          <select x-model="editForm.api_format"
+            class="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-2 text-xs focus:outline-none focus:border-indigo-500">
+            <option value="openai">OpenAI</option>
+            <option value="anthropic">Anthropic</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-[10px] text-gray-500 block mb-1">Role</label>
+          <select x-model="editForm.role"
+            class="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-2 text-xs focus:outline-none focus:border-indigo-500">
+            <option value="both">Both</option>
+            <option value="sentiment">Sentiment Only</option>
+            <option value="analysis">Analysis Only</option>
+          </select>
+        </div>
+      </div>
+      <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+        <input type="checkbox" x-model="editForm.supports_thinking" class="rounded bg-gray-800 border-gray-600 text-indigo-500 focus:ring-0 w-3.5 h-3.5">
+        Supports Thinking / Reasoning (Qwen-max, Claude Opus/Sonnet)
+      </label>
+      <div class="flex gap-2 pt-2">
+        <button @click="saveModel()" class="flex-1 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-medium transition">Save</button>
+        <button @click="editOpen=false" class="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm text-gray-400 transition">Cancel</button>
+        <button x-show="editForm._isEdit" @click="deleteModel(editForm.id)"
+          class="px-4 py-2 bg-red-900/30 hover:bg-red-800/50 rounded-lg text-sm text-red-400 transition">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ View Default Modal ═══ -->
+  <div x-show="defaultViewOpen" x-transition.opacity class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+    <div class="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl w-[700px] max-h-[80vh] flex flex-col" @click.away="defaultViewOpen=false">
+      <div class="flex items-center justify-between px-5 py-3 border-b border-gray-800">
+        <h3 class="text-sm font-medium text-gray-300">Default Prompt</h3>
+        <button @click="defaultViewOpen=false" class="text-gray-500 hover:text-white">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="flex-1 overflow-y-auto px-5 py-4">
+        <pre class="text-xs mono text-gray-400 leading-relaxed whitespace-pre-wrap" x-text="defaultViewText"></pre>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function settingsApp() {
+      return {
+        models: [],
+        lang: 'en',
+        editOpen: false,
+        editForm: {},
+        modelsOpen: false,
+        promptsOpen: false,
+        scheduleEnabled: false,
+        scheduleTime: '17:30',
+        scheduleSaved: null,
+        // prompts
+        prompts: {},
+        promptOpen: null,
+        promptEdits: {},
+        promptSaved: null,
+        defaultViewOpen: false,
+        defaultViewText: '',
+        skillList: [
+          { key: 'longterm_screen', label: 'Long-Term Screen', color: 'text-emerald-400' },
+          { key: 'swing_screen', label: 'Swing Screen', color: 'text-blue-400' },
+          { key: 'position_review', label: 'Position Review', color: 'text-purple-400' },
+        ],
+
+        get sentimentModels() {
+          return this.models.filter(m => m.role === 'sentiment' || m.role === 'both')
+        },
+        get analysisModels() {
+          return this.models.filter(m => m.role === 'analysis' || m.role === 'both')
+        },
+        get customCount() {
+          return this.skillList.filter(sk => this.prompts[sk.key]?.is_custom).length
+        },
+
+        async init() {
+          await this.refreshModels()
+          const langRes = await fetch('/settings/lang')
+          const langData = await langRes.json()
+          this.lang = langData.lang || 'en'
+          await this.refreshPrompts()
+          const schRes = await fetch('/settings/schedule')
+          const schData = await schRes.json()
+          this.scheduleEnabled = schData.enabled || false
+          this.scheduleTime = schData.time || '17:30'
+          if (window.location.hash === '#skill-prompts') {
+            this.promptsOpen = true
+            this.$nextTick(() => document.getElementById('skill-prompts')?.scrollIntoView({ behavior: 'smooth' }))
+          }
+        },
+
+        async saveSchedule() {
+          await fetch('/settings/schedule', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: this.scheduleEnabled, time: this.scheduleTime }),
+          })
+          this.scheduleSaved = true
+          setTimeout(() => this.scheduleSaved = false, 2000)
+        },
+
+        async setLang(newLang) {
+          await fetch('/settings/lang', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ lang: newLang }),
+          })
+          this.lang = newLang
+          this.promptEdits = {}
+          this.promptOpen = null
+          await this.refreshPrompts()
+        },
+
+        async refreshPrompts() {
+          const res = await fetch('/settings/prompts')
+          const data = await res.json()
+          this.prompts = data.prompts || {}
+        },
+
+        toggleSkillEditor(key) {
+          if (this.promptOpen === key) {
+            this.promptOpen = null
+          } else {
+            this.promptOpen = key
+            this.$nextTick(() => {
+              const el = document.getElementById('prompt-' + key)
+              if (el && !el.value) el.value = this.prompts[key]?.active ?? ''
+            })
+          }
+          this.promptSaved = null
+        },
+
+        hasPromptChange(key) {
+          const edit = this.promptEdits[key]
+          if (edit === undefined || edit === null) return false
+          const current = this.prompts[key]?.active ?? ''
+          return edit !== current
+        },
+
+        async savePrompt(key) {
+          const text = this.promptEdits[key] ?? ''
+          await fetch('/settings/prompts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ skill: key, prompt: text }),
+          })
+          this.promptSaved = key
+          delete this.promptEdits[key]
+          await this.refreshPrompts()
+          setTimeout(() => { if (this.promptSaved === key) this.promptSaved = null }, 2000)
+        },
+
+        async resetPrompt(key) {
+          if (!confirm('Reset to default prompt? Your custom prompt will be deleted.')) return
+          await fetch('/settings/prompts/reset', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ skill: key }),
+          })
+          delete this.promptEdits[key]
+          await this.refreshPrompts()
+          this.$nextTick(() => {
+            const el = document.getElementById('prompt-' + key)
+            if (el) el.value = this.prompts[key]?.active ?? ''
+          })
+        },
+
+        viewDefault(key) {
+          this.defaultViewText = this.prompts[key]?.default ?? ''
+          this.defaultViewOpen = true
+        },
+
+        async refreshModels() {
+          const res = await fetch('/models')
+          const data = await res.json()
+          this.models = data.models || []
+        },
+
+        editModel(m) {
+          this.editForm = {
+            id: m.id, display_name: m.display_name, api_base: m.api_base,
+            api_key: '', model_id: m.model_id, api_format: m.api_format,
+            role: m.role, supports_thinking: m.supports_thinking, _isEdit: true,
+          }
+          this.editOpen = true
+        },
+
+        startAddModel() {
+          this.editForm = {
+            id: '', display_name: '', api_base: '', api_key: '',
+            model_id: '', api_format: 'openai', role: 'both',
+            supports_thinking: false, _isEdit: false,
+          }
+          this.editOpen = true
+        },
+
+        async saveModel() {
+          const f = this.editForm
+          if (!f.id || !f.display_name || !f.api_base || !f.model_id) {
+            alert('Please fill ID, Name, API Base, and Model ID')
+            return
+          }
+          await fetch('/models', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(f),
+          })
+          this.editOpen = false
+          await this.refreshModels()
+        },
+
+        async deleteModel(id) {
+          if (!confirm('Delete model ' + id + '?')) return
+          await fetch('/models/' + id, { method: 'DELETE' })
+          this.editOpen = false
+          await this.refreshModels()
+        },
+
+        async setDefault(id, role) {
+          const m = this.models.find(m => m.id === id)
+          if (!m) return
+          await fetch('/models', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              ...m, api_key: '',
+              is_default_sentiment: role === 'sentiment' ? true : m.is_default_sentiment,
+              is_default_analysis: role === 'analysis' ? true : m.is_default_analysis,
+            }),
+          })
+          await this.refreshModels()
+        },
+      }
+    }
+  </script>
+</body>
+</html>

@@ -1,7 +1,0 @@
-# Add your stock tickers here, one per line.
-# Lines starting with # are comments.
-# Example:
-AAPL
-NVDA
-MSFT
-TSLA

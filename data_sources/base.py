@@ -14,10 +14,19 @@ class OHLCVProvider(ABC):
 class FundamentalsProvider(ABC):
     @abstractmethod
     def fetch_fundamentals(self, ticker: str) -> dict:
-        """Fetch fundamental metrics for a single ticker.
+        """Fetch fundamental metrics + earnings + insider data (rate-limited).
         Returns dict with keys: pe_ratio, ps_ratio, pb_ratio, peg_ratio,
         market_cap, revenue_growth_yoy, earnings_growth_yoy, gross_margin,
-        roe, fcf_yield, company_name, sector, industry, exchange."""
+        roe, fcf_yield, company_name, sector, industry, exchange,
+        next_earnings_date, last_earnings_date, mspr."""
+        ...
+
+    @abstractmethod
+    def fetch_analyst_data(self, ticker: str) -> dict:
+        """Fetch analyst data from a fast source (no strict rate limit).
+        Returns dict with keys: analyst_rating, analyst_target_price,
+        analyst_count. May also fill pe_ratio, ps_ratio, pb_ratio, peg_ratio,
+        fcf_yield as fallback."""
         ...
 
 class NewsProvider(ABC):

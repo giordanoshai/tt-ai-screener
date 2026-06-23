@@ -62,9 +62,9 @@ def fetch_ohlcv(tickers: list[str]):
                 if sub.empty:
                     continue
                 sub = _calc_indicators(sub)
-                sub = sub.dropna(subset=["ma_20"])
-                if sub.empty:
-                    continue
+                for col in OHLCV_COLS:
+                    if col not in sub.columns:
+                        sub[col] = None
                 sub = sub[OHLCV_COLS]
                 con.execute(f"DELETE FROM stock_ohlcv_daily WHERE ticker = ?", [ticker])
                 con.execute("INSERT INTO stock_ohlcv_daily SELECT * FROM sub")

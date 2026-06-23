@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tt-trading-mcp management script
+# TT AI Screener management script
 # Usage: ./manage.sh [start|stop|restart|status]
 
 set -e

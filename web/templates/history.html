@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>History — TT AI Screener</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .mono { font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code', ui-monospace, monospace; }
+    .line-clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen" x-data="historyApp()" x-cloak>
+
+  {% set header_right_content %}
+    <span class="text-[11px] text-gray-500" x-text="history.length + ' records'"></span>
+  {% endset %}
+  {% include "header.html" %}
+
+  <div class="max-w-5xl mx-auto px-6 py-6 space-y-4">
+
+    <!-- Filter -->
+    <div class="flex items-center gap-2">
+      <span class="text-xs text-gray-500">Filter:</span>
+      <button @click="filter=''" :class="!filter ? 'bg-gray-700 text-white' : 'bg-gray-800 text-gray-500 hover:text-gray-300'"
+        class="text-[11px] px-2.5 py-1 rounded transition">All</button>
+      <button @click="filter='longterm_screen'" :class="filter==='longterm_screen' ? 'bg-emerald-900/60 text-emerald-400' : 'bg-gray-800 text-gray-500 hover:text-gray-300'"
+        class="text-[11px] px-2.5 py-1 rounded transition">Long-Term</button>
+      <button @click="filter='swing_screen'" :class="filter==='swing_screen' ? 'bg-blue-900/60 text-blue-400' : 'bg-gray-800 text-gray-500 hover:text-gray-300'"
+        class="text-[11px] px-2.5 py-1 rounded transition">Swing</button>
+      <button @click="filter='position_review'" :class="filter==='position_review' ? 'bg-purple-900/60 text-purple-400' : 'bg-gray-800 text-gray-500 hover:text-gray-300'"
+        class="text-[11px] px-2.5 py-1 rounded transition">Position</button>
+    </div>
+
+    <!-- List -->
+    <div x-show="!filtered.length" class="py-16 text-center text-gray-600 text-sm">No analysis history yet</div>
+
+    <div class="space-y-3">
+      <template x-for="h in filtered" :key="h.id">
+        <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+          <!-- Header -->
+          <div class="px-5 py-3 flex items-center justify-between cursor-pointer hover:bg-gray-800/30 transition" @click="h._open = !h._open">
+            <div class="flex items-center gap-3">
+              <span class="text-[10px] px-2 py-0.5 rounded font-medium"
+                :class="h.skill === 'longterm_screen' ? 'bg-emerald-900/40 text-emerald-400'
+                       : h.skill === 'swing_screen' ? 'bg-blue-900/40 text-blue-400'
+                       : 'bg-purple-900/40 text-purple-400'"
+                x-text="({longterm_screen:'Long-Term', swing_screen:'Swing', position_review:'Position'})[h.skill] || h.skill"></span>
+              <span class="text-xs text-gray-300 mono" x-text="formatTickers(h.tickers)"></span>
+              <span class="text-[10px] text-gray-600" x-text="h.ticker_count ? h.ticker_count + ' tickers' : ''"></span>
+            </div>
+            <div class="flex items-center gap-3">
+              <span class="text-[10px] text-gray-600" x-text="h.model || ''"></span>
+              <span class="text-[10px] text-gray-500" x-text="formatTime(h.created_at)"></span>
+              <svg class="w-4 h-4 text-gray-600 transition" :class="h._open && 'rotate-180'" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+              </svg>
+            </div>
+          </div>
+          <!-- Preview -->
+          <div x-show="!h._open" class="px-5 pb-3">
+            <p class="text-[11px] text-gray-500 line-clamp-2 leading-relaxed" x-text="h.analysis_text?.substring(0, 300)"></p>
+          </div>
+          <!-- Full -->
+          <div x-show="h._open" class="px-5 pb-4">
+            <div class="bg-gray-950/50 rounded-lg p-4 text-xs text-gray-300 leading-relaxed whitespace-pre-wrap max-h-[70vh] overflow-y-auto mono"
+                 x-text="h.analysis_text"></div>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>
+
+  <script>
+    function historyApp() {
+      return {
+        history: [],
+        filter: '',
+
+        get filtered() {
+          if (!this.filter) return this.history
+          return this.history.filter(h => h.skill === this.filter)
+        },
+
+        async init() {
+          const res = await fetch('/analyze/history?limit=100')
+          const data = await res.json()
+          this.history = (data.history || []).map(h => ({ ...h, _open: false }))
+        },
+
+        formatTickers(tickers) {
+          if (!tickers) return ''
+          const arr = tickers.split(',')
+          if (arr.length <= 5) return arr.join(', ')
+          return arr.slice(0, 4).join(', ') + ' +' + (arr.length - 4) + ' more'
+        },
+
+        formatTime(ts) {
+          if (!ts) return ''
+          try {
+            const d = new Date(ts)
+            return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' ' +
+                   d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })
+          } catch { return ts }
+        },
+      }
+    }
+  </script>
+</body>
+</html>

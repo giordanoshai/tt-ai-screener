@@ -8,8 +8,10 @@ import yfinance as yf
 from data_sources.base import OHLCVProvider, FundamentalsProvider, NewsProvider
 
 
+from config import FINNHUB_TIER
+
 FINNHUB_BASE = "https://finnhub.io/api/v1"
-RATE_LIMIT_SLEEP = 1.1
+RATE_LIMIT_SLEEP = 0.12 if FINNHUB_TIER == "premium" else 1.1
 
 
 class YFinanceOHLCVProvider(OHLCVProvider):
@@ -79,11 +81,13 @@ class FinnhubFundamentalsProvider(FundamentalsProvider):
         return r.json()
 
     def fetch_fundamentals(self, ticker: str) -> dict:
-        # --- Finnhub metrics + profile ---
+        """Finnhub-only: metrics + profile + earnings + insider (4 API calls, rate-limited)."""
+        # --- metrics ---
         data = self._get("/stock/metric", {"symbol": ticker, "metric": "all"})
         m = data.get("metric", {})
         time.sleep(RATE_LIMIT_SLEEP)
 
+        # --- profile ---
         profile = self._get("/stock/profile2", {"symbol": ticker})
         time.sleep(RATE_LIMIT_SLEEP)
 
@@ -111,47 +115,12 @@ class FinnhubFundamentalsProvider(FundamentalsProvider):
             "exchange": profile.get("exchange", ""),
             "sector": profile.get("finnhubIndustry", ""),
             "industry": profile.get("finnhubIndustry", ""),
-            # placeholders filled below
-            "analyst_rating": None,
-            "analyst_target_price": None,
-            "analyst_count": None,
             "next_earnings_date": None,
             "last_earnings_date": None,
             "mspr": None,
         }
 
-        # --- yfinance: analyst data ---
-        try:
-            info = yf.Ticker(ticker).info
-            if info:
-                result["analyst_rating"] = info.get("recommendationKey")
-                result["analyst_target_price"] = info.get("targetMeanPrice")
-                result["analyst_count"] = info.get("numberOfAnalystOpinions")
-
-                pe_yf = info.get("trailingPE")
-                if pe_yf and not result["pe_ratio"]:
-                    result["pe_ratio"] = pe_yf
-                ps_yf = info.get("priceToSalesTrailing12Months")
-                if ps_yf and not result["ps_ratio"]:
-                    result["ps_ratio"] = ps_yf
-                pb_yf = info.get("priceToBook")
-                if pb_yf and not result["pb_ratio"]:
-                    result["pb_ratio"] = pb_yf
-
-                if not result["peg_ratio"]:
-                    earn_growth = info.get("earningsGrowth")
-                    if result["pe_ratio"] and earn_growth and earn_growth > 0:
-                        result["peg_ratio"] = round(result["pe_ratio"] / (earn_growth * 100), 2)
-
-                if not result["fcf_yield"]:
-                    fcf = info.get("freeCashflow")
-                    mcap = info.get("marketCap")
-                    if fcf and mcap:
-                        result["fcf_yield"] = round(fcf / mcap, 4)
-        except Exception:
-            pass
-
-        # --- Finnhub: earnings calendar ---
+        # --- earnings calendar ---
         try:
             today = date.today()
             cal = self._get("/calendar/earnings", {
@@ -174,7 +143,7 @@ class FinnhubFundamentalsProvider(FundamentalsProvider):
         except Exception:
             pass
 
-        # --- Finnhub: insider transactions (Form 4) → compute MSPR ---
+        # --- insider transactions (Form 4) → MSPR ---
         try:
             today_dt = date.today()
             ninety_days_ago = today_dt - timedelta(days=90)
@@ -207,6 +176,42 @@ class FinnhubFundamentalsProvider(FundamentalsProvider):
         except Exception:
             pass
 
+        return result
+
+    def fetch_analyst_data(self, ticker: str) -> dict:
+        """yfinance-only: analyst ratings + valuation fallbacks (fast, no Finnhub rate limit)."""
+        result = {
+            "analyst_rating": None,
+            "analyst_target_price": None,
+            "analyst_count": None,
+            "pe_ratio": None,
+            "ps_ratio": None,
+            "pb_ratio": None,
+            "peg_ratio": None,
+            "fcf_yield": None,
+        }
+        try:
+            info = yf.Ticker(ticker).info
+            if not info:
+                return result
+            result["analyst_rating"] = info.get("recommendationKey")
+            result["analyst_target_price"] = info.get("targetMeanPrice")
+            result["analyst_count"] = info.get("numberOfAnalystOpinions")
+            result["pe_ratio"] = info.get("trailingPE")
+            result["ps_ratio"] = info.get("priceToSalesTrailing12Months")
+            result["pb_ratio"] = info.get("priceToBook")
+
+            earn_growth = info.get("earningsGrowth")
+            pe = result["pe_ratio"]
+            if pe and earn_growth and earn_growth > 0:
+                result["peg_ratio"] = round(pe / (earn_growth * 100), 2)
+
+            fcf = info.get("freeCashflow")
+            mcap = info.get("marketCap")
+            if fcf and mcap:
+                result["fcf_yield"] = round(fcf / mcap, 4)
+        except Exception:
+            pass
         return result
 
 

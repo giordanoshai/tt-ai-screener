@@ -17,63 +17,23 @@ This is the canonical list of tools this server exposes. Each tool maps to a fun
 ### Screening
 | Tool | Params | Description |
 |---|---|---|
-| `screen_longterm_candidates` | `limit=20` | Fundamental screening: high growth, high margins, reasonable valuation + bullish yearly MA |
-| `screen_swing_candidates` | `limit=20`, `setup_type='all'/'breakout'/'pullback'` | Technical screening: breakout / pullback setups, all filtering done server-side |
-
-### Trades
-| Tool | Params | Description |
-|---|---|---|
-| `get_recent_trades` | `limit`, `status`, `start_date`, `end_date`, `trade_type`, `ticker`, `direction` | Query trade history. `trade_type`: `PAPER`=模拟, `STRAND`=实盘. `direction`: `LONG`/`SHORT` |
-| `get_recent_trades_light` | same as above | Lightweight version, less fields, saves tokens |
-| `get_trade_details` | `trade_id` (uuid or display_id) | Full trade detail including all execution legs |
-| `get_trade_emotions` | — | Emotional state logs linked to trades |
-
-### Market Data
-| Tool | Params | Description |
-|---|---|---|
-| `get_stock_ohlcv` | `ticker`(required), `start_date`, `end_date`, `limit=100` | Daily OHLCV + RSI14 + MAs for a ticker |
-| `get_stock_fundamentals` | `ticker`(required) | Latest fundamental snapshot for a ticker |
-| `get_latest_market_breadth` | `limit=5` | Recent market breadth & trend data |
-| `get_market_regime_history` | `limit=10`, `include_config=False` | Macro market regime: trend, volatility, trading recommendations. Set `include_config=True` for full scoring rules (token-heavy) |
-| `get_daily_news_summary` | `limit=5` | Daily news digest (morning + evening) |
-| `get_news_sentiment_summary` | `ticker`(required), `days=7` | Aggregated sentiment stats for a ticker, no full text, token-efficient |
-| `get_option_market_snapshots` | `trade_id` or `option_code`, `limit=100` | Options Greeks snapshot (delta, theta, IV) for a position |
-| `get_option_ohlcv` | — | Options OHLCV data |
+| `screen_stocks` | `screen_type`, `sector`, `min_market_cap`, `max_pe`, `min_growth`, `min_margin`, `min_rsi`, `max_rsi`, `above_ma`, `limit=20` | Parameterized stock screener. **At least one filter required** (no filter = rejected). `screen_type`: `longterm`/`swing` determines scoring. Filters: sector name, market cap (billions), PE cap, growth % floor, margin % floor, RSI range, MA price floor (20/50/200) |
 
 ### Watchlist
 | Tool | Params | Description |
 |---|---|---|
-| `get_user_watchlist` | `limit=100` | Current watchlist |
+| `list_watchlist` | — | List all watchlist tickers with latest price, daily change, and technicals |
 | `add_to_watchlist` | `ticker`(required) | Add ticker to watchlist |
 | `remove_from_watchlist` | `ticker`(required) | Remove ticker from watchlist |
-| `search_stocks_meta` | — | Search stock metadata |
+| `analyze_watchlist` | `analysis_type='longterm'`/`'swing'` | Run longterm or swing analysis on all watchlist tickers via skills engine |
 
-### Strategy & Rules
+### Positions
 | Tool | Params | Description |
 |---|---|---|
-| `get_strategy_templates` | `only_active=True` | User-defined strategy templates with buy/sell criteria and risk settings |
-| `get_trading_rules` | — | Risk parameters: max daily loss, max position size, etc. |
-| `get_strategy_signals` | — | Active signals from strategy templates |
-
-### Journal & Notes
-| Tool | Params | Description |
-|---|---|---|
-| `get_trader_daily_logs` | `limit=10`, `start_date` | Daily psychology log: sleep, focus, mood score, review notes |
-| `create_or_update_trader_daily_log` | — | Write/update a daily log entry |
-| `get_daily_trade_notes` | — | Notes attached to specific trades |
-| `get_recent_notes` | — | Recently created notes |
-| `create_note` | — | Create a new note |
-| `update_note` | — | Update existing note |
-
-### System
-| Tool | Params | Description |
-|---|---|---|
-| `get_activity_sessions` | — | User activity session history |
-| `get_energy_schedules` | — | Energy/focus schedule configuration |
-| `get_reward_config` | — | Gamification reward configuration |
-| `get_system_logs` | — | Server-side system logs |
-| `analyze_server_status` | — | Server health check |
-| `search_stock_news` | — | Search news by keyword/ticker |
+| `list_positions` | — | List all positions with current price, P&L (% and $), and portfolio summary |
+| `add_position` | `ticker`(required), `avg_cost`(required), `shares`(required) | Add or update a position |
+| `remove_position` | `ticker`(required) | Remove a position |
+| `analyze_positions` | — | Comprehensive analysis of all positions: technicals, fundamentals, news, P&L via skills engine |
 
 ---
 
@@ -82,18 +42,32 @@ This is the canonical list of tools this server exposes. Each tool maps to a fun
 ```
 tt-trading-mcp/
   server.py              # MCP server entrypoint — registers all tools
-  tools/
-    screening.py         # screen_longterm_candidates, screen_swing_candidates
-    trades.py            # get_recent_trades, get_trade_details, get_trade_emotions
-    market.py            # ohlcv, fundamentals, breadth, regime, news, options
-    watchlist.py         # get/add/remove watchlist, search_stocks_meta
-    strategy.py          # strategy_templates, trading_rules, signals
-    journal.py           # daily_logs, notes, create_or_update
-    system.py            # activity_sessions, server_status, system_logs
-  db/
-    schema.sql           # Full SQLite schema
-    seed.py              # Sample data / import scripts
   config.py              # DB path, API keys, data source settings
+  ai_client.py           # OpenAI-compatible AI client (sentiment + analysis)
+  tools/
+    screening.py         # screen_stocks (parameterized screener, filter required)
+    watchlist.py         # list/add/remove watchlist, analyze_watchlist
+    positions.py         # list/add/remove positions, analyze_positions
+  data_sources/
+    base.py              # Provider abstract classes
+    us_market.py         # yfinance + Finnhub implementations
+    registry.py          # Provider registry
+  db/
+    init.py              # DuckDB schema + migrations
+    update.py            # Daily incremental update pipeline
+    fetch.py             # Initial data fetch
+    universe.py          # CSV ticker import
+  skills/
+    __init__.py          # Analysis engine — DB queries + AI API orchestration
+    longterm_screen.md   # Long-term investing skill prompt
+    swing_screen.md      # Swing trade skill prompt
+    position_review.md   # Position review skill prompt
+  web/
+    app.py               # FastAPI web server
+    templates/
+      index.html         # Watchlist page
+      screener.html      # Multi-dimensional stock screener
+  .skills/               # Claude Code superpowers plugin format (ZIP)
   requirements.txt
 ```
 
@@ -103,30 +77,29 @@ tt-trading-mcp/
 
 ## Data Sources
 
-Users configure their data source in `config.py`:
+Users configure in `.env`:
 
-```python
-DB_PATH = "~/trading.db"          # SQLite (default, self-hosted)
-MARKET_DATA_PROVIDER = "yfinance" # yfinance | polygon | alpaca | csv
+```bash
+FINNHUB_KEY=xxx                    # Required
+FINNHUB_TIER=free                  # free | premium (rate limit)
+DB_PATH=./trading.duckdb           # DuckDB database
+SENTIMENT_API_BASE=...             # AI: news sentiment scoring
+AI_API_BASE=...                    # AI: skills analysis engine
 ```
 
-**Supported ingestion paths:**
-- SQLite database (default) — user maintains their own DB
-- CSV import from brokerage exports (IBKR, Schwab, Tastytrade)
-- Market data APIs: yfinance (free), Polygon.io, Alpaca
+**Data providers:**
+- yfinance: OHLCV (batch), analyst ratings, valuation fallbacks
+- Finnhub: fundamentals, earnings calendar, insider MSPR, news
+- AI API (OpenAI-compatible): sentiment scoring, skills analysis
 
-**Core database tables** (defined in `db/schema.sql`):
-- `trades` — trade records with status, direction, trade_type, executions
-- `stock_ohlcv_daily` — daily price data + RSI14 + MAs
-- `stock_fundamentals` — fundamental snapshots per ticker
-- `market_breadth` — daily breadth indicators
-- `market_regime_history` — macro regime classification
+**Core database tables** (DuckDB, defined in `db/init.py`):
+- `stocks_meta` — ticker metadata (company, sector, tier)
+- `stock_ohlcv_daily` — daily OHLCV + RSI14 + MAs + vol_ratio + atr
+- `stock_fundamentals` — 18 fields: valuation, growth, analyst, earnings, MSPR
+- `news` — news articles with AI sentiment_label + sentiment_score
+- `trades` — trade records
 - `user_watchlist` — user's tracked tickers
-- `strategy_templates` — user-defined buy/sell strategies
-- `trading_rules` — risk parameters
-- `trader_daily_log` — psychology journal
-- `notes` — freeform notes
-- `news_articles` — ingested news with sentiment scores
+- `user_positions` — portfolio positions (ticker, avg_cost, shares)
 
 ---
 
@@ -137,11 +110,14 @@ Built with the [MCP Python SDK](https://github.com/modelcontextprotocol/python-s
 ```python
 # server.py pattern
 from mcp.server.fastmcp import FastMCP
-mcp = FastMCP("tt-trading-mcp")
+from tools.screening import screen_stocks
+from tools.watchlist import list_watchlist, add_to_watchlist, remove_from_watchlist, analyze_watchlist
+from tools.positions import list_positions, add_position, remove_position, analyze_positions
 
-from tools.screening import screen_longterm_candidates, screen_swing_candidates
-mcp.tool()(screen_longterm_candidates)
-mcp.tool()(screen_swing_candidates)
+mcp = FastMCP("tt-trading-mcp")
+mcp.tool()(screen_stocks)
+mcp.tool()(list_watchlist)
+# ... register all 9 tools
 
 if __name__ == "__main__":
     mcp.run()
@@ -151,7 +127,21 @@ if __name__ == "__main__":
 
 ## Claude.ai Integration
 
-Add to `claude_desktop_config.json` (Mac: `~/Library/Application Support/Claude/`):
+### Remote (Claude.ai web — recommended)
+
+```bash
+python main.py
+# Prints:
+#   Web dashboard:  http://localhost:8766
+#   MCP endpoint:   http://localhost:8766/mcp?token=<auto-generated>
+```
+
+In Claude.ai → Settings → MCP → Add custom integration, paste the MCP endpoint URL.
+Token auto-generates on first run and saves to `.env`.
+
+### Local (Claude Desktop)
+
+Add to `claude_desktop_config.json`:
 
 ```json
 {
@@ -175,12 +165,16 @@ Add to `claude_desktop_config.json` (Mac: `~/Library/Application Support/Claude/
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-
-# Test server locally
-python server.py
+cp .env.example .env  # edit with your API keys
 ```
 
 ```bash
-# Run with MCP inspector (debug tool calls)
+# Unified entry point
+python main.py              # Web + MCP remote on one port (default :8766)
+python main.py --mcp        # MCP stdio only (for Claude Desktop)
+python main.py --update     # Run data update once
+python main.py --cron 17:30 # Web + MCP + daily auto-update at 5:30 PM
+
+# MCP inspector (debug tool calls)
 npx @modelcontextprotocol/inspector python server.py
 ```

@@ -1,0 +1,24 @@
+<header class="border-b border-gray-800 px-6 py-3 flex items-center justify-between">
+  <div class="flex items-center gap-6">
+    <a href="/" class="text-sm font-semibold tracking-tight text-gray-300 hover:text-white transition">TT AI Screener</a>
+    <nav class="flex gap-1">
+      {% set nav_items = [
+        ('/', 'Home'),
+        ('/watchlist', 'Watchlist'),
+        ('/screener', 'Screener'),
+        ('/positions', 'Positions'),
+        ('/history', 'History'),
+        ('/settings', 'Settings'),
+      ] %}
+      {% for href, label in nav_items %}
+      <a href="{{ href }}"
+        class="text-xs px-3 py-1.5 rounded-md transition {{ 'bg-gray-800 text-white' if active_nav == label else 'text-gray-400 hover:text-white hover:bg-gray-800' }}">
+        {{ label }}
+      </a>
+      {% endfor %}
+    </nav>
+  </div>
+  <div class="flex items-center gap-3">
+    {{ header_right_content | default('', true) }}
+  </div>
+</header>

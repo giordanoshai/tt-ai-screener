@@ -80,7 +80,8 @@ def init_db():
             source          VARCHAR,
             url             TEXT,
             published_at    TIMESTAMP,
-            sentiment_label VARCHAR
+            sentiment_label VARCHAR,
+            sentiment_score DOUBLE
         )
     """)
 
@@ -112,10 +113,118 @@ def init_db():
         )
     """)
 
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS user_positions (
+            ticker       VARCHAR PRIMARY KEY,
+            avg_cost     DOUBLE NOT NULL,
+            shares       INTEGER NOT NULL,
+            added_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS ai_models (
+            id                    VARCHAR PRIMARY KEY,
+            display_name          VARCHAR NOT NULL,
+            api_base              VARCHAR NOT NULL,
+            api_key               VARCHAR,
+            model_id              VARCHAR NOT NULL,
+            api_format            VARCHAR DEFAULT 'openai',
+            role                  VARCHAR DEFAULT 'both',
+            supports_thinking     BOOLEAN DEFAULT FALSE,
+            is_default_sentiment  BOOLEAN DEFAULT FALSE,
+            is_default_analysis   BOOLEAN DEFAULT FALSE,
+            enabled               BOOLEAN DEFAULT TRUE
+        )
+    """)
+
+    con.execute("""
+        CREATE SEQUENCE IF NOT EXISTS seq_analysis_id START 1
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS analysis_history (
+            id            INTEGER DEFAULT nextval('seq_analysis_id') PRIMARY KEY,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            skill         VARCHAR NOT NULL,
+            tickers       VARCHAR,
+            ticker_count  INTEGER,
+            context_json  TEXT,
+            analysis_text TEXT,
+            model         VARCHAR
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key   VARCHAR PRIMARY KEY,
+            value VARCHAR NOT NULL
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS skill_prompts (
+            skill      VARCHAR NOT NULL,
+            lang       VARCHAR NOT NULL,
+            prompt     TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (skill, lang)
+        )
+    """)
+
+    con.execute("""
+        CREATE SEQUENCE IF NOT EXISTS seq_update_id START 1
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS update_history (
+            id          INTEGER DEFAULT nextval('seq_update_id') PRIMARY KEY,
+            started_at  TIMESTAMP,
+            finished_at TIMESTAMP,
+            status      VARCHAR,
+            duration_s  INTEGER,
+            summary     TEXT,
+            log_text    TEXT
+        )
+    """)
+
     con.execute("CREATE INDEX IF NOT EXISTS idx_ohlcv_ticker_date ON stock_ohlcv_daily(ticker, date)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_news_ticker ON news(ticker)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_news_published ON news(published_at)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker)")
+
+    # migrations for existing databases
+    try:
+        con.execute("ALTER TABLE news ADD COLUMN sentiment_score DOUBLE")
+    except Exception:
+        pass
+    try:
+        con.execute("ALTER TABLE ai_models ADD COLUMN api_format VARCHAR DEFAULT 'openai'")
+    except Exception:
+        pass
+
+    # Seed default models from .env (only if table is empty)
+    if con.execute("SELECT COUNT(*) FROM ai_models").fetchone()[0] == 0:
+        from config import (
+            SENTIMENT_API_BASE, SENTIMENT_API_KEY, SENTIMENT_MODEL,
+            AI_API_BASE, AI_API_KEY, AI_MODEL,
+        )
+        defaults = []
+        if SENTIMENT_API_BASE and SENTIMENT_MODEL:
+            defaults.append((
+                "env-sentiment", SENTIMENT_MODEL, SENTIMENT_API_BASE, SENTIMENT_API_KEY,
+                SENTIMENT_MODEL, "openai", "sentiment", False, True, False, True,
+            ))
+        if AI_API_BASE and AI_MODEL:
+            thinking = "max" in AI_MODEL.lower() or "think" in AI_MODEL.lower()
+            defaults.append((
+                "env-analysis", AI_MODEL, AI_API_BASE, AI_API_KEY,
+                AI_MODEL, "openai", "analysis", thinking, False, True, True,
+            ))
+        for d in defaults:
+            con.execute("""
+                INSERT INTO ai_models (id, display_name, api_base, api_key, model_id, api_format, role, supports_thinking, is_default_sentiment, is_default_analysis, enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (id) DO NOTHING
+            """, list(d))
 
     con.close()
     print("✓ Database initialized.")

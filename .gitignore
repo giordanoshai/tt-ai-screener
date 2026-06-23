@@ -4,3 +4,10 @@
 __pycache__/
 *.pyc
 logs/
+.venv/
+docs/
+.antigravitycli/
+GEMINI.md
+CLAUDE.md
+tests/
+changelog.md
