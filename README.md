@@ -35,7 +35,7 @@ cp .env.example .env             # Edit: add your FINNHUB_KEY
 python main.py                   # Start server
 ```
 
-Open `http://localhost:8766` — add tickers via the web UI, then connect Claude.ai.
+Open `http://your_domain_host:8766` — add tickers via the web UI, then connect Claude.ai.
 
 ---
 
