@@ -2,6 +2,62 @@
 
 All notable changes to this project will be documented in this file.
 
+### [2026-08-28] 统一数据层实施计划（两份）
+* **新增 (Added)**: [`docs/superpowers/plans/2026-08-28-tt-data-hub.md`](file:///d:/Dev_project/Python_Project/tt-trading-mcp/docs/superpowers/plans/2026-08-28-tt-data-hub.md) —— 新建统一采集服务的 10 个任务，含完整代码、单元测试、试跑与验收命令。覆盖：仓库骨架与代码格式转换、数据库统一写入层与运行日志、技术指标移植（附与旧实现对拍的步骤）、yfinance 日线采集（逐只重试补齐现在每天漏的 110 只）、拆股断层检测与修复、UW 客户端与活跃池与美股小时线、A股股票池与日线（含除权漂移检测）、A股小时线与行业分类补齐、UW 快照迁移与基本面、部署与定时任务切换。
+* **新增 (Added)**: [`docs/superpowers/plans/2026-08-28-tt-trading-mcp-postgres.md`](file:///d:/Dev_project/Python_Project/tt-trading-mcp/docs/superpowers/plans/2026-08-28-tt-trading-mcp-postgres.md) —— 本项目改造为只读消费端的 7 个任务：Postgres 读写分离访问层、自选/持仓/选股三个工具的移植、新增 `get_hourly_setup` 小时线买点工具、删除 DuckDB 与全部采集代码、systemd 部署与 Cloudflare Tunnel。
+* **修复 (Fixed)**: 实测推翻了 spec 里两处设计并已更正 —— ① **UW 没有 `/splits` 端点（404），且 UW 的 K 线数据本身就不复权**（KLAC 在 UW 那边同样是 2411→254 的断崖），所以日线主源必须是 yfinance（实测它的历史是连续的 241→254），UW 改为只负责小时线与衍生数据；② 拆股修复方案改为「跳空体检 + yfinance 重拉历史 + 清空该票小时线」。
+* **修改 (Changed)**: 补充 UW 接口的四个实测坑到 spec 4.2.1 —— 不带浏览器 User-Agent 会被 Cloudflare 拦（Error 1010）；K 线每个交易日返回盘前/盘中/盘后三行，只有 `market_time='r'` 是真的；`total_volume` 字段数值错误，只能用 `volume`；`limit`/`start_date` 参数无效，控制窗口的是 `timeframe`（1M/3M/6M/YTD/1Y/2Y/3Y/5Y，MAX 报 422）。
+* **修改 (Changed)**: 发现三处 spec 之外的移植障碍并写入计划 —— 线上 `user_watchlist` 的时间列是 `created_at` 而非 `added_at` 且有非空 `user_id`；现有选股 SQL 的相关子查询在 Postgres 里是全表扫 274 万行（执行计划代价 722 万），须改写为 `latest` 公共表达式；`stock_fundamentals` 主键是 `(ticker, updated_at)`，连表须用 `distinct on` 取最新一条。
+* **移除 (Removed)**: 删除已过时的 `PLAN.md` 与 `docs/supabase_uw_integration_architecture.md`（两者均声称 Supabase 在云端、`stocks_meta` 含行业分类，与实情不符）。
+* **修复 (Fixed)**: 更正此前「UW 没有拆股端点」的错误结论 —— 端点存在，路径是 `/api/companies/{票}/splits`（此前误试 `/api/stock/{票}/splits` 才 404）。实测 KLAC 返回 `{"effective_date":"2026-06-12","split_factor":10.0}`，与库内断层完全吻合。拆股方案据此改为「日历判断 + yfinance 修复」两段式，弃用原先靠成交量比值猜测的启发式（降级为查不到日历时的兜底）。
+* **新增 (Added)**: spec 5.5.1 给出「存本地 vs 用时再拉」的判断规则（命中「需跨股票批量筛选」「当天不采永久丢失」「每次分析都要用」任一条才存），并按此规则把 UW 全部数据分类归位：新增该存的三样（完整基本面、上市退市清单、空头比例），停掉国会交易两张表，内部人交易由每日降为周更，伽马墙从 466 行扩为活跃池每日全采；暗池、财报历史、盈利预期、季节性、机构持仓等一律不存，按需拉取。
+* **新增 (Added)**: spec 5.5.2 —— 基本面改用 UW `/api/companies/{票}/profile`（51 字段）。**实测证实现有 `stock_fundamentals` 数据本身是准确的**（AAPL 的 `return_on_equity_ttm` 1.488、`quarterly_revenue_growth_yoy` 0.164 与库内完全一致，说明本就同源），更换理由是字段太少与更新太慢：字段由 18 扩至约 30，补上填充率仅 49% 的 `peg_ratio`、71% 的净利润增速，并新增前瞻市盈率、企业价值倍数、beta、52 周高低点、五档分析师人数分布等。
+* **新增 (Added)**: spec 5.5.3 与 `us_universe` 任务 —— 用 `/api/companies/listings` 一次拉全量（活跃 14389 只、已退市 9449 只，含上市日与退市日），每周滚动收录新上市、标记已退市、写入上市日期。**这同时解决了每日漏采 110 只票的部分成因**：其中一些早已退市，采集程序仍在天天拉取并失败；`us_pool()` 相应加入 `delisted_at is null` 过滤。
+* **修改 (Changed)**: 明确「小时线是最细的工作周期」这条边界 —— 本系统做波段、长线与持仓分析，不做日内交易，故分钟线定位为**只供手工复盘的归档数据，不建任何定时任务**。据此三处收紧：① 新增只覆盖小时线的部分索引 `idx_ohlcv_min_hourly`（小时线与 1994 万行分钟线同表，而现有唯一索引的 `timeframe` 排在第四列，按票查小时线会扫到大量分钟线行）；② 两个小时线任务的清理语句补上 `market` 条件，避免互删对方市场的数据；③ 验收清单新增第 7 条，用等值断言分钟线行数未被改动，防止哪条清理语句漏写 `timeframe = '1h'`。
+
+### [2026-08-28] 统一数据层设计方案（美股 + A股）
+* **新增 (Added)**: 设计文档 [`docs/superpowers/specs/2026-08-28-统一数据层设计.md`](file:///d:/Dev_project/Python_Project/tt-trading-mcp/docs/superpowers/specs/2026-08-28-%E7%BB%9F%E4%B8%80%E6%95%B0%E6%8D%AE%E5%B1%82%E8%AE%BE%E8%AE%A1.md)。核心内容：把散在四个项目里的采集合并成独立的命令行采集程序 `tt-data-hub`（唯一写库角色），`tt-trading-mcp` 退化为只读消费端；A股经 AKShare 并入现有表（`market='CN'`，代码格式 `600519.SH`）；新增小时线层，只采「持仓 + 自选 + 粗筛命中」的活跃池约 400 只，复用 `stock_ohlcv_min` 的 `timeframe='1h'`。含建表 SQL、任务清单、定时排期、14 步不断档切换顺序与验收清单。
+* **新增 (Added)**: 实测确认 A股数据源可用性 —— 那台 AKShare 服务（AKTools 1.18.64）的**东方财富源全部返回 500**，方案改为只用新浪源：日线 `stock_zh_a_daily`、小时线 `stock_zh_a_minute`（单次 1970 根覆盖两年）、全市场快照 `stock_zh_a_spot`、市值 `stock_zh_a_gdhs`、财务 `stock_financial_abstract`。
+* **修复 (Fixed)**: 定位到一个**现存数据故障**并写入修复方案 —— `stock_ohlcv_daily` 只写最新一天、从不回刷历史，导致拆股后新旧价格断裂。库内 2026 年有 115 处，KLAC（1拆10）、CRWD（1拆4）、MNST（1拆2）、MQ（4合1）等大票的均线、20/55日新高、ATR 目前全部失真。方案新增 `us_splits` 任务（UW 拆股日历为主 + 全库跳空体检兜底）并要求上线前做一次全量修复。
+* **修改 (Changed)**: 纠正上一版架构文档的两处事实偏差 —— ① Supabase 是自建在局域网 `192.168.1.38`，不在云端，故 MCP 部署需配 Cloudflare Tunnel；② `stocks_meta` 实际只有 7 列，**没有 sector/industry/market**，`screen_stocks` 的板块筛选参数迁移后会直接失效，方案增加 `meta_refresh` 任务补齐。
+
+### [2026-08-28] Supabase (PostgreSQL) 资产梳理与 Unusual Whales 全量融合架构落地
+* **新增 (Added)**: 创建架构设计文档 [`docs/supabase_uw_integration_architecture.md`](file:///d:/Dev_project/Python_Project/tt-trading-mcp/docs/supabase_uw_integration_architecture.md)，系统梳理 Supabase 中 9 张核心资产表（274 万行技术面行情、3 万条基本面、8000+ 条 UW 结构化新闻流、2500 笔真实交易记录），并设计由单机 DuckDB 往 Supabase (PostgreSQL) 中央数据库的平滑迁移与融合蓝图。
+* **新增 (Added)**: 创建并更新项目推进计划 [`PLAN.md`](file:///d:/Dev_project/Python_Project/tt-trading-mcp/PLAN.md)，详细拆解 API 调研、K 线深度验证、数据层迁移、增量更新与多维量化分析的实施步骤。
+* **修改 (Changed)**: 完成 Unusual Whales API (adv KEY) 的实测与深度校验：确认 `1h`（覆盖 7+ 个月）、`30m`（覆盖 4 个月）、`15m` 及 `1m/5m` 的单次 2500 根 K 棒拉取能力与历史回溯参数支持，确立“大周期日线定方向 + 小周期1h/30m找买点与风控”的双周期架构。
+
+### [2026-07-16] 阿里云百炼 (Bailian) 异步新闻情绪批推理改造
+* **新增 (Added)**: `main.py` — 新增后台 `sentiment-harvester` 守护线程。当启动 Web 容器时，该线程会在后台每隔 **5分钟** 自动醒来，调用百炼 API 查询是否有完成的批量新闻打分任务，若有则自动下载并悄悄写回数据库。这保证了在服务运行期间，处理完的情绪能够被完全自动导入，实现全自动无人值守。
+* **修改 (Changed)**: `db/update.py` — 重构 `update_news_sentiment()` 调度流程。从同步阻塞、多线程高频调用，改造成**非阻塞、异步分步轮询**架构。每次更新时优先检测本地是否存在活跃的 Batch ID，若百炼平台已运行完毕（status=completed）则直接下载 JSONL 并回写入库，同时删除活跃 ID；若没有活跃 ID 则筛选最新未评分新闻上传（每批限 1000 条内）并创建新的 Batch 任务存入 settings 表。
+* **修改 (Changed)**: `ai_client.py` — 新增 `submit_news_sentiment_batch()`、`check_batch_status()` 与 `download_batch_results()` 接口函数，以符合百炼/OpenAI兼容 Batch 推理的 API 标准。
+* **修改 (Changed)**: `ai_client.py` — 增加百炼批处理机型自动重映射。由于百炼 Batch 模式暂不支持 `deepseek-v4-flash` 模型，提交至批推理任务时模型会自动重映射/平滑降级到官方完全支持的 `qwen-plus` 运行。
+* **修改 (Changed)**: `ai_client.py` — `get_model` 添加 `api_key` 的环境变量 fallback。若数据库中密钥为空（在 Web 界面尚未配置），程序会自动回退到本地 `.env` 中的 `SENTIMENT_API_KEY`/`AI_API_KEY`，解决 CLI 环境因授权失败导致的 401 错误。
+
+### [2026-07-16] Finnhub API 速率优化 — Fundamentals 更新提速约 4 倍
+* **修改 (Changed)**: `data_sources/us_market.py` — 新增 `FinnhubRateLimiter` 线程安全单例限速器，替代每次调用后固定 `time.sleep(1.1)` 的粗放策略。限速器在请求前 throttle，自动扣除 HTTP 请求耗时，Finnhub 配额利用率从 ~45% 提升至 ~90%（实际吞吐量翻倍）。
+* **修改 (Changed)**: `data_sources/us_market.py` — `fetch_fundamentals()` 新增 `light=True` 模式：仅拉 metrics+profile（2 次 API），跳过 earnings calendar 和 insider transactions（省 2 次 API），适用于 universe tier 的非核心 ticker。
+* **修改 (Changed)**: `data_sources/base.py` — `FundamentalsProvider` 抽象接口新增 `light` 参数。
+* **修改 (Changed)**: `db/update.py` — `update_fundamentals()` 改为接收 `tickers_with_tier`（含 tier 信息），core ticker 使用完整 4 调用，universe ticker 使用 light 2 调用。预计 2169 ticker 全量更新从 ~5 小时降至 ~1.2 小时。
+
+### [2026-07-16] UW API 集成代码审查修复
+* **修复 (Fixed)**: `config.py` — UW API Token 不再硬编码为默认值，改为空字符串，防止源码泄露密钥。`.env` 中变量名从 `UW_API_KEY` 修正为 `UW_API_TOKEN`，与 config 读取一致。
+* **修复 (Fixed)**: `skills/__init__.py` — `gather_context("position_review")` 中 UW Smart Money 数据（`uw_*` 前缀字段）被丢弃的 bug，现已正确合并到 LLM 上下文中。
+* **修复 (Fixed)**: `tools/screening.py` + `tools/positions.py` — 未配置 `UW_API_TOKEN` 时，跳过 UW API 调用，避免 100 次无效 401 请求拖慢响应。
+* **修改 (Changed)**: `data_sources/uw_client.py` — 去掉 URL query param 重复传递 token 的安全风险；`get_comprehensive_profile` 改为 `ThreadPoolExecutor` 并行调用 10 个端点（5 线程），单 ticker 从 ~2s 降至 ~0.5s。
+* **修改 (Changed)**: `tools/screening.py` — Insider 数据从无意义的 `len(data[:5])` 改为区分买/卖计数（`uw_insider_buys` / `uw_insider_sells`）；`import datetime` 移到文件顶部。
+* **修改 (Changed)**: `tools/positions.py` — 复用 `_extract_uw_summary()` 提取函数，消除 screening/positions 间的重复代码。
+* **新增 (Added)**: `data_sources/uw_client.py` 新增 `uw_available()` 便捷方法，用于检查 UW Token 是否已配置。
+* **修改 (Changed)**: `.env.example` 新增 `UW_API_TOKEN` 配置项说明。
+
+### [2026-07-16] 接入 Unusual Whales API (Smart Money 策略)
+* **新增 (Added)**: 创建 `data_sources/uw_client.py`，专门为**长线持仓**和**短线波段 (Swing)** 接入了 10 个 Unusual Whales 接口：内部人交易、国会议员持仓、机构持仓趋势、真实做空比例、FTDs、暗盘交易、月度季节性规律、波动率异常得分、期权多空立场等。
+* **修改 (Changed)**: 更新 `tools/screening.py`。在 DuckDB 基础筛选后，对排名前 10 的候选股票自动拉取全套 UW "Smart Money" 和 "Options Flow" 深度数据，极大增强 LLM 的选股判断力。
+* **修改 (Changed)**: 更新 `tools/positions.py` (`analyze_positions`)。分析当前持仓时，将深度整合机构资金与空头数据，帮助捕捉波段见顶或长线建仓信号。
+* **修改 (Changed)**: `config.py` 中增加 `UW_API_TOKEN` 环境变量配置。
+
+### [2026-07-13] 新增项目英文介绍文档
+* **新增 (Added)**: 在 `docs/introduction_en.md` 新增极简版项目英文介绍文档（控制在600字符以内），阐述了项目的核心卖点、设计理念（"LLM as the UI"）和核心功能。
+
 ### [2026-06-23] 项目重命名 TT AI Screener + 移除 setup.py + 重写 README
 * **修改 (Changed)**: 项目从 `tt-trading-mcp` 重命名为 **TT AI Screener**（`tt-ai-screener`），更新 server.py、web/app.py、main.py、manage.sh、run_daily_update.bat、settings.html 中所有引用。
 * **修改 (Changed)**: 删除过时的 `setup.py` 首次安装向导。`main.py` 启动时已自动初始化数据库，数据更新用 `--update`，ticker 管理已迁移到 watchlist 工具。

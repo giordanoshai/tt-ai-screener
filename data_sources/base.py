@@ -13,8 +13,10 @@ class OHLCVProvider(ABC):
 
 class FundamentalsProvider(ABC):
     @abstractmethod
-    def fetch_fundamentals(self, ticker: str) -> dict:
+    def fetch_fundamentals(self, ticker: str, light: bool = False) -> dict:
         """Fetch fundamental metrics + earnings + insider data (rate-limited).
+        light=True: only metrics + profile (2 API calls, skips earnings/insider).
+        light=False: full data (4 API calls).
         Returns dict with keys: pe_ratio, ps_ratio, pb_ratio, peg_ratio,
         market_cap, revenue_growth_yoy, earnings_growth_yoy, gross_margin,
         roe, fcf_yield, company_name, sector, industry, exchange,

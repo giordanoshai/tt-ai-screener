@@ -275,7 +275,8 @@ def update_analyst_data(tickers: list[str], registry: ProviderRegistry, max_work
     _log(f"[Analyst] Done: {fetched} fetched, {skipped} skipped, {errors} errors in {_elapsed(t0)}")
 
 
-def update_fundamentals(tickers: list[str], registry: ProviderRegistry):
+def update_fundamentals(tickers_with_tier: list[dict], registry: ProviderRegistry):
+    """Update fundamentals. Core tickers get full data (4 API calls), universe gets light (2 calls)."""
     if not FINNHUB_KEY:
         _log("[Fundamentals] Skipped — no FINNHUB_KEY")
         return
@@ -283,14 +284,19 @@ def update_fundamentals(tickers: list[str], registry: ProviderRegistry):
     _set_stage("Fundamentals")
     t0 = time.time()
     con = get_conn()
-    total = len(tickers)
+    total = len(tickers_with_tier)
     fetched = 0
     skipped = 0
     errors = 0
+    light_count = 0
+    full_count = 0
 
-    _log(f"[Fundamentals] {total} tickers (stale > {FUNDAMENTALS_STALE_DAYS}d)")
+    core_set = {t["ticker"] for t in tickers_with_tier if t.get("tier") == "core"}
+    _log(f"[Fundamentals] {total} tickers ({len(core_set)} core=4calls, {total - len(core_set)} universe=2calls, stale > {FUNDAMENTALS_STALE_DAYS}d)")
 
-    for i, ticker in enumerate(tickers, 1):
+    for i, item in enumerate(tickers_with_tier, 1):
+        ticker = item["ticker"] if isinstance(item, dict) else item
+        is_core = ticker in core_set
         try:
             row = con.execute(
                 "SELECT updated_at FROM stock_fundamentals WHERE ticker = ?", [ticker]
@@ -307,7 +313,7 @@ def update_fundamentals(tickers: list[str], registry: ProviderRegistry):
                     pass
 
             provider = registry.get_fundamentals_provider("US")
-            data = provider.fetch_fundamentals(ticker)
+            data = provider.fetch_fundamentals(ticker, light=not is_core)
 
             con.execute("""
                 INSERT INTO stock_fundamentals (
@@ -358,15 +364,19 @@ def update_fundamentals(tickers: list[str], registry: ProviderRegistry):
             ])
 
             fetched += 1
+            if is_core:
+                full_count += 1
+            else:
+                light_count += 1
             if fetched % 50 == 0:
-                _log(f"  [{i}/{total}] fetched {fetched}, skipped {skipped}, err {errors} ({_elapsed(t0)})")
+                _log(f"  [{i}/{total}] fetched {fetched} ({full_count} full, {light_count} light), skipped {skipped}, err {errors} ({_elapsed(t0)})")
         except Exception as e:
             errors += 1
             if errors <= 5 or errors % 20 == 0:
                 _log(f"  [{i}/{total}] {ticker}: ERROR - {e} ({_elapsed(t0)})")
 
     con.close()
-    _log(f"[Fundamentals] Done: {fetched} fetched, {skipped} skipped, {errors} errors in {_elapsed(t0)}")
+    _log(f"[Fundamentals] Done: {fetched} fetched ({full_count} full, {light_count} light), {skipped} skipped, {errors} errors in {_elapsed(t0)}")
 
 
 def _fetch_and_insert_news(ticker, registry, con, days):
@@ -435,10 +445,19 @@ def update_news(tickers: list[str], registry: ProviderRegistry, days: int = 3, m
     _log(f"[News] Done: +{total_articles} articles, {errors} errors in {_elapsed(t0)}")
 
 
-def update_news_sentiment(batch_size: int = 20, workers: int = 5):
-    """Score unscored news articles using AI sentiment model (multi-threaded)."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from ai_client import sentiment_available, score_news_batch
+def update_news_sentiment():
+    """Manage asynchronous sentiment batch jobs with Aliyun Bailian / OpenAI Batch API.
+
+    1. Checks if there is an active batch. If completed, applies results and clears the state.
+    2. If no active batch remains, finds unscored news and submits a new batch job.
+    """
+    from ai_client import (
+        sentiment_available,
+        check_batch_status,
+        download_batch_results,
+        submit_news_sentiment_batch
+    )
+
     if not sentiment_available():
         _log("[Sentiment] Skipped — no SENTIMENT_API configured")
         return
@@ -446,56 +465,89 @@ def update_news_sentiment(batch_size: int = 20, workers: int = 5):
     _set_stage("Sentiment")
     t0 = time.time()
     con = get_conn()
+
+    # Step 1: Check for active batch job in app_settings
+    active_batch_row = con.execute(
+        "SELECT value FROM app_settings WHERE key = 'active_sentiment_batch_id'"
+    ).fetchone()
+
+    active_batch_id = active_batch_row[0] if active_batch_row else None
+    
+    if active_batch_id:
+        _log(f"[Sentiment] Found active batch job: {active_batch_id}. Checking status...")
+        job_info = check_batch_status(active_batch_id)
+        status = job_info.get("status")
+
+        if status == "completed":
+            output_file_id = job_info.get("output_file_id")
+            _log(f"  Batch completed! Downloading results file: {output_file_id}")
+            results = download_batch_results(output_file_id)
+            
+            if results:
+                updated_count = 0
+                for res in results:
+                    con.execute(
+                        "UPDATE news SET sentiment_label = ?, sentiment_score = ? WHERE id = ?",
+                        [res["label"], res["score"], res["news_id"]]
+                    )
+                    updated_count += 1
+                _log(f"  Successfully applied sentiment results for {updated_count}/{len(results)} news.")
+            else:
+                _log("  Warning: Completed batch output was empty or failed to parse.")
+
+            # Clear active batch status
+            con.execute("DELETE FROM app_settings WHERE key = 'active_sentiment_batch_id'")
+            active_batch_id = None
+
+        elif status in ["failed", "expired", "cancelled"]:
+            _log(f"  Batch job failed/expired/cancelled (status: {status}). Clearing state so we can retry.")
+            con.execute("DELETE FROM app_settings WHERE key = 'active_sentiment_batch_id'")
+            active_batch_id = None
+
+        else:
+            _log(f"  Batch job is still running (status: {status}). Skipping new submission until this completes.")
+            con.close()
+            return
+
+    # Step 2: Submit a new batch if there is no active batch job
     unscored = con.execute("""
         SELECT id, headline, summary FROM news
         WHERE sentiment_label IS NULL
         ORDER BY published_at DESC
     """).fetchall()
 
-    total = len(unscored)
-    if total == 0:
-        _log("[Sentiment] All news already scored")
+    total_unscored = len(unscored)
+    if total_unscored == 0:
+        _log("[Sentiment] All news already scored. No new batch to submit.")
         con.close()
         return
 
-    batches = []
-    for i in range(0, total, batch_size):
-        batches.append(unscored[i:i + batch_size])
+    # Cap the batch size at 1000 to keep Bailian file/token limit safe
+    max_batch_size = 1000
+    batch_items = unscored[:max_batch_size]
+    
+    articles = []
+    for r in batch_items:
+        articles.append({
+            "id": r[0],
+            "headline": r[1],
+            "summary": r[2]
+        })
 
-    _log(f"[Sentiment] {total} articles, {len(batches)} batches, {workers} threads")
-    scored = 0
-    errors = 0
-    done_articles = 0
-
-    def _score_batch(batch):
-        articles = [{"headline": r[1], "summary": r[2]} for r in batch]
-        return batch, score_news_batch(articles)
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_score_batch, b): b for b in batches}
-        for future in as_completed(futures):
-            try:
-                batch, results = future.result()
-                batch_scored = 0
-                for j, res in enumerate(results):
-                    if res.get("label"):
-                        con.execute(
-                            "UPDATE news SET sentiment_label = ?, sentiment_score = ? WHERE id = ?",
-                            [res["label"], res.get("score"), batch[j][0]]
-                        )
-                        batch_scored += 1
-                scored += batch_scored
-            except Exception as e:
-                errors += 1
-                if errors <= 3:
-                    _log(f"  Thread error: {e}")
-
-            done_articles += len(futures[future])
-            if done_articles % 100 < batch_size or done_articles >= total:
-                _log(f"  [{done_articles}/{total}] scored {scored}, err {errors} ({_elapsed(t0)})")
+    _log(f"[Sentiment] Submitting {len(articles)} unscored news items to Bailian Batch (Total unscored: {total_unscored})...")
+    
+    new_batch_id = submit_news_sentiment_batch(articles)
+    if new_batch_id:
+        con.execute("""
+            INSERT INTO app_settings (key, value) VALUES ('active_sentiment_batch_id', ?)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, [new_batch_id])
+        _log(f"[Sentiment] Submitted new batch job successfully. Job ID: {new_batch_id}")
+    else:
+        _log("[Sentiment] Error: Failed to submit new batch job.")
 
     con.close()
-    _log(f"[Sentiment] Done: {scored}/{total} scored, {errors} errors in {_elapsed(t0)}")
+    _log(f"[Sentiment] Done: processed status check/submission in {_elapsed(t0)}")
 
 
 def _save_update_history():
@@ -581,8 +633,8 @@ def run():
         # 1. OHLCV
         update_ohlcv(all_ticker_names, registry)
 
-        # 2. Fundamentals (Finnhub)
-        update_fundamentals(all_ticker_names, registry)
+        # 2. Fundamentals (Finnhub) — core=full 4 calls, universe=light 2 calls
+        update_fundamentals(all_tickers, registry)
 
         # 3. Analyst (yfinance)
         update_analyst_data(all_ticker_names, registry)

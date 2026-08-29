@@ -299,6 +299,10 @@ def gather_context(skill_name: str, params: dict = None) -> str:
                 data["cost_basis"] = p["cost_basis"]
             if p.get("shares") is not None:
                 data["shares"] = p["shares"]
+            # Merge UW Smart Money data (uw_* fields from positions_input)
+            for k, v in p.items():
+                if k.startswith("uw_"):
+                    data[k] = v
             all_positions.append(data)
 
         return json.dumps({

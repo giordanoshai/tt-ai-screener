@@ -24,6 +24,9 @@ logger = logging.getLogger("tt-trading")
 _cron_thread = None
 _cron_stop = threading.Event()
 
+_harvester_thread = None
+_harvester_stop = threading.Event()
+
 
 def start_mcp_stdio():
     from server import mcp
@@ -76,6 +79,39 @@ def stop_cron():
         _cron_thread.join(timeout=2)
         _cron_thread = None
         logger.info("[Cron] Stopped")
+
+
+def _harvester_loop():
+    logger.info("[Sentiment Harvester] Background polling started (every 5 minutes)")
+    while not _harvester_stop.is_set():
+        try:
+            from db.update import update_news_sentiment
+            update_news_sentiment()
+        except Exception as e:
+            logger.error(f"[Sentiment Harvester] Error in polling batch status: {e}")
+
+        # Wait 300 seconds (5 minutes), check stop event dynamically
+        if _harvester_stop.wait(timeout=300):
+            break
+
+
+def start_harvester():
+    global _harvester_thread
+    if _harvester_thread and _harvester_thread.is_alive():
+        return
+    _harvester_stop.clear()
+    _harvester_thread = threading.Thread(target=_harvester_loop, daemon=True, name="sentiment-harvester")
+    _harvester_thread.start()
+    logger.info("[Sentiment Harvester] Scheduled background polling")
+
+
+def stop_harvester():
+    global _harvester_thread
+    if _harvester_thread and _harvester_thread.is_alive():
+        _harvester_stop.set()
+        _harvester_thread.join(timeout=2)
+        _harvester_thread = None
+        logger.info("[Sentiment Harvester] Stopped")
 
 
 def apply_schedule(schedule: dict):
@@ -131,8 +167,13 @@ def main():
         logger.info("Starting MCP server (stdio)")
         start_mcp_stdio()
     else:
+        # Start background sentiment polling harvester (every 5 minutes)
+        start_harvester()
         from server import run_server
-        run_server(args.port)
+        try:
+            run_server(args.port)
+        finally:
+            stop_harvester()
 
 
 if __name__ == "__main__":

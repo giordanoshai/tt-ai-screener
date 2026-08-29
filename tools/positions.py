@@ -125,10 +125,25 @@ def analyze_positions() -> str:
             return json.dumps({"error": "No positions found. Add positions first."})
 
         from skills import gather_context
-        positions_input = [
-            {"ticker": r[0], "cost_basis": r[1], "shares": r[2]}
-            for r in positions
-        ]
+        from data_sources.uw_client import UnusualWhalesClient, uw_available
+        from tools.screening import _extract_uw_summary
+
+        positions_input = []
+        uw_client = UnusualWhalesClient() if uw_available() else None
+
+        for r in positions:
+            ticker = r[0]
+            pos_data = {"ticker": ticker, "cost_basis": r[1], "shares": r[2]}
+
+            if uw_client:
+                try:
+                    uw_data = uw_client.get_comprehensive_profile(ticker)
+                    pos_data.update(_extract_uw_summary(uw_data))
+                except Exception as e:
+                    pos_data["uw_error"] = str(e)
+
+            positions_input.append(pos_data)
+
         context = gather_context("position_review", {"positions": positions_input})
         return context
     except Exception as e:

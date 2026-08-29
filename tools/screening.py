@@ -1,5 +1,45 @@
 import json
+import datetime
 from db.init import get_conn
+from data_sources.uw_client import UnusualWhalesClient, uw_available
+
+
+def _extract_uw_summary(uw_data: dict) -> dict:
+    """Extract key UW data points from a comprehensive profile into a flat dict."""
+    summary = {}
+
+    # Insider: distinguish buys vs sells
+    insider_data = uw_data.get("insider", {}).get("data", [])
+    if insider_data:
+        buys = sum(1 for t in insider_data[:20] if t.get("transaction_type") == "P")
+        sells = sum(1 for t in insider_data[:20] if t.get("transaction_type") == "S")
+        summary["uw_insider_buys"] = buys
+        summary["uw_insider_sells"] = sells
+
+    # Short Interest
+    si_data = uw_data.get("short_interest", {}).get("data", {})
+    if si_data:
+        summary["uw_short_interest_pct"] = si_data.get("short_interest")
+
+    # Option Stance
+    stance = uw_data.get("option_stance", {}).get("data", {})
+    if stance:
+        summary["uw_option_stance"] = stance.get("stance")
+
+    # Seasonality — current month
+    season = uw_data.get("seasonality", {}).get("data", [])
+    if season:
+        current_month = datetime.datetime.now().month
+        month_data = next((m for m in season if m.get("month") == current_month), None)
+        if month_data:
+            summary["uw_seasonality_current_month_avg_return"] = month_data.get("average_return")
+
+    # Risk Reversal Skew — latest value
+    skew = uw_data.get("skew", {}).get("data", [])
+    if isinstance(skew, list) and skew:
+        summary["uw_latest_skew"] = skew[-1].get("skew")
+
+    return summary
 
 
 def screen_stocks(
@@ -130,6 +170,17 @@ def screen_stocks(
             "analyst_rating", "analyst_target_price", "next_earnings_date",
         ]
         result = [dict(zip(cols, r)) for r in rows]
+
+        # Fetch UW Smart Money & Options Data for top 10 candidates (only if token configured)
+        if uw_available():
+            uw_client = UnusualWhalesClient()
+            for i in range(min(10, len(result))):
+                ticker = result[i]["ticker"]
+                try:
+                    uw_data = uw_client.get_comprehensive_profile(ticker)
+                    result[i].update(_extract_uw_summary(uw_data))
+                except Exception as e:
+                    result[i]["uw_error"] = str(e)
 
         filters_used = {k: v for k, v in {
             "screen_type": screen_type, "sector": sector,

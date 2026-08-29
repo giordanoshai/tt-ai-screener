@@ -1,4 +1,5 @@
 import time
+import threading
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -11,8 +12,46 @@ from data_sources.base import OHLCVProvider, FundamentalsProvider, NewsProvider
 from config import FINNHUB_TIER
 
 FINNHUB_BASE = "https://finnhub.io/api/v1"
-RATE_LIMIT_SLEEP = 0.12 if FINNHUB_TIER == "premium" else 1.1
 
+
+# ── Shared Finnhub Rate Limiter ──────────────────────────────────────────────
+
+class FinnhubRateLimiter:
+    """Thread-safe sliding-window rate limiter for Finnhub API.
+
+    Accounts for actual request time so we don't waste budget sleeping.
+    Free tier: 60 calls/min → we use 55 as safety margin.
+    Premium:   300 calls/min → we use 280.
+    """
+    _instance = None
+    _init_lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._init_lock:
+                if cls._instance is None:
+                    obj = super().__new__(cls)
+                    calls_per_min = 55 if FINNHUB_TIER == "free" else 280
+                    obj._min_interval = 60.0 / calls_per_min
+                    obj._lock = threading.Lock()
+                    obj._last_call = 0.0
+                    cls._instance = obj
+        return cls._instance
+
+    def throttle(self):
+        """Block until it's safe to make the next Finnhub API call."""
+        with self._lock:
+            now = time.monotonic()
+            wait = self._min_interval - (now - self._last_call)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_call = time.monotonic()
+
+
+_rate_limiter = FinnhubRateLimiter()
+
+
+# ── OHLCV Provider (yfinance) ────────────────────────────────────────────────
 
 class YFinanceOHLCVProvider(OHLCVProvider):
 
@@ -69,27 +108,32 @@ class YFinanceOHLCVProvider(OHLCVProvider):
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+# ── Fundamentals Provider (Finnhub + yfinance) ──────────────────────────────
+
 class FinnhubFundamentalsProvider(FundamentalsProvider):
 
     def __init__(self, api_key: str):
         self.api_key = api_key
 
     def _get(self, path: str, params: dict) -> dict | list:
+        _rate_limiter.throttle()
         params["token"] = self.api_key
         r = requests.get(f"{FINNHUB_BASE}{path}", params=params, timeout=15)
         r.raise_for_status()
         return r.json()
 
-    def fetch_fundamentals(self, ticker: str) -> dict:
-        """Finnhub-only: metrics + profile + earnings + insider (4 API calls, rate-limited)."""
+    def fetch_fundamentals(self, ticker: str, light: bool = False) -> dict:
+        """Fetch fundamentals from Finnhub.
+
+        light=False (core): metrics + profile + earnings + insider (4 API calls)
+        light=True (universe): metrics + profile only (2 API calls) — 2x faster
+        """
         # --- metrics ---
         data = self._get("/stock/metric", {"symbol": ticker, "metric": "all"})
         m = data.get("metric", {})
-        time.sleep(RATE_LIMIT_SLEEP)
 
         # --- profile ---
         profile = self._get("/stock/profile2", {"symbol": ticker})
-        time.sleep(RATE_LIMIT_SLEEP)
 
         def g(key):
             v = m.get(key)
@@ -120,6 +164,10 @@ class FinnhubFundamentalsProvider(FundamentalsProvider):
             "mspr": None,
         }
 
+        # Light mode: skip earnings & insider to save API calls
+        if light:
+            return result
+
         # --- earnings calendar ---
         try:
             today = date.today()
@@ -128,7 +176,6 @@ class FinnhubFundamentalsProvider(FundamentalsProvider):
                 "from": (today - timedelta(days=90)).isoformat(),
                 "to": (today + timedelta(days=90)).isoformat(),
             })
-            time.sleep(RATE_LIMIT_SLEEP)
 
             for e in cal.get("earningsCalendar", []):
                 ed = e.get("date")
@@ -148,7 +195,6 @@ class FinnhubFundamentalsProvider(FundamentalsProvider):
             today_dt = date.today()
             ninety_days_ago = today_dt - timedelta(days=90)
             txn_data = self._get("/stock/insider-transactions", {"symbol": ticker})
-            time.sleep(RATE_LIMIT_SLEEP)
 
             records = txn_data.get("data", []) if isinstance(txn_data, dict) else []
             total_buy = 0.0
@@ -215,12 +261,15 @@ class FinnhubFundamentalsProvider(FundamentalsProvider):
         return result
 
 
+# ── News Provider (Finnhub) ──────────────────────────────────────────────────
+
 class FinnhubNewsProvider(NewsProvider):
 
     def __init__(self, api_key: str):
         self.api_key = api_key
 
     def _get(self, path: str, params: dict) -> dict | list:
+        _rate_limiter.throttle()
         params["token"] = self.api_key
         r = requests.get(f"{FINNHUB_BASE}{path}", params=params, timeout=15)
         r.raise_for_status()
@@ -235,7 +284,6 @@ class FinnhubNewsProvider(NewsProvider):
             "from": date_from,
             "to": date_to,
         })
-        time.sleep(RATE_LIMIT_SLEEP)
 
         if not isinstance(articles, list):
             return []

@@ -206,8 +206,17 @@ def get_model(model_id: str = None, role: str = "analysis") -> dict | None:
     con.close()
     if not row:
         return None
+    
+    api_key = row[2]
+    if not api_key:
+        import os
+        if role == "sentiment":
+            api_key = os.getenv("SENTIMENT_API_KEY", "")
+        else:
+            api_key = os.getenv("AI_API_KEY", "")
+
     return {
-        "id": row[0], "api_base": row[1], "api_key": row[2],
+        "id": row[0], "api_base": row[1], "api_key": api_key,
         "model_id": row[3], "api_format": row[4],
         "supports_thinking": row[5], "display_name": row[6],
     }
@@ -286,3 +295,181 @@ def score_news_batch(articles: list[dict]) -> list[dict]:
     except Exception:
         pass
     return [{"label": None, "score": None}] * len(articles)
+
+
+# ── Sentiment Batch Inference (Aliyun Bailian / OpenAI Batch API) ─────────────
+
+def submit_news_sentiment_batch(articles: list[dict]) -> str | None:
+    """Submit news sentiment tasks to Aliyun Bailian / OpenAI Batch API.
+
+    Returns the created batch_id, or None if submission failed.
+    """
+    import os
+    import time
+    model_cfg = get_model(role="sentiment")
+    if not model_cfg or not model_cfg.get("api_base") or not model_cfg.get("model_id"):
+        return None
+
+    api_base = model_cfg["api_base"].rstrip("/")
+    api_key = model_cfg.get("api_key", "")
+    model_id = model_cfg["model_id"]
+
+    # Aliyun Bailian Batch API does not support deepseek-v4-flash yet.
+    # Fallback to qwen-plus which is fully supported and highly accurate.
+    if model_id == "deepseek-v4-flash":
+        model_id = "qwen-plus"
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    # 1. Generate JSONL content locally
+    # Limiting summary length to avoid token waste
+    batch_lines = []
+    for art in articles:
+        news_id = art["id"]
+        headline = art.get("headline", "")
+        summary = art.get("summary", "")[:300]
+        body_text = f"{headline} — {summary}" if summary else headline
+
+        req_item = {
+            "custom_id": f"news_{news_id}",
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {
+                "model": model_id,
+                "messages": [
+                    {"role": "system", "content": "You are a financial news sentiment analyzer. Output JSON only: {\"label\": \"positive\"|\"negative\"|\"neutral\", \"score\": float(-1.0 to 1.0)}"},
+                    {"role": "user", "content": body_text}
+                ],
+                "temperature": 0.1,
+                # Explicitly disable Qwen thinking mode to save tokens/cost
+                "enable_thinking": False
+            }
+        }
+        batch_lines.append(json.dumps(req_item, ensure_ascii=False))
+
+    temp_filename = f"temp_batch_{int(time.time())}.jsonl"
+    with open(temp_filename, "w", encoding="utf-8") as f:
+        f.write("\n".join(batch_lines) + "\n")
+
+    try:
+        # 2. Upload file to Bailian (POST /files)
+        # Using with block to ensure file handle is closed properly (prevents WinError 32)
+        with open(temp_filename, "rb") as file_stream:
+            files = {"file": (temp_filename, file_stream, "application/octet-stream")}
+            data = {"purpose": "batch"}
+            r = requests.post(f"{api_base}/files", headers=headers, files=files, data=data, timeout=30)
+            r.raise_for_status()
+            file_info = r.json()
+            file_id = file_info["id"]
+
+        # 3. Create batch job (POST /batches)
+        batch_data = {
+            "input_file_id": file_id,
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h",
+            "metadata": {
+                "ds_name": f"sentiment_batch_{int(time.time())}",
+                "ds_description": f"Batch news sentiment scoring for {len(articles)} articles"
+            }
+        }
+        r = requests.post(f"{api_base}/batches", headers=headers, json=batch_data, timeout=30)
+        r.raise_for_status()
+        job_info = r.json()
+        return job_info["id"]
+
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Failed to submit Aliyun Bailian Batch: {e}")
+        return None
+    finally:
+        # Clean up local temp file
+        if os.path.exists(temp_filename):
+            try:
+                os.remove(temp_filename)
+            except Exception:
+                pass
+
+
+def check_batch_status(batch_id: str) -> dict:
+    """Retrieve status details for a Bailian batch job.
+
+    Returns the JSON dict from API response.
+    """
+    model_cfg = get_model(role="sentiment")
+    if not model_cfg or not model_cfg.get("api_base"):
+        return {}
+
+    api_base = model_cfg["api_base"].rstrip("/")
+    api_key = model_cfg.get("api_key", "")
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    try:
+        r = requests.get(f"{api_base}/batches/{batch_id}", headers=headers, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Failed to retrieve status for batch {batch_id}: {e}")
+        return {}
+
+
+def download_batch_results(output_file_id: str) -> list[dict]:
+    """Download results file from Bailian and parse them.
+
+    Returns a list of parsed dicts: [{"news_id": int, "label": str, "score": float}]
+    """
+    model_cfg = get_model(role="sentiment")
+    if not model_cfg or not model_cfg.get("api_base"):
+        return []
+
+    api_base = model_cfg["api_base"].rstrip("/")
+    api_key = model_cfg.get("api_key", "")
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    results = []
+    try:
+        r = requests.get(f"{api_base}/files/{output_file_id}/content", headers=headers, timeout=60)
+        r.raise_for_status()
+        
+        # Each line is a JSON: {"custom_id": "news_123", "response": {"status_code": 200, "body": {"choices": [{"message": {"content": "..."}}]}}}
+        for line in r.text.strip().split("\n"):
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            custom_id = item.get("custom_id", "")
+            if not custom_id.startswith("news_"):
+                continue
+            
+            try:
+                news_id = int(custom_id.split("_")[1])
+            except ValueError:
+                continue
+
+            resp_body = item.get("response", {}).get("body", {})
+            choices = resp_body.get("choices", [])
+            if not choices:
+                continue
+            
+            content = choices[0].get("message", {}).get("content", "").strip()
+            # Clean markdown code block wraps
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            if "<think>" in content:
+                content = content.split("</think>")[-1].strip()
+
+            try:
+                sentiment_data = json.loads(content)
+                results.append({
+                    "news_id": news_id,
+                    "label": sentiment_data.get("label"),
+                    "score": sentiment_data.get("score")
+                })
+            except Exception:
+                pass
+
+        return results
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Failed to download and parse batch file {output_file_id}: {e}")
+        return []
+
