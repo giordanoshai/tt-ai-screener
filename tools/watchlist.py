@@ -1,107 +1,135 @@
+"""自选池工具。数据源是 Postgres（原来是本地 DuckDB 文件）。
+
+移植时踩过的几个坑，都写在这儿免得下次再踩：
+
+1. 线上表的时间列叫 ``created_at``，DuckDB 那版叫 ``added_at``，照搬会报列不存在。
+2. ``user_watchlist.user_id`` 是非空 uuid，插入时必须带上，值取自
+   ``config.WATCHLIST_USER_ID``。``id`` 是自增列，插入时不要给。
+3. 这张表有两个唯一索引：``(ticker)`` 和 ``(user_id, ticker)``。
+   ``on conflict`` 盯的是 ``(ticker)`` ——它是更严的那个，
+   任何 ``(user_id, ticker)`` 重复必然也是 ticker 重复，盯它一个就够。
+4. 占位符是 ``%s``，不是 DuckDB 的 ``?``。
+5. 取最新一根 K 线不能写相关子查询，在 Postgres 上是全表扫 275 万行；
+   先用 CTE 把自选票的最新日期一次算出来，再等值连接。
+6. 日线表混了美股和 A股，每个连接条件都必须带 ``market``，否则会串市场。
+"""
 import json
-from db.init import get_conn
+
+import config
+from db import pg
+
+
+# 自选池的行情快照。三层左连接，所以票即使没有基本信息、没有行情，
+# 也一定会出现在结果里——自选池是用户自己维护的，不能被数据缺失吞掉。
+_LIST_SQL = """
+    with wl as (
+        select
+            w.ticker,
+            coalesce(m.market, 'US') as market,
+            w.created_at
+        from user_watchlist w
+        left join stocks_meta m on m.ticker = w.ticker
+    ),
+    latest as (
+        select d.ticker, d.market, max(d.date) as bar_date
+        from stock_ohlcv_daily d
+        join wl on wl.ticker = d.ticker and wl.market = d.market
+        group by d.ticker, d.market
+    )
+    select
+        wl.ticker,
+        m.company_name,
+        m.sector,
+        wl.market,
+        o.date,
+        o.close,
+        o.pct_chg,
+        o.rsi_14,
+        o.ma_20,
+        o.ma_50,
+        o.ma_200,
+        o.vol_ratio,
+        wl.created_at
+    from wl
+    left join stocks_meta m on m.ticker = wl.ticker
+    left join latest l on l.ticker = wl.ticker and l.market = wl.market
+    left join stock_ohlcv_daily o
+           on o.ticker = l.ticker
+          and o.market = l.market
+          and o.date = l.bar_date
+    order by wl.created_at desc, wl.ticker
+"""
 
 
 def list_watchlist() -> str:
-    """
-    List all tickers in the watchlist with latest price, daily change, and key technicals.
-    """
-    con = get_conn()
+    """列出自选池里全部股票，带最新价、当日涨跌和关键技术指标。"""
     try:
-        rows = con.execute("""
-            SELECT
-                w.ticker,
-                m.company_name,
-                m.sector,
-                o.close,
-                o.pct_chg,
-                o.rsi_14,
-                o.ma_20,
-                o.ma_50,
-                o.ma_200,
-                o.vol_ratio,
-                w.added_at
-            FROM user_watchlist w
-            LEFT JOIN stocks_meta m ON w.ticker = m.ticker
-            LEFT JOIN stock_ohlcv_daily o ON w.ticker = o.ticker
-                AND o.date = (SELECT MAX(date) FROM stock_ohlcv_daily WHERE ticker = w.ticker)
-            ORDER BY w.added_at DESC
-        """).fetchall()
-
-        cols = ["ticker", "company_name", "sector", "close", "pct_chg",
-                "rsi_14", "ma_20", "ma_50", "ma_200", "vol_ratio", "added_at"]
-        result = [dict(zip(cols, r)) for r in rows]
-        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-    finally:
-        con.close()
+        rows = pg.query(_LIST_SQL)
+        return json.dumps(rows, ensure_ascii=False, indent=2, default=str)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
 
 def add_to_watchlist(ticker: str) -> str:
-    """Add a ticker to the watchlist."""
-    con = get_conn()
+    """把一只股票加进自选池。已经在池子里的话什么都不做，不报错。"""
     try:
-        ticker = ticker.upper().strip()
+        ticker = (ticker or "").upper().strip()
         if not ticker:
             return json.dumps({"error": "ticker is required"})
 
-        meta = con.execute(
-            "SELECT ticker FROM stocks_meta WHERE ticker = ?", [ticker]
-        ).fetchone()
-        if not meta:
-            return json.dumps({"error": f"{ticker} not found in database. Run data update first."})
+        known = pg.query_one(
+            "select ticker from stocks_meta where ticker = %s", (ticker,))
+        if not known:
+            return json.dumps(
+                {"error": f"{ticker} 不在数据库里。等 tt-data-hub 下次采集后再试。"},
+                ensure_ascii=False)
 
-        con.execute(
-            "INSERT INTO user_watchlist (ticker) VALUES (?) ON CONFLICT DO NOTHING",
-            [ticker],
-        )
-        return json.dumps({"ok": True, "ticker": ticker})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-    finally:
-        con.close()
+        if not config.WATCHLIST_USER_ID:
+            return json.dumps({"error": "缺少 WATCHLIST_USER_ID 配置"},
+                              ensure_ascii=False)
+
+        inserted = pg.execute_write(
+            "insert into user_watchlist (user_id, ticker) values (%s, %s) "
+            "on conflict (ticker) do nothing",
+            (config.WATCHLIST_USER_ID, ticker))
+        return json.dumps({"ok": True, "ticker": ticker,
+                           "already_present": inserted == 0})
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
 
 def remove_from_watchlist(ticker: str) -> str:
-    """Remove a ticker from the watchlist."""
-    con = get_conn()
+    """把一只股票从自选池移除。"""
     try:
-        ticker = ticker.upper().strip()
-        deleted = con.execute(
-            "DELETE FROM user_watchlist WHERE ticker = ? RETURNING ticker", [ticker]
-        ).fetchone()
-        if not deleted:
-            return json.dumps({"error": f"{ticker} not in watchlist"})
+        ticker = (ticker or "").upper().strip()
+        if not ticker:
+            return json.dumps({"error": "ticker is required"})
+
+        removed = pg.fetch_write(
+            "delete from user_watchlist where ticker = %s returning ticker",
+            (ticker,))
+        if not removed:
+            return json.dumps({"error": f"{ticker} 不在自选池里"},
+                              ensure_ascii=False)
         return json.dumps({"ok": True, "removed": ticker})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-    finally:
-        con.close()
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
 
 def analyze_watchlist(analysis_type: str = "longterm") -> str:
-    """
-    Run longterm or swing analysis on all watchlist tickers.
-    analysis_type: 'longterm' | 'swing'
-    Requires at least 1 ticker in watchlist.
-    """
-    con = get_conn()
-    try:
-        tickers = [r[0] for r in con.execute(
-            "SELECT ticker FROM user_watchlist ORDER BY added_at"
-        ).fetchall()]
-        con.close()
+    """对自选池里全部股票跑长线或波段分析。
 
+    analysis_type: 'longterm' | 'swing'
+    """
+    try:
+        rows = pg.query("select ticker from user_watchlist order by created_at")
+        tickers = [r["ticker"] for r in rows]
         if not tickers:
-            return json.dumps({"error": "Watchlist is empty. Add tickers first."})
+            return json.dumps({"error": "自选池是空的，先加几只票。"},
+                              ensure_ascii=False)
 
         from skills import gather_context
-        if analysis_type == "swing":
-            context = gather_context("swing_screen", {"tickers": tickers})
-        else:
-            context = gather_context("longterm_screen", {"tickers": tickers})
-
-        return context
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+        skill = "swing_screen" if analysis_type == "swing" else "longterm_screen"
+        return gather_context(skill, {"tickers": tickers})
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)

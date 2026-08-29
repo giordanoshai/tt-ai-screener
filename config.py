@@ -6,18 +6,22 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).parent
 
-DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "trading.duckdb"))
-FINNHUB_KEY = os.getenv("FINNHUB_KEY", "")
-FINNHUB_TIER = os.getenv("FINNHUB_TIER", "free")  # free | premium
-NEWS_DAYS = int(os.getenv("NEWS_DAYS", "30"))
-UW_API_TOKEN = os.getenv("UW_API_TOKEN", "")
-FUNDAMENTALS_STALE_DAYS = int(os.getenv("FUNDAMENTALS_STALE_DAYS", "7"))
-NEWS_MOVER_PCT_THRESHOLD = float(os.getenv("NEWS_MOVER_PCT_THRESHOLD", "5.0"))
-NEWS_MOVER_VOLRATIO_THRESHOLD = float(os.getenv("NEWS_MOVER_VOLRATIO_THRESHOLD", "2.0"))
-OHLCV_BATCH_SIZE = int(os.getenv("OHLCV_BATCH_SIZE", "200"))
-TICKERS_FILE = BASE_DIR / "tickers.txt"
+# 数据库：读写分账号，物理隔开，避免误写。
+# 采集（往库里写行情、基本面、新闻）已经全部搬到 tt-data-hub，
+# 这个项目退化成只读消费端，写连接只给自选和持仓的增删改用。
+#
+# 兼容旧键名 READ / WRITE，等 .env 换成新键名之后可以把 or 这一段清掉。
+PG_READ_URL = os.getenv("PG_READ_URL") or os.getenv("READ", "")
+PG_WRITE_URL = os.getenv("PG_WRITE_URL") or os.getenv("WRITE", "")
 
-# AI: news sentiment analysis (small/cheap model, runs during data update)
+# 线上 user_watchlist 表有非空的 user_id 列（uuid），插入时必须带上。
+# 库里目前只有这一个用户，所以给了默认值，.env 里配了就以 .env 为准。
+WATCHLIST_USER_ID = os.getenv(
+    "WATCHLIST_USER_ID", "29795d82-c53b-43e5-985b-cb67b565d7bd")
+
+UW_API_TOKEN = os.getenv("UW_API_TOKEN", "")
+
+# AI: news sentiment analysis (small/cheap model)
 SENTIMENT_API_BASE = os.getenv("SENTIMENT_API_BASE", "")
 SENTIMENT_API_KEY = os.getenv("SENTIMENT_API_KEY", "")
 SENTIMENT_MODEL = os.getenv("SENTIMENT_MODEL", "")
@@ -30,27 +34,3 @@ AI_MODEL = os.getenv("AI_MODEL", "")
 # MCP remote server
 MCP_PORT = int(os.getenv("MCP_PORT", "8766"))
 MCP_TOKEN = os.getenv("MCP_TOKEN", "")
-
-
-def load_tickers() -> list[str]:
-    """Load tickers from DB watchlist. Falls back to tickers.txt if DB not ready."""
-    try:
-        import duckdb
-        con = duckdb.connect(DB_PATH)
-        rows = con.execute("SELECT ticker FROM user_watchlist ORDER BY ticker").fetchall()
-        con.close()
-        if rows:
-            return [r[0] for r in rows]
-    except Exception:
-        pass
-
-    # Fallback: read from tickers.txt (used during first-time setup before DB exists)
-    if TICKERS_FILE.exists():
-        tickers = []
-        for line in TICKERS_FILE.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                tickers.append(line.upper())
-        return tickers
-
-    return []

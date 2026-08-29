@@ -2,6 +2,63 @@
 
 All notable changes to this project will be documented in this file.
 
+### [2026-08-29] 改造为只读 Postgres 消费端（计划 2 的任务 1~5）
+
+数据采集已全部移交独立的 `tt-data-hub` 服务，本项目退化成只读消费端
+（自选和持仓的增删改除外）。五个任务由五个实施者并行完成，全部走
+「先写红测试 → 改代码 → 变绿」，并做了变异测试（故意改坏实现，验证测试
+真的咬得住）。新增 211 个测试，全绿。
+
+* **新增 (Added)**: `db/pg.py` —— 唯一的数据库出入口。读走 `readonly_user`
+  且连接额外设为只读事务（第二道防误写闸，实测报错从「没有权限」变成
+  「只读事务里不能执行 INSERT」），写走 `write_user`。把 Postgres 的
+  `numeric` 统一转成 `float`：`stock_fundamentals` 有 20 多个 numeric 列，
+  psycopg2 默认给出 `Decimal`，而 `Decimal` 不能直接转 JSON，不在访问层
+  处理的话上面每个工具都要各踩一遍。
+* **新增 (Added)**: `tools/hourly.py` 的 `get_hourly_setup` —— 小时线买点
+  工具。返回约 1.5 KB 的纯标量摘要，不含任何原始 K 线（有测试钉住：不许
+  出现 dict 数组、JSON 必须小于 3000 字符）。覆盖做波段真正要问的四件事：
+  现价卡在区间哪个位置、均线方向（含斜率，比「站没站上」更说明问题）、
+  量能几倍（均量刻意排除最后一根，否则放量会被自己稀释）、每根平均波动
+  多少钱（止损别放得比这更近）。支撑阻力用摆动高低点算，不是简单的区间
+  最高最低——那才是市场真正掉过头的位置。
+* **修改 (Changed)**: `tools/watchlist.py` / `positions.py` / `screening.py`
+  全部改连 Postgres。占位符从 DuckDB 的 `?` 换成 `%s`；每条查询都带上
+  `market` 条件（日线表现在混了美股和 A股）。
+* **修改 (Changed)**: 持仓改为**分币种**汇总——美股计美元、A股计人民币，
+  汇总里根本不存在跨币种的总数。
+* **修改 (Changed)**: `screen_stocks` 新增 `market` 参数；行业分类暂时从
+  `ticker_over20b` 兜底取（最新交易日 2082 只可筛票里 2074 只能取到，
+  而 `stocks_meta.sector` 目前全为空），每次返回都带 `sector_source`
+  字段明说这是临时兜底；板块名做了归一化和同义词映射（「Health Care」
+  和「Healthcare」自动相等）。
+* **修复 (Fixed)**: 选股查询的性能。实测对比四种取最新交易日的写法
+  （日线表 275 万行）：原来的相关子查询 738 万代价 / 6750 毫秒；计划推荐的
+  `group by market` 公共表达式**同样是全表扫**，18 万代价 / 375 毫秒；
+  按票 LATERAL 倒扫 13 万 / 203 毫秒；最终选的两段式（先单查最新日再当
+  常量传进主查询）**5541 代价 / 109 毫秒**。性能守卫盯的是「计划内最大
+  节点代价」而不是顶层——顶层有 `limit` 兜着会漏掉底下藏的全表扫。
+* **修复 (Fixed)**: 三处按真库实测纠正的移植错误 ——
+  ① `user_watchlist` 的冲突键是 `(ticker)` 单列不是 `(user_id, ticker)`，
+  按后者写会直接抛唯一键冲突；② `user_positions` 主键只有 `ticker` 不含
+  `market`，`ON CONFLICT (ticker, market)` 会报「没有匹配的唯一约束」；
+  ③ 时间列叫 `created_at` / `updated_at`，不是 DuckDB 那版的 `added_at`。
+* **修改 (Changed)**: `config.py` 改用 `PG_READ_URL` / `PG_WRITE_URL`
+  （各保留一次对旧键名 `READ` / `WRITE` 的兼容读取），新增
+  `WATCHLIST_USER_ID`；删除全部采集相关配置（`DB_PATH`、`FINNHUB_*`、
+  `NEWS_*`、`OHLCV_BATCH_SIZE`、`FUNDAMENTALS_STALE_DAYS`、`TICKERS_FILE`、
+  `load_tickers`）。
+* **移除 (Removed)**: `analyze_positions` 里那段走 `data_sources/uw_client.py`
+  的调用。那个客户端从来没调通过——它写死了 `https://api.unusualwhales.com/api`，
+  读的配置项 `UW_API_TOKEN` 在 `.env` 里根本不存在。文件本身没删，留给任务 6。
+
+**已知未完成**：任务 6（删 DuckDB 与采集代码）、任务 7（部署与 Cloudflare
+Tunnel）尚未开始；另外 `web/app.py` 里有一套跟 MCP 工具完全平行的 DuckDB
+实现（20 处 `get_conn()`、`/screen` 端点自己拼 SQL 且不带 market 条件、
+持仓端点没有币种），任务 6 一删 `db/init.py` 它就会 import 失败，需要单独
+排一个任务。
+
+
 ### [2026-08-28] 统一数据层实施计划（两份）
 * **新增 (Added)**: [`docs/superpowers/plans/2026-08-28-tt-data-hub.md`](file:///d:/Dev_project/Python_Project/tt-trading-mcp/docs/superpowers/plans/2026-08-28-tt-data-hub.md) —— 新建统一采集服务的 10 个任务，含完整代码、单元测试、试跑与验收命令。覆盖：仓库骨架与代码格式转换、数据库统一写入层与运行日志、技术指标移植（附与旧实现对拍的步骤）、yfinance 日线采集（逐只重试补齐现在每天漏的 110 只）、拆股断层检测与修复、UW 客户端与活跃池与美股小时线、A股股票池与日线（含除权漂移检测）、A股小时线与行业分类补齐、UW 快照迁移与基本面、部署与定时任务切换。
 * **新增 (Added)**: [`docs/superpowers/plans/2026-08-28-tt-trading-mcp-postgres.md`](file:///d:/Dev_project/Python_Project/tt-trading-mcp/docs/superpowers/plans/2026-08-28-tt-trading-mcp-postgres.md) —— 本项目改造为只读消费端的 7 个任务：Postgres 读写分离访问层、自选/持仓/选股三个工具的移植、新增 `get_hourly_setup` 小时线买点工具、删除 DuckDB 与全部采集代码、systemd 部署与 Cloudflare Tunnel。

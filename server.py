@@ -11,6 +11,7 @@ from config import MCP_PORT, MCP_TOKEN, BASE_DIR
 from tools.screening import screen_stocks
 from tools.watchlist import list_watchlist, add_to_watchlist, remove_from_watchlist, analyze_watchlist
 from tools.positions import list_positions, add_position, remove_position, analyze_positions
+from tools.hourly import get_hourly_setup
 
 mcp = FastMCP("tt-ai-screener")
 
@@ -28,6 +29,9 @@ mcp.tool()(list_positions)
 mcp.tool()(add_position)
 mcp.tool()(remove_position)
 mcp.tool()(analyze_positions)
+
+# 小时线：日线定方向，小时线定进出场点位
+mcp.tool()(get_hourly_setup)
 
 
 def _ensure_token() -> str:
