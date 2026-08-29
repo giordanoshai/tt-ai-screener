@@ -53,6 +53,21 @@ psycopg2.extensions.register_type(_FLOAT_NUMERIC)
 psycopg2.extensions.register_type(_FLOAT_NUMERIC_ARRAY)
 
 
+#: 只读查询的语句超时（毫秒）。超时由【服务器】自己杀掉。
+#:
+#: 2026-08-29 实测踩到的：服务器上有两条查询在数据库端跑了 2~3 小时——
+#: 发起它们的进程早被 kill 了，但后端进程不会跟着客户端死。其中一条正是
+#: 本项目改造前那个 group by market 的全表扫写法，一直在扫 380 万行的日线表，
+#: 把整个库的 IO 拖慢，而进程列表里看不出任何异常。
+#: 排查还多绕一圈：write_user 没权限终结 readonly_user 的连接，
+#: 只能用同一个角色去 pg_cancel_backend。
+#:
+#: 设了之后不依赖任何人记得清理。只加在读连接上——写连接留给自选和持仓的
+#: 增删改，不该被掐。MCP 工具的查询本来都在毫秒级（选股实测 109 毫秒），
+#: 3 分钟是给「刚灌完数据、索引还没跟上」那种暂态留的余量。
+READ_STATEMENT_TIMEOUT_MS = 180_000
+
+
 @contextmanager
 def _conn(write: bool = False):
     """开一个连接。正常结束自动提交，出异常自动回滚，总是关闭。"""
@@ -68,6 +83,10 @@ def _conn(write: bool = False):
         if not write:
             # 会话级只读：账号权限之外的第二道闸
             connection.set_session(readonly=True)
+            # 语句超时：防止查询在服务端跑飞（见上面常量的注释）
+            with connection.cursor() as cur:
+                cur.execute("set statement_timeout = %s"
+                            % READ_STATEMENT_TIMEOUT_MS)
         yield connection
         connection.commit()
     except Exception:

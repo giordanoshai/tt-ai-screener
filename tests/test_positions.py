@@ -397,23 +397,15 @@ class TestCnDataNotReadyYet:
 
     这不是代码问题，是上游 tt-data-hub 的 cn_daily 任务还没跑。
     分币种的逻辑已经用假数据测透了（见 TestSummaryByCurrency）；
-    这两条留着当上游数据到位的信号，变成 XPASS 就可以把 xfail 去掉。
+    2026-08-29 上游 cn_daily / meta_refresh 已跑，A股 1500 只票、105 万行日线
+    都在库里了，xfail 标记已摘掉。从现在起这两条是真正的守卫。
     """
 
-    @pytest.mark.xfail(strict=False,
-                       reason="stocks_meta 里一只 A股都没有（15661 行全是 US），"
-                              "要先跑 tt-data-hub 的 cn_daily / meta_refresh；"
-                              "在那之前 add_position(market='CN') 会被"
-                              "「不在数据库里」挡回去")
     def test_cn_tickers_exist_in_meta(self):
         n = pg.query_one("select count(*) as n from stocks_meta "
                          "where market = %s", ("CN",))["n"]
         assert n > 0, "A股元数据还没进来，add_position 的存在性校验过不了"
 
-    @pytest.mark.xfail(strict=False,
-                       reason="stock_ohlcv_daily 目前只有 US，"
-                              "要先跑 tt-data-hub 的 cn_daily；"
-                              "在那之前 A股持仓的现价和盈亏都是空的")
     def test_cn_daily_bars_exist_for_pricing(self):
         n = pg.query_one("select count(*) as n from stock_ohlcv_daily "
                          "where market = %s", ("CN",))["n"]

@@ -2,6 +2,69 @@
 
 All notable changes to this project will be documented in this file.
 
+### [2026-08-29] 删掉 DuckDB 与全部采集代码（计划 2 的任务 6）
+
+采集职责移交 `tt-data-hub` 之后，这个项目里的采集代码整个删掉，四个
+「import 就炸」的模块全部修好。316 个测试全绿。
+
+* **移除 (Removed)**: `data_sources/` 整个目录、`db/init.py`、`db/update.py`、
+  `db/fetch.py`、`db/universe.py`、`db/fetch_universe.py`、`db/migrate.py`、
+  `db/run_daily_update.bat`。`db/` 下现在只剩 `pg.py`。
+* **移除 (Removed)**: `main.py` 从 180 行砍到 49 行——去掉 `--update`、`--cron`、
+  整个定时线程，以及 2026-07-16 加的百炼异步情绪打分后台线程（它依赖
+  `db.update`）。现在只剩 `--mcp` 和 `--port`。
+* **修改 (Changed)**: `skills/__init__.py` 改连 Postgres。按代码取数时先按后缀
+  把票分成美股/A股两组分别查，不会串市场；取最新交易日改成票少的按票走主键
+  倒扫、扫全池的先单查该市场最新日再等值比较，原来的相关子查询全删。
+  另外改成**以传进来的代码列表为驱动表**——原来 `FROM stock_ohlcv_daily JOIN
+  stocks_meta` 的写法，一只票只要缺行情或缺元数据就整行消失，而自选池是用户
+  自己维护的，票被数据缺失悄悄吞掉比返回一行空数据更糟。
+* **修改 (Changed)**: `web/app.py` 全部重写。**凡是 `tools/` 里已有的能力，端点
+  改成直接调那个函数**，不再维护第二份 SQL：持仓的增删改查、自选的增删、
+  板块下拉、最新交易日、行业别名展开。`/api/positions` 现在把工具算好的
+  **分币种汇总**原样透出，网页层不再把美元和人民币加到一起。
+  `/screen` 因为支持的筛选条件是 MCP 工具的超集（多头排列、离均线距离上下限、
+  振幅、涨跌幅区间、是否在自选池里），仍然自己拼 SQL，但复用了工具里的
+  两段式取最新交易日和行业别名展开。
+* **修复 (Fixed)**: `ai_client.py` 的 `get_model()` / `list_models()` 一直在查
+  `ai_models` 这张表，而**线上 Postgres 根本没有它**——所以 `get_model()` 永远
+  返回 None，网页里的 AI 分析是完全不能用的，表现却是「没配置模型」，会让人
+  以为是自己配错了。改成直接从环境变量读（`config.py` 里本来就有
+  `AI_API_BASE` / `AI_API_KEY` / `AI_MODEL` 和一套 `SENTIMENT_*`）。
+* **修复 (Fixed)**: 只读连接加 `statement_timeout = 3min`。2026-08-29 实测：
+  被 kill 掉的进程发出去的查询在**数据库端继续跑了 2~3 小时**（后端进程不会
+  跟着客户端死），其中一条正是本项目改造前那个 `group by market` 的全表扫写法，
+  一直在扫 380 万行的日线表，把整个库的 IO 拖慢，而进程列表里看不出任何异常。
+  排查还多绕一圈：`write_user` 没权限终结 `readonly_user` 的连接，只能用同一个
+  角色去 `pg_cancel_backend`。**写连接不加**——大批量写入正常就要跑几分钟。
+* **修改 (Changed)**: `/status` 的行数改用 Postgres 自己的统计值
+  （`pg_class.reltuples`）而不是真数一遍全表，首页从 1124 毫秒降到 251 毫秒，
+  误差千分之四。这个数字没有任何模板在显示，不值得为它花 425 毫秒/市场。
+* **修改 (Changed)**: `/ticker/{ticker}` 去掉「库里没有就现场采一份写回库」的
+  回落路径——那是采集，现在归 `tt-data-hub`。有测试钉住这个端点一个字都不写库。
+* **新增 (Added)**: `pytest.ini` 限定 `testpaths = tests`。根目录下未跟踪的
+  `scratch/` 里有一批同样叫 `test_*.py` 的临时脚本，**在 import 阶段就去调
+  Unusual Whales 接口**，不限定目录的话光收集用例就要 15 分钟。
+* **修改 (Changed)**: `requirements.txt` 删掉 `duckdb` / `yfinance` /
+  `pandas-ta` / `finnhub-python`（最后那个全项目一次 `import finnhub` 都没有，
+  本来就是死依赖），补上 `psycopg2-binary`。
+* **修改 (Changed)**: 摘掉 9 个 `xfail` 标记——它们当初标的是「等 tt-data-hub
+  灌数据」，现在 A股日线 105 万行、A股小时线 14.4 万行、美股小时线 2.9 万行、
+  行业分类 1555 只都到位了，这些测试变成 XPASS。摘掉标记它们才重新是守卫。
+  行业分类那条保留 xfail（只补到 1555，目标 2000，因为 `meta_refresh` 那轮撞上
+  UW 端点整体故障，2133 只里 530 只没采到）。
+* **修改 (Changed)**: `web/templates/settings.html` 删掉「数据更新时间表」卡片、
+  `home.html` 删掉「AUTO 17:30」角标——采集不在这个项目里了，留着是假按钮。
+
+**已知未完成 / 待决定**：任务 7（部署与 Cloudflare Tunnel）没做；网页上还有
+一批端点的底层表线上不存在（`ai_models` / `app_settings` / `skill_prompts` /
+`analysis_history`），对应的「改语言」「自定义技能提示词」「分析历史」页面
+是摆设，删还是保留待定；`tools/watchlist.py` 的 `list_watchlist` 实测 1281 毫秒
+（用的是已知较慢的 `group by` 写法），`/watchlist` 页面 1414 毫秒里 1281 毫秒
+花在这；`analysis.html` 的总盈亏 getter 会把不同币种加到一起，等有了 A股持仓
+就会显示假数字。
+
+
 ### [2026-08-29] 改造为只读 Postgres 消费端（计划 2 的任务 1~5）
 
 数据采集已全部移交独立的 `tt-data-hub` 服务，本项目退化成只读消费端

@@ -380,18 +380,12 @@ class TestUpstreamDataNotReadyYet:
     要等 tt-data-hub 的对应任务跑完。等它们变成 XPASS 就把标记去掉。
     """
 
-    @pytest.mark.xfail(strict=False,
-                       reason="stocks_meta.sector 全空（15661 行 0 个有值），"
-                              "要先跑 tt-data-hub 的 meta_refresh")
     def test_sector_shows_up_in_the_list(self):
         rows = json.loads(watchlist.list_watchlist())
         if not rows:
             pytest.skip("自选池是空的")
         assert any(r["sector"] for r in rows), "自选池里没有一只票有行业分类"
 
-    @pytest.mark.xfail(strict=False,
-                       reason="stock_ohlcv_daily 目前只有 US，"
-                              "要先跑 tt-data-hub 的 cn_daily")
     def test_cn_ticker_uses_its_own_latest_trading_day(self):
         """A股和美股的最新交易日不一样，取价必须各按各的市场来。"""
         cn = pg.query_one(

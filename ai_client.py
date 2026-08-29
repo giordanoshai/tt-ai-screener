@@ -4,6 +4,7 @@ All functions accept model config dict with api_format field.
 """
 import json
 import requests
+import config
 
 
 # ── OpenAI format ────────────────────────────────────────────────────────────
@@ -188,60 +189,70 @@ def chat_stream(model_cfg: dict, messages: list[dict],
         yield from _openai_stream(model_cfg, messages, temperature, max_tokens)
 
 
-# ── Model registry (reads from DB) ──────────────────────────────────────────
+# ── 模型配置：从环境变量读 ────────────────────────────────────────────────
+#
+# 原来这两个函数查的是 ai_models 这张表。2026-08-29 实测：线上 Postgres 里
+# 【根本没有这张表】，所以 get_model() 永远返回 None —— 网页里的 AI 分析
+# 是完全不能用的，而且表现为「没配置模型」，会让人以为是自己配错了。
+# 网页那套增删改模型的表单也存不进去，填完就消失。
+#
+# 而 config.py 里本来就有 AI_API_BASE / AI_API_KEY / AI_MODEL 和一套
+# SENTIMENT_*，.env.example 里也一直列着。所以直接从环境变量读，
+# 数据库这条路整个去掉（它依赖的 db.init 也随采集代码一起删了）。
 
-def get_model(model_id: str = None, role: str = "analysis") -> dict | None:
-    from db.init import get_conn
-    con = get_conn()
-    if model_id:
-        row = con.execute(
-            "SELECT id, api_base, api_key, model_id, api_format, supports_thinking, display_name FROM ai_models WHERE id = ? AND enabled = TRUE",
-            [model_id]
-        ).fetchone()
-    else:
-        col = "is_default_sentiment" if role == "sentiment" else "is_default_analysis"
-        row = con.execute(
-            f"SELECT id, api_base, api_key, model_id, api_format, supports_thinking, display_name FROM ai_models WHERE {col} = TRUE AND enabled = TRUE LIMIT 1",
-        ).fetchone()
-    con.close()
-    if not row:
+_ROLE_ENV = {
+    "analysis": ("AI_API_BASE", "AI_API_KEY", "AI_MODEL", "分析模型"),
+    "sentiment": ("SENTIMENT_API_BASE", "SENTIMENT_API_KEY", "SENTIMENT_MODEL",
+                  "情绪打分模型"),
+}
+
+
+def _model_from_env(role: str) -> dict | None:
+    base_k, key_k, model_k, label = _ROLE_ENV.get(role, _ROLE_ENV["analysis"])
+    api_base = getattr(config, base_k, "")
+    model_id = getattr(config, model_k, "")
+    if not api_base or not model_id:
         return None
-    
-    api_key = row[2]
-    if not api_key:
-        import os
-        if role == "sentiment":
-            api_key = os.getenv("SENTIMENT_API_KEY", "")
-        else:
-            api_key = os.getenv("AI_API_KEY", "")
-
     return {
-        "id": row[0], "api_base": row[1], "api_key": api_key,
-        "model_id": row[3], "api_format": row[4],
-        "supports_thinking": row[5], "display_name": row[6],
+        "id": role,
+        "api_base": api_base,
+        "api_key": getattr(config, key_k, ""),
+        "model_id": model_id,
+        "api_format": "openai",
+        "supports_thinking": False,
+        "display_name": "%s（%s）" % (label, model_id),
     }
 
 
+def get_model(model_id: str = None, role: str = "analysis") -> dict | None:
+    """取一个模型配置。没配返回 None，上层显示「未配置」。
+
+    `model_id` 现在当作角色名用（"analysis" / "sentiment"）——环境变量这套
+    配置下每个角色只有一个模型，没有多模型可选。传别的值按角色回退。
+    """
+    if model_id in _ROLE_ENV:
+        role = model_id
+    return _model_from_env(role)
+
+
 def list_models(role: str = None) -> list[dict]:
-    from db.init import get_conn
-    con = get_conn()
-    where = "enabled = TRUE"
-    params = []
-    if role:
-        where += " AND (role = ? OR role = 'both')"
-        params.append(role)
-    rows = con.execute(f"""
-        SELECT id, display_name, model_id, api_format, role, supports_thinking,
-               is_default_sentiment, is_default_analysis
-        FROM ai_models WHERE {where} ORDER BY display_name
-    """, params).fetchall()
-    con.close()
-    return [
-        {"id": r[0], "display_name": r[1], "model_id": r[2], "api_format": r[3],
-         "role": r[4], "supports_thinking": r[5],
-         "is_default_sentiment": r[6], "is_default_analysis": r[7]}
-        for r in rows
-    ]
+    """列出当前配好的模型。环境变量里配了几个就是几个，最多两个。"""
+    roles = [role] if role in _ROLE_ENV else list(_ROLE_ENV)
+    out = []
+    for r in roles:
+        cfg = _model_from_env(r)
+        if cfg:
+            out.append({
+                "id": cfg["id"],
+                "display_name": cfg["display_name"],
+                "model_id": cfg["model_id"],
+                "api_format": cfg["api_format"],
+                "role": r,
+                "supports_thinking": cfg["supports_thinking"],
+                "is_default_sentiment": r == "sentiment",
+                "is_default_analysis": r == "analysis",
+            })
+    return out
 
 
 def analysis_available() -> bool:

@@ -35,34 +35,6 @@
       </div>
     </div>
 
-    <!-- ═══ Data Update Schedule ═══ -->
-    <div class="bg-gray-900 border border-gray-800 rounded-xl">
-      <div class="px-5 py-3 flex items-center justify-between">
-        <div>
-          <h3 class="text-sm font-medium text-gray-200">Data Update Schedule</h3>
-          <p class="text-[10px] text-gray-500 mt-0.5">Auto-update data daily at a fixed time (skips weekends)</p>
-        </div>
-        <div class="flex items-center gap-3">
-          <input type="time" x-model="scheduleTime"
-            class="bg-gray-800 border border-gray-700 rounded px-2.5 py-1.5 text-xs mono text-gray-200 focus:outline-none focus:border-indigo-500"
-            :disabled="!scheduleEnabled">
-          <button @click="scheduleEnabled = !scheduleEnabled; saveSchedule()"
-            class="relative w-10 h-5 rounded-full transition-colors duration-200"
-            :class="scheduleEnabled ? 'bg-indigo-600' : 'bg-gray-700'">
-            <span class="absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform duration-200"
-              :class="scheduleEnabled && 'translate-x-5'"></span>
-          </button>
-        </div>
-      </div>
-      <div x-show="scheduleEnabled" class="px-5 pb-3 flex items-center gap-2">
-        <button @click="saveSchedule()"
-          class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-xs font-medium transition">
-          Save Time
-        </button>
-        <span x-show="scheduleSaved" class="text-[10px] text-green-500">Saved</span>
-      </div>
-    </div>
-
     <!-- ══════════════════════════════════════════════════════════════════════ -->
     <!-- AI Models (collapsible)                                              -->
     <!-- ══════════════════════════════════════════════════════════════════════ -->
@@ -472,9 +444,6 @@ Input JSON structure:</p>
         editForm: {},
         modelsOpen: false,
         promptsOpen: false,
-        scheduleEnabled: false,
-        scheduleTime: '17:30',
-        scheduleSaved: null,
         // prompts
         prompts: {},
         promptOpen: null,
@@ -504,24 +473,10 @@ Input JSON structure:</p>
           const langData = await langRes.json()
           this.lang = langData.lang || 'en'
           await this.refreshPrompts()
-          const schRes = await fetch('/settings/schedule')
-          const schData = await schRes.json()
-          this.scheduleEnabled = schData.enabled || false
-          this.scheduleTime = schData.time || '17:30'
           if (window.location.hash === '#skill-prompts') {
             this.promptsOpen = true
             this.$nextTick(() => document.getElementById('skill-prompts')?.scrollIntoView({ behavior: 'smooth' }))
           }
-        },
-
-        async saveSchedule() {
-          await fetch('/settings/schedule', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ enabled: this.scheduleEnabled, time: this.scheduleTime }),
-          })
-          this.scheduleSaved = true
-          setTimeout(() => this.scheduleSaved = false, 2000)
         },
 
         async setLang(newLang) {

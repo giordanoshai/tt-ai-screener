@@ -17,3 +17,12 @@ tests/*
 !tests/test_*.py
 !tests/__init__.py
 changelog.md
+
+# 临时工作目录和接口调研笔记，不进版本库。
+# .api/akshre.md 里有内网地址 192.168.1.38，而本仓库有公开的 GitHub 远程；
+# scratch/ 里的脚本一 import 就去调外部接口。
+# 2026-08-29 被 `git add -A` 误提交过一次（未推送，已回退）。
+scratch/
+.api/
+swing_trade_setups_zh.md
+scratch_test_batch.jsonl

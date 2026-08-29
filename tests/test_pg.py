@@ -247,22 +247,81 @@ class TestSchemaExpectations:
 class TestUpstreamDataNotReadyYet:
     """这两条是数据前提，不是代码问题——tt-data-hub 的对应任务还没跑。
 
-    标成 xfail 是为了不挡住这一层的开发；等上游补数据后它们会变成
-    XPASS，看到 XPASS 就把 xfail 标记去掉。
+    2026-08-29 上游数据已到位（A股日线 105 万行、A股小时线 14.4 万行、
+    美股小时线 2.9 万行），这一组里除了行业分类那条，xfail 标记都已摘掉——
+    从现在起它们是真正的守卫，数据要是没了会红。
     """
 
-    @pytest.mark.xfail(strict=False,
-                       reason="stocks_meta.sector 全空（15661 行 0 个有值），"
-                              "要先跑 tt-data-hub 的 meta_refresh")
+    @pytest.mark.xfail(strict=False, reason=(
+        "行业分类只补到 1555 只（目标 2000）。2026-08-29 跑 tt-data-hub 的 "
+        "meta_refresh 时，UW 那个转售端点整体故障了一次（全域 530 约 20 分钟），"
+        "2133 只里有 530 只没采到，失败的是从字母 R 开始连续的一段——"
+        "不是这些票本身有问题，重跑就能补上。这条留着当补齐的信号。"))
     def test_stocks_meta_sector_is_populated(self):
         n = pg.query_one(
             "select count(*) as n from stocks_meta where sector is not null")["n"]
         assert n >= 2000, f"只有 {n} 只票有行业分类，先去跑 tt-data-hub 的 meta_refresh"
 
-    @pytest.mark.xfail(strict=False,
-                       reason="stock_ohlcv_daily 目前只有 US，"
-                              "要先跑 tt-data-hub 的 cn_daily")
     def test_daily_table_has_cn_market(self):
         markets = {r["market"] for r in pg.query(
             "select distinct market from stock_ohlcv_daily")}
         assert "CN" in markets, "A股数据还没进来，先跑 tt-data-hub 的 cn_daily"
+
+
+class TestReadQueriesCannotRunAway:
+    """只读连接必须有语句超时。
+
+    2026-08-29 实测踩到的：服务器上有两条查询在数据库端跑了 2~3 小时——
+    发起它们的进程早就被 kill 掉了，但【后端进程不会跟着客户端死】。
+    其中一条正是这个项目改造前那个 `group by market` 的写法（已知会全表扫），
+    它一直在扫 380 万行的日线表，把整个库的 IO 拖慢。
+
+    排查还多绕一圈：write_user 没权限终结 readonly_user 的连接
+    （must be a member of the role whose process is being terminated），
+    只能用同一个角色去 pg_cancel_backend。
+
+    设了超时之后由服务器自己杀，不依赖任何人记得清理。
+    只加在读连接上——写连接留给自选和持仓的增删改，不该被掐。
+    """
+
+    @staticmethod
+    def _fake(monkeypatch):
+        executed = []
+
+        class FakeCur:
+            def execute(self, sql, params=None):
+                executed.append(sql)
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def close(self): pass
+
+        class FakeConn:
+            def cursor(self, *a, **k): return FakeCur()
+            def set_session(self, **kw): pass
+            def commit(self): pass
+            def rollback(self): pass
+            def close(self): pass
+
+        monkeypatch.setattr(pg.psycopg2, "connect", lambda *a, **k: FakeConn())
+        monkeypatch.setattr(pg.config, "PG_READ_URL", "postgresql://fake/read")
+        monkeypatch.setattr(pg.config, "PG_WRITE_URL", "postgresql://fake/write")
+        return executed
+
+    def test_read_connection_sets_a_statement_timeout(self, monkeypatch):
+        executed = self._fake(monkeypatch)
+        with pg._conn(write=False):
+            pass
+        assert any("statement_timeout" in s.lower() for s in executed), \
+            "只读连接没设语句超时"
+
+    def test_write_connection_has_no_statement_timeout(self, monkeypatch):
+        executed = self._fake(monkeypatch)
+        with pg._conn(write=True):
+            pass
+        assert not any("statement_timeout" in s.lower() for s in executed), \
+            "写连接不该设语句超时"
+
+    def test_timeout_is_generous_enough(self):
+        """MCP 工具的查询都该在毫秒级（选股实测 109 毫秒），
+        但留足余量避免误杀刚灌完数据、索引还没跟上时的慢查询。"""
+        assert 120_000 <= pg.READ_STATEMENT_TIMEOUT_MS <= 600_000

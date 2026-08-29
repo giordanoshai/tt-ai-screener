@@ -124,14 +124,26 @@ def _plan(fmt="text", ticker="AAPL", market="US"):
 class TestQueryPlan:
     """确认查询是靠索引直接跳到小时线那一段，而不是先扫分钟线再过滤。"""
 
-    def test_partial_hourly_index_exists(self):
-        """库里有一个专门给小时线用的部分索引。它要是被删了，这里先报警。"""
+    def test_the_index_this_query_relies_on_exists(self):
+        """守住小时线查询真正依赖的那个索引。
+
+        这条原来守的是 idx_ohlcv_min_hourly —— 那是个部分索引
+        btree (ticker, ts DESC) where timeframe='1h'。写这个任务的时候就已经
+        实测发现【优化器根本不选它】：它缺 market 列，用它反而要多一道 heap
+        上的 market 过滤，代价更高。真正被选中的一直是下面这个。
+
+        2026-08-29 那个用不上的部分索引已经从库里删掉了（连同另外两个冗余
+        索引，一共回收约 1.5 GB），所以这条改成守真正在用的那个。
+        """
         rows = pg.query(
             "select indexdef from pg_indexes where schemaname='public' "
             "and tablename='stock_ohlcv_min' and indexname=%s",
-            ("idx_ohlcv_min_hourly",))
-        assert rows, "部分索引 idx_ohlcv_min_hourly 不见了"
-        assert "'1h'" in rows[0]["indexdef"]
+            ("stock_ohlcv_min_ticker_tf_ts_idx",))
+        assert rows, ("索引 stock_ohlcv_min_ticker_tf_ts_idx 不见了 —— "
+                      "小时线查询会退化成扫 2000 万行分钟线")
+        d = rows[0]["indexdef"]
+        for col in ("market", "ticker", "timeframe", "ts"):
+            assert col in d, "索引定义里缺 %s 列：%s" % (col, d)
 
     def test_no_sequential_scan(self):
         """全表顺序扫 2000 万行 / 9.3 GB，绝不允许。"""
@@ -574,25 +586,18 @@ class TestAgainstRealData:
     看到 XPASS 就把 xfail 去掉。
     """
 
-    @pytest.mark.xfail(strict=False,
-                       reason="stock_ohlcv_min 里 timeframe='1h' 是 0 行，"
-                              "要先跑 tt-data-hub 的 us_hourly")
     def test_us_hourly_data_exists(self):
         n = pg.query_one(
             "select count(*) as n from stock_ohlcv_min "
             "where market = 'US' and timeframe = '1h'")["n"]
         assert n > 0, "美股小时线还没进来，先跑 tt-data-hub 的 us_hourly"
 
-    @pytest.mark.xfail(strict=False,
-                       reason="stock_ohlcv_min 里 market='CN' 的小时线是 0 行，"
-                              "要先跑 tt-data-hub 的 cn_hourly")
     def test_cn_hourly_data_exists(self):
         n = pg.query_one(
             "select count(*) as n from stock_ohlcv_min "
             "where market = 'CN' and timeframe = '1h'")["n"]
         assert n > 0, "A股小时线还没进来，先跑 tt-data-hub 的 cn_hourly"
 
-    @pytest.mark.xfail(strict=False, reason="等上游把小时线灌进来")
     def test_real_ticker_returns_a_usable_setup(self, sample_hourly_ticker):
         out = json.loads(hourly.get_hourly_setup(sample_hourly_ticker["ticker"]))
         assert "error" not in out, out
@@ -600,7 +605,6 @@ class TestAgainstRealData:
         assert out["recent_high"] >= out["last_close"] >= out["recent_low"]
         assert 0 <= out["position_pct"] <= 100
 
-    @pytest.mark.xfail(strict=False, reason="等上游把 A股小时线灌进来")
     def test_cn_bars_start_at_0930(self):
         """A股一天 4 根，ts 减 60 分钟对齐后应该是 09:30 / 10:30 / 13:00 / 14:00。
         如果出现 15:00，说明采集侧的对齐没生效。"""
