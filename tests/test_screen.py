@@ -269,11 +269,15 @@ def test_ticker_remove_delegates_to_watchlist_tool(client):
 @pytest.mark.parametrize("method,path", [
     ("post", "/update"),
     ("get", "/update/status"),
+    ("get", "/update/stream"),
 ])
 def test_collection_endpoints_are_gone(client, method, path):
-    resp = getattr(client, method)(path)
-    assert resp.status_code == 410
-    assert "tt-data-hub" in resp.json()["error"]
+    """这三个端点先是改成 410 存根，2026-08-29 连存根一起删了。
+
+    理由：410 存根在页面上还是三个能点的按钮，点了弹一句「已经搬走了」——
+    看着像坏了。采集在这个项目里已经彻底不存在，按钮和路由一起没了才诚实。
+    """
+    assert getattr(client, method)(path).status_code in (404, 405)
 
 
 # ── 静态检查：DuckDB 的痕迹一点都不许剩 ────────────────────────────────────────

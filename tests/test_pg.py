@@ -247,16 +247,15 @@ class TestSchemaExpectations:
 class TestUpstreamDataNotReadyYet:
     """这两条是数据前提，不是代码问题——tt-data-hub 的对应任务还没跑。
 
-    2026-08-29 上游数据已到位（A股日线 105 万行、A股小时线 14.4 万行、
-    美股小时线 2.9 万行），这一组里除了行业分类那条，xfail 标记都已摘掉——
-    从现在起它们是真正的守卫，数据要是没了会红。
+    2026-08-29 上游数据全部到位，这一组的 xfail 标记已【全部】摘掉，
+    从现在起它们是真正的守卫，数据要是没了会红：
+      A股日线 105 万行 / 1500 只 / 三年
+      A股小时线 14.4 万行 / 150 只
+      美股小时线 2.9 万行
+      行业分类 2020 只（meta_refresh 第一轮撞上 UW 端点整体故障只补到 1555，
+                       降并发重跑之后失败数从 530 降到 7）
     """
 
-    @pytest.mark.xfail(strict=False, reason=(
-        "行业分类只补到 1555 只（目标 2000）。2026-08-29 跑 tt-data-hub 的 "
-        "meta_refresh 时，UW 那个转售端点整体故障了一次（全域 530 约 20 分钟），"
-        "2133 只里有 530 只没采到，失败的是从字母 R 开始连续的一段——"
-        "不是这些票本身有问题，重跑就能补上。这条留着当补齐的信号。"))
     def test_stocks_meta_sector_is_populated(self):
         n = pg.query_one(
             "select count(*) as n from stocks_meta where sector is not null")["n"]

@@ -52,8 +52,13 @@ This is the canonical list of tools this server exposes (10 tools). Each tool ma
 tt-trading-mcp/
   main.py                # Unified entrypoint (web + MCP, or MCP stdio)
   server.py              # MCP server — registers all 10 tools, token auth
-  config.py              # Postgres URLs, AI API keys, MCP port/token
-  ai_client.py           # OpenAI/Anthropic-compatible AI client (analysis)
+  config.py              # Postgres URLs, fallback AI env vars, MCP port/token
+  ai_client.py           # OpenAI/Anthropic-compatible AI client; reads config/models.json
+  config/
+    models.json          # AI model list (NO keys — each entry names an env var)
+    skill_prompts.json   # Custom skill prompts; absent until the UI saves one
+  sql/
+    001_analysis_history.sql   # The one table this repo owns
   db/
     pg.py                # THE ONLY database gateway (read + write)
   tools/
@@ -95,22 +100,114 @@ API: `pg.query(sql, params) -> list[dict]`, `pg.query_one(...) -> dict | None`, 
 
 ## Data Sources
 
-**Collection lives in `tt-data-hub`, not here.** That repo owns the ingest jobs, the schema, and the system cron on the server. This project only reads what is already in the database (plus its own watchlist/positions writes). Do not add fetching, table creation, or migrations to this repo.
+Market data comes from Postgres; configuration comes from files in the repo and from
+`.env`. Nothing comes from a local database file any more — **there is no DuckDB**.
+`trading.duckdb` is a dead leftover; no code reads it, and no code should.
 
-Configured in `.env` (see `config.py`):
+| What | Where it lives | Who writes it |
+|---|---|---|
+| Prices/OHLCV (daily + intraday), fundamentals, news + sentiment, Unusual Whales options data | Self-hosted Supabase/Postgres | **`tt-data-hub` only.** This repo reads it through `readonly_user` |
+| Watchlist, positions | Same Postgres (`user_watchlist`, `user_positions`) | **This repo**, through `write_user` |
+| Analysis history | Same Postgres (`analysis_history`) | **This repo**, through `write_user` |
+| AI model configuration | `config/models.json` (a file, not a table) | Edited by hand |
+| API keys for those models | `.env` | Edited by hand |
+| Custom skill prompts | `config/skill_prompts.json` (a file, not a table) | Written by the Settings page |
+| Default skill prompts | `skills/<lang>/<skill>.md` | Edited by hand |
+| Output language | `LANG_UI` env var — fixed, not switchable at runtime | Edited by hand |
+
+### Market data: read-only, collected elsewhere
+
+**Collection lives in `tt-data-hub`, not here.** That repo owns the ingest jobs, the
+schema, the migrations, and the system cron on the server. Do not add fetching, table
+creation, or migrations to this repo. There is no `/update` endpoint and no update
+button — those were removed, not stubbed, because a button that only apologises is
+worse than no button. To see how the last ingest run went, read `ingest_runlog`
+(surfaced on the home page and at `GET /api/update/last`).
+
+### Writes from this repo: exactly three tables
+
+`user_watchlist`, `user_positions`, and `analysis_history`. Everything else goes
+through the read-only account, whose session is additionally set to a read-only
+transaction. `analysis_history` is the newest of the three: every AI analysis run
+from the web UI (both `POST /analyze` and the streaming `POST /analyze/stream`) is
+saved there, and the History page reads it back. **A failed history write must never
+fail the analysis** — the answer is already computed and on its way to the user, so a
+failure there is logged and swallowed.
+
+### AI models: `config/models.json`
+
+The model list used to be an `ai_models` table in the old DuckDB. It was missed
+during the migration and does not exist in Postgres, which is why AI analysis
+silently reported "no model configured" for a while. It now lives in
+`config/models.json`:
+
+```jsonc
+{
+  "models": [
+    {
+      "id": "qwen-max",                  // stable key; what /analyze's `model` param takes
+      "display_name": "Qwen3.7 Max",
+      "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model_id": "qwen3.7-max",         // what goes in the API request body
+      "api_format": "openai",            // openai | anthropic
+      "role": "analysis",                // analysis | sentiment | both
+      "supports_thinking": true,
+      "is_default_analysis": true,       // picked when no id is given
+      "is_default_sentiment": false,
+      "enabled": true,                   // false = hidden everywhere
+      "api_key_env": "DASHSCOPE_API_KEY" // NAME of an env var, never the key itself
+    }
+  ]
+}
+```
+
+**No secret ever goes in this file.** `api_key_env` names an environment variable
+(`ANTHROPIC_API_KEY`, `DASHSCOPE_API_KEY`, `OPENAI_API_KEY`, `AI_API_KEY`, …) and
+`ai_client.get_model()` resolves it with `os.getenv` at call time. The file is read
+fresh on every call, so an edit takes effect without a restart.
+
+The Settings page shows this list **read-only** — adding, removing, or changing the
+default model means editing the file. The old `POST /models` and `DELETE /models/{id}`
+endpoints are gone.
+
+If `config/models.json` is missing, unreadable, or has no models, `ai_client` falls
+back to the single-model-per-role env vars (`AI_API_BASE`/`AI_API_KEY`/`AI_MODEL` and
+`SENTIMENT_API_BASE`/`SENTIMENT_API_KEY`/`SENTIMENT_MODEL`).
+
+### Skill prompts: `skills/<lang>/*.md`, overridable in `config/skill_prompts.json`
+
+`load_skill_prompt(skill, lang)` returns the custom prompt if
+`config/skill_prompts.json` has one, otherwise the bundled markdown file. The JSON is
+`{"<skill>": {"<lang>": "<prompt>"}}`; a missing file, a broken file, or a blank entry
+all fall back to the markdown without erroring. The Settings page writes it (Save) and
+removes entries from it (Reset to Default). The `skill_prompts` table it replaced does
+not exist in Postgres.
+
+### Language: fixed
+
+`LANG_UI` (`en` / `cn`, default `en`) decides the analysis output language and which
+`skills/<lang>/` directory is used. **Runtime language switching was removed** — the
+`app_settings` table it was stored in does not exist in Postgres, and the feature is
+not wanted. There is no `/settings/lang` endpoint and no switch in the UI.
+
+### `.env`
 
 ```bash
 PG_READ_URL=...            # Postgres, readonly_user  (all market data)
-PG_WRITE_URL=...           # Postgres, write_user     (watchlist + positions only)
+PG_WRITE_URL=...           # Postgres, write_user     (watchlist + positions + history)
 WATCHLIST_USER_ID=...      # uuid; user_watchlist.user_id is NOT NULL
-AI_API_BASE=...            # AI: skills analysis engine
-SENTIMENT_API_BASE=...     # AI: news sentiment scoring
+ANTHROPIC_API_KEY=...      # AI keys, referenced by name from config/models.json
+DASHSCOPE_API_KEY=...
+OPENAI_API_KEY=...
+AI_API_BASE=...            # fallback single-model config, only used if models.json is empty
+SENTIMENT_API_BASE=...     # same, for sentiment scoring
+LANG_UI=en                 # en | cn, output language (fixed, not switchable in the UI)
 UW_API_TOKEN=...           # Unusual Whales (options flow), optional
 MCP_PORT=8766
 MCP_TOKEN=...              # auto-generated on first run
 ```
 
-**Core database tables** (self-hosted Postgres; schema owned by `tt-data-hub`):
+**Core database tables** (self-hosted Postgres; market-data schema owned by `tt-data-hub`):
 
 | Table | Notes |
 |---|---|
@@ -121,8 +218,13 @@ MCP_TOKEN=...              # auto-generated on first run
 | `stock_fundamentals` | Valuation, growth, margins, analyst ratings, earnings dates, insider MSPR, short interest. **Many rows per ticker** (see rule 4 above). Currently **US only** — CN tickers legitimately come back with empty fundamentals |
 | `news` | Articles with AI `sentiment_label` + `sentiment_score`. **No `ticker` column** — tickers live in `related_tickers` (`text[]`, GIN-indexed, so match with `&&`). **No `headline` column** — the title is in `title` |
 | `uw_gex_daily` | Options gamma walls (call/put wall, gamma flip/magnet). Covers only ~40 large caps |
-| `user_watchlist` | User's tracked tickers. Time column is **`created_at`** (not `added_at`); `user_id` is a NOT NULL uuid; unique on `(ticker)` |
-| `user_positions` | `ticker`, `market`, `avg_cost`, `shares`, `currency`, `updated_at`. PK is `ticker` alone |
+| `user_watchlist` | User's tracked tickers. Time column is **`created_at`** (not `added_at`); `user_id` is a NOT NULL uuid; unique on `(ticker)`. **Written by this repo** |
+| `user_positions` | `ticker`, `market`, `avg_cost`, `shares`, `currency`, `updated_at`. PK is `ticker` alone. **Written by this repo** |
+| `analysis_history` | `id`, `created_at`, `skill`, `tickers` (comma-joined), `ticker_count`, `context_json`, `analysis_text`, `model`. Owned and **written by this repo** — see `sql/001_analysis_history.sql` |
+
+Three tables that the old DuckDB had and Postgres deliberately does **not**:
+`ai_models`, `skill_prompts`, `app_settings`. They are now `config/models.json`,
+`config/skill_prompts.json`, and (for language) a plain env var. Do not re-create them.
 
 ---
 

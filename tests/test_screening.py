@@ -199,15 +199,31 @@ class TestSector:
         result = screen(sector="Technology", min_rsi=20)
         assert "sector_source" in result
 
-    @pytest.mark.xfail(
-        reason="stocks_meta.sector 目前 15661 行全是空的，"
-               "要等 tt-data-hub 的 meta_refresh 任务跑过才有值。"
-               "变成 XPASS 就说明上游补完了，届时摘掉这个标记，"
-               "并可以把 ticker_over20b 那段临时兜底删掉。",
-        strict=False)
     def test_stocks_meta_sector_is_populated(self):
+        """2026-08-29 上游 meta_refresh 已跑完，这条从 xfail 转正。
+
+        补的过程有波折：第一轮撞上 UW 那个转售端点整体故障（全域 530 约 20 分钟），
+        2133 只里 530 只没采到，只补到 1555；把并发从 6 降到 3 重跑之后失败数
+        降到 7，最终 2020 只。
+        """
         row = pg.query_one("select count(sector) as c from stocks_meta")
         assert row["c"] >= 2000
+
+    def test_fallback_still_earns_its_keep(self):
+        """ticker_over20b 那段临时兜底【暂时不删】。
+
+        stocks_meta 补到 2020 只之后，选股池里仍有约 100 只票没有行业分类
+        （2018/2121 = 95%），兜底表还能补上其中大部分。等覆盖率接近 100%
+        再删。这条测下来要是发现兜底一只都补不到了，就说明可以删了。
+        """
+        gap = pg.query_one("""
+            select count(*) as n from ticker_over20b t
+            join stocks_meta m on m.ticker = t.ticker
+            where m.delisted_at is null and m.sector is null""")["n"]
+        assert gap >= 0  # 只是把这个数字暴露出来，不设门槛
+        if gap == 0:
+            import warnings
+            warnings.warn("选股池行业分类已 100% 覆盖，可以删掉 ticker_over20b 兜底了")
 
 
 # --------------------------------------------------------------------------

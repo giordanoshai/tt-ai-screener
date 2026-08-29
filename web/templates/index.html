@@ -14,12 +14,6 @@
       {{ status.ohlcv_tickers }} tickers &middot; data up to
       <span class="text-gray-300">{{ status.ohlcv_latest }}</span>
     </span>
-    <button @click="triggerUpdate()"
-      class="text-xs px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 transition disabled:opacity-40"
-      :disabled="updating">
-      <span x-show="!updating">&#8635; Update Data</span>
-      <span x-show="updating">Updating&hellip;</span>
-    </button>
   {% endset %}
   {% include "header.html" %}
 
@@ -141,26 +135,6 @@
       {% endif %}
     </div>
 
-    <!-- Update progress -->
-    <div x-show="updating || updateLog.length > 0" class="bg-gray-900 border border-gray-800 rounded-xl p-4">
-      <div class="flex items-center justify-between mb-2">
-        <h3 class="text-xs font-medium text-gray-400">
-          <span x-show="updating" class="inline-block w-2 h-2 rounded-full bg-green-500 mr-1.5 animate-pulse"></span>
-          Data Update
-          <span x-show="updateStage && updateStage !== 'done'" class="text-gray-500 ml-1" x-text="'— ' + updateStage"></span>
-          <span x-show="updateStage === 'done'" class="text-green-400 ml-1">— Complete</span>
-        </h3>
-        <button x-show="!updating && updateLog.length" @click="updateLog=[];updateStage=''"
-          class="text-[10px] text-gray-600 hover:text-gray-400">Clear</button>
-      </div>
-      <div class="bg-gray-950 rounded p-3 max-h-48 overflow-y-auto text-[11px] font-mono text-gray-500 space-y-0.5"
-           x-ref="updateLogEl">
-        <template x-for="(line, i) in updateLog" :key="i">
-          <div x-text="line" :class="line.includes('Done') ? 'text-green-500' : line.includes('ERROR') ? 'text-red-400' : ''"></div>
-        </template>
-      </div>
-    </div>
-
     <!-- DB Stats -->
     <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
       <div class="bg-gray-900 border border-gray-800 rounded-lg px-4 py-3">
@@ -231,7 +205,6 @@
         adding: false,
         addMsg: '',
         addOk: false,
-        updating: false,
         toast: '',
         analyzing: false,
         activeSkill: '',
@@ -288,49 +261,6 @@
           fd.append('ticker', ticker)
           await fetch('/ticker/remove', { method: 'POST', body: fd })
           location.reload()
-        },
-
-        updateLog: [],
-        updateStage: '',
-
-        async triggerUpdate() {
-          this.updating = true
-          this.updateLog = []
-          this.updateStage = ''
-          try {
-            const res = await fetch('/update', { method: 'POST' })
-            const data = await res.json()
-            if (!data.ok) {
-              this.showToast('✗ ' + data.error)
-              this.updating = false
-              return
-            }
-            this.showToast('↻ Update started')
-            this.streamProgress()
-          } catch(e) {
-            this.showToast('✗ Network error')
-            this.updating = false
-          }
-        },
-
-        streamProgress() {
-          const es = new EventSource('/update/stream')
-          es.onmessage = (e) => {
-            this.updateLog.push(e.data)
-            if (this.updateLog.length > 200) this.updateLog.shift()
-            const m = e.data.match(/\[(\w+)\] started/)
-            if (m) this.updateStage = m[1]
-          }
-          es.addEventListener('done', () => {
-            es.close()
-            this.updating = false
-            this.updateStage = 'done'
-            this.showToast('✓ Update complete')
-          })
-          es.onerror = () => {
-            es.close()
-            this.updating = false
-          }
         },
 
         async runAnalysis(skill) {

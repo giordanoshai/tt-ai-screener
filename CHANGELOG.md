@@ -2,6 +2,57 @@
 
 All notable changes to this project will be documented in this file.
 
+### [2026-08-29] 四张漏迁的表各归其位，从旧 DuckDB 抢回 6 笔真实持仓
+
+改造成只读 Postgres 消费端时，有四张表被漏掉了——它们在线上库里**根本不存在**，
+所以对应功能一直是坏的，而界面上看起来只是「没配置」。
+
+* **修复 (Fixed)**: **从 `trading.duckdb` 里抢回 6 笔真实持仓**（GOOGL / AMZN /
+  MP / RKLB / NVO / ORCL），而线上 `user_positions` 当时是**空的**。差一点就
+  跟着旧库一起删掉了。迁进 Supabase 之后接上现价验证过整条链路：成本
+  11935.6 → 现值 10961.3（−8.16%）。新表比旧的多两列 `market` 和 `currency`，
+  所以汇总是**分币种**的，美股美元和 A股人民币不会被加到一起。
+* **新增 (Added)**: `sql/001_analysis_history.sql` —— 建 `analysis_history` 表。
+  这是本项目自己的数据（不是行情），迁库时漏了，所以「分析历史」页面一直是空的。
+  `write_user` 有建新表的权限（改已有表不行——那些表属主是 postgres），
+  所以这个文件不需要管理员执行。旧库里 3 条历史记录已迁入。
+* **修改 (Changed)**: AI 模型配置从 `ai_models` 表搬到 `config/models.json`。
+  旧库里 9 个模型配置已导出。**密钥不在 JSON 里**——每个模型只带一个
+  `api_key_env` 字段指向环境变量名，实际值在 `.env`。改模型直接改文件，
+  网页上的模型页改成只读。
+* **修改 (Changed)**: 自定义技能提示词从 `skill_prompts` 表搬到
+  `config/skill_prompts.json`。文件不存在就直接用 `skills/*.md`，第一次在
+  设置页保存时才生成。「重置」= 删掉 JSON 里那一条。
+* **移除 (Removed)**: 语言切换整个删掉（原来存 `app_settings` 表）。
+  现在只看环境变量 `LANG_UI`。
+* **移除 (Removed)**: `/update`、`/update/status`、`/update/stream` 三个端点，
+  连同 `home.html` 的 UPDATE 按钮、`index.html` 的更新按钮、以及浮动的管道
+  日志面板。采集搬到 `tt-data-hub` 之后这些都是假按钮，点了只会报错。
+* **修复 (Fixed)**: 分析历史现在在 `/analyze/stream` 里也存。原计划只在
+  `/analyze` 存，但网页上三个页面点「分析」走的**全是**流式那条，只存
+  `/analyze` 等于历史页永远是空的。存历史失败只记日志，不影响分析本身
+  ——结果已经返回给用户了。
+* **修改 (Changed)**: 摘掉最后一个 `xfail` 标记。`stocks_meta.sector` 补到
+  2020 只（选股池覆盖 2018/2121 = 95%），越过了那条测试等的门槛。补的
+  过程有波折：第一轮撞上 UW 转售端点整体故障（全域 530 约 20 分钟），
+  2133 只里 530 只没采到只补到 1555；并发从 6 降到 3 重跑后失败数降到 7。
+  `ticker_over20b` 那段临时兜底**暂时保留**（还有约 100 只票靠它），
+  另加了一条探针测试，等覆盖率到 100% 会提醒可以删。
+* **修改 (Changed)**: `.env.example` 补上 `DASHSCOPE_API_KEY` /
+  `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `LANG_UI` 四个键并说明用途。
+* **修改 (Changed)**: `CLAUDE.md` 新增完整的数据来源结构表——什么数据、
+  存在哪、谁写。本仓库只写三张表（`user_watchlist` / `user_positions` /
+  `analysis_history`），行情类一律只读。
+
+**当前状态**：9 个模型里 4 个 Claude 和 1 个 GPT **拿不到密钥**（`.env` 里没有
+`ANTHROPIC_API_KEY` 和 `OPENAI_API_KEY`），设置页会给它们标红「No key」——
+这是诚实显示不是故障。默认的两个（分析走 Qwen3.7 Max、情绪走 DeepSeek V4
+Flash）密钥齐全，能用。
+
+**`trading.duckdb`（277 MB）暂时保留**，等确认新的模型配置和分析历史页面
+都正常再删。`migrate_from_duckdb.py` 是配套的一次性脚本，同样等删。
+
+
 ### [2026-08-29] 删掉 DuckDB 与全部采集代码（计划 2 的任务 6）
 
 采集职责移交 `tt-data-hub` 之后，这个项目里的采集代码整个删掉，四个

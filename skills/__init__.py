@@ -30,12 +30,16 @@ except 吞成 `{"error": ...}`——从工具返回值上看不出是这一层�
    查出来基本面字段全是空的，这是正常的，不是 bug。
 """
 import json
+import os
 from datetime import date
 from pathlib import Path
 
 from db import pg
 
 SKILLS_DIR = Path(__file__).parent
+
+#: 自定义提示词存这里。测试会把这个名字指到临时文件上。
+PROMPTS_JSON = SKILLS_DIR.parent / "config" / "skill_prompts.json"
 
 SKILL_NAMES = ["longterm_screen", "swing_screen", "position_review"]
 SUPPORTED_LANGS = ["en", "cn"]
@@ -44,22 +48,6 @@ DEFAULT_LANG = "en"
 # A股代码后缀：上交所 / 深交所 / 北交所。跟 tools/hourly.py 用的是同一套规则。
 _CN_SUFFIXES = (".SH", ".SZ", ".BJ")
 DEFAULT_MARKET = "US"
-
-# app_settings / skill_prompts 这两张表是本地 DuckDB 时代的东西，
-# 自建 Postgres 里没有（表结构由 tt-data-hub 管）。查不到就退回文件和环境变量，
-# 但没必要每次调用都去撞一次连接——第一次发现表不存在就记下来，之后直接跳过。
-_MISSING_TABLES: set[str] = set()
-
-
-def _optional_query_one(table: str, sql: str, params=None):
-    """查一张「可能不存在」的表。表没有或查询出错都返回 None，不抛异常。"""
-    if table in _MISSING_TABLES:
-        return None
-    try:
-        return pg.query_one(sql, params)
-    except Exception:
-        _MISSING_TABLES.add(table)
-        return None
 
 
 def _market_of(ticker: str) -> str:
@@ -76,36 +64,95 @@ def _group_by_market(tickers: list[str]) -> dict[str, list[str]]:
 
 
 def get_lang() -> str:
-    """读语言偏好：数据库设置 > .env > 默认英文。"""
-    row = _optional_query_one(
-        "app_settings", "select value from app_settings where key = 'lang'")
-    if row and row.get("value") in SUPPORTED_LANGS:
-        return row["value"]
+    """输出语言。环境变量 LANG_UI（en / cn）说了算，没配就是英文。
 
-    import os
-    env_lang = os.getenv("LANG_UI", "").lower()
-    if env_lang in SUPPORTED_LANGS:
-        return env_lang
-    return DEFAULT_LANG
+    原来这里先查 app_settings 表拿「用户在设置页选的语言」。那张表是本地
+    DuckDB 时代的东西，自建 Postgres 里没有，所以每次调用都白撞一次连接。
+    2026-08-29 用户决定语言切换这个功能整个不要了，只剩这一条路。
+    """
+    env_lang = os.getenv("LANG_UI", "").strip().lower()
+    return env_lang if env_lang in SUPPORTED_LANGS else DEFAULT_LANG
+
+
+# ---------------------------------------------------------------- 自定义提示词
+#
+# 原来存在 skill_prompts 表里，跟 app_settings 一样迁库时漏掉了，线上没有，
+# 所以设置页上「保存提示词」一直是存不进去的。现在存本地 JSON，结构是
+# {"技能名": {"语言": "提示词"}}。文件不存在、坏了、或者那一条是空白，
+# 都退回 skills/<lang>/<skill>.md，不报错。
+
+
+def _check(skill_name: str, lang: str) -> None:
+    if skill_name not in SKILL_NAMES:
+        raise ValueError(f"Unknown skill: {skill_name}")
+    if lang not in SUPPORTED_LANGS:
+        raise ValueError(f"Unknown lang: {lang}")
+
+
+def load_custom_prompts() -> dict:
+    """读全部自定义提示词。文件没有或读不动都返回空字典。"""
+    try:
+        data = json.loads(PROMPTS_JSON.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def get_custom_prompt(skill_name: str, lang: str) -> str | None:
+    """某个技能某种语言的自定义提示词。没有、或者存的是空白，返回 None。"""
+    entry = load_custom_prompts().get(skill_name)
+    if not isinstance(entry, dict):
+        return None
+    text = entry.get(lang)
+    return text if isinstance(text, str) and text.strip() else None
+
+
+def save_custom_prompt(skill_name: str, lang: str, prompt: str) -> None:
+    """存一条自定义提示词，其余条目原样保留。"""
+    _check(skill_name, lang)
+    data = load_custom_prompts()
+    data.setdefault(skill_name, {})
+    if not isinstance(data[skill_name], dict):
+        data[skill_name] = {}
+    data[skill_name][lang] = prompt
+    _write_custom_prompts(data)
+
+
+def delete_custom_prompt(skill_name: str, lang: str) -> bool:
+    """删掉一条自定义提示词，回到 md 文件。本来就没有返回 False。"""
+    _check(skill_name, lang)
+    data = load_custom_prompts()
+    entry = data.get(skill_name)
+    if not isinstance(entry, dict) or lang not in entry:
+        return False
+    entry.pop(lang)
+    if not entry:
+        data.pop(skill_name)
+    _write_custom_prompts(data)
+    return True
+
+
+def _write_custom_prompts(data: dict) -> None:
+    PROMPTS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    PROMPTS_JSON.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_skill_prompt(skill_name: str, lang: str = None) -> str:
+    """实际用的提示词：有自定义就用自定义，否则用 skills/ 下的 md 文件。"""
     if skill_name not in SKILL_NAMES:
         raise ValueError(f"Unknown skill: {skill_name}")
     lang = lang or get_lang()
 
-    row = _optional_query_one(
-        "skill_prompts",
-        "select prompt from skill_prompts where skill = %s and lang = %s",
-        (skill_name, lang))
-    if row and (row.get("prompt") or "").strip():
-        return row["prompt"]
+    custom = get_custom_prompt(skill_name, lang)
+    if custom:
+        return custom
 
     return load_default_skill_prompt(skill_name, lang)
 
 
 def load_default_skill_prompt(skill_name: str, lang: str = None) -> str:
-    """只从文件读，忽略数据库里的自定义覆盖。"""
+    """只从 md 文件读，忽略自定义覆盖。"""
     if skill_name not in SKILL_NAMES:
         raise ValueError(f"Unknown skill: {skill_name}")
     lang = lang or get_lang()

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""网页层。数据全部来自自建 Postgres，而且**只读**。
+"""网页层。行情数据全部来自自建 Postgres，而且**只读**。
 
 ## 这一版改了什么
 
@@ -29,17 +29,34 @@
 ## 采集功能整个搬走了
 
 往库里写行情、基本面、新闻的活现在全在 **tt-data-hub**（另一个仓库，跑在服务器
-上）。所以「立刻更新」「更新进度」这些端点在这里已经没有意义，统一返回 410 并
-说清楚去哪儿看。表结构也由那边的建表脚本管，网页服务不建表。
+上）。表结构也由那边的建表脚本管，网页服务不建表。
 
-**「定时更新时间」那组接口（``/settings/schedule``）连同设置页上的开关一起删掉了**，
-不是改成 410。理由：它原来靠 ``main.py`` 里的定时线程干活，那套东西已经随采集一起
-删了，接口留着也只是个点一下就报错的按钮。定时任务现在归 tt-data-hub 的 crontab。
+「立刻更新 / 更新进度 / 更新日志」那三个端点（``/update``、``/update/status``、
+``/update/stream``）连同首页和自选页上的更新按钮**一起删掉了**，不是改成 410：
+它们原来靠 ``main.py`` 里的定时线程和采集代码干活，那套东西已经随采集搬走，
+留着只是三个点一下就报错的假按钮。定时任务现在归 tt-data-hub 的 crontab。
+「定时更新时间」那组接口（``/settings/schedule``）早先也是这么删的。
 
-## 写库只有两处
+## 写库只有三处
 
-自选和持仓的增删改。其余一律走只读账号（``db.pg`` 里的读连接还额外设成只读
-事务，是防误写的第二道闸）。
+自选、持仓的增删改，以及**分析历史**（``analysis_history``，见下）。其余一律走
+只读账号（``db.pg`` 里的读连接还额外设成只读事务，是防误写的第二道闸）。
+
+## 三块配置不在数据库里
+
+``ai_models`` / ``skill_prompts`` / ``app_settings`` 这三张表是本地 DuckDB 时代
+的东西，迁到自建 Postgres 时漏掉了，线上根本没有 —— 所以对应的三块功能一直是
+坏的，界面上却只显示成「没配置」。2026-08-29 的处理：
+
+* **AI 模型** → 挪到 ``config/models.json``（密钥在 ``.env``，JSON 里只写环境
+  变量名）。网页上**只读**，改模型直接改文件，原来那套增删改接口删掉。
+* **自定义技能提示词** → 挪到 ``config/skill_prompts.json``。网页上照旧能看、
+  能改、能重置（重置 = 删掉 JSON 里那一条，回退到 ``skills/<lang>/*.md``）。
+* **语言切换** → 整个功能不要了。语言固定看环境变量 ``LANG_UI``。
+
+而 ``analysis_history`` 相反：用户确认这个功能要保留，表已经在线上建好
+（``sql/001_analysis_history.sql``），所以分析结果重新落库、历史页恢复可用。
+存历史失败**绝不能让分析本身失败** —— 结果已经算出来给用户了。
 
 ## 三个跟 DuckDB 时代不一样的地方
 
@@ -50,6 +67,7 @@
    查询 6750 ms，两段式 109 ms。这一段直接用 ``tools.screening.latest_trading_day``。
 """
 import json
+import logging
 import re
 import sys
 from datetime import datetime
@@ -75,6 +93,7 @@ from tools.screening import latest_trading_day
 
 app = FastAPI(title="TT AI Screener")
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
+log = logging.getLogger(__name__)
 
 # 这个项目认的两个市场。日线表里就这两种 market 值。
 MARKETS = ("US", "CN")
@@ -110,14 +129,6 @@ def _tool_list(raw: str) -> tuple[list, str | None]:
     if isinstance(data, dict):
         return [], data.get("error") or "工具返回了意料之外的结构"
     return data, None
-
-
-def _moved_to_hub(feature: str, where: str) -> JSONResponse:
-    """采集相关的端点统一这么回：说清楚搬到哪儿了、现在去哪看。"""
-    return JSONResponse({
-        "ok": False,
-        "error": f"{feature}已经不在这个项目里了，采集全部由 {DATA_HUB} 负责。{where}",
-    }, status_code=410)
 
 
 def _as_datetime(value):
@@ -254,7 +265,7 @@ def _get_last_update() -> dict | None:
 
 
 def _get_ai_models() -> list[dict]:
-    """AI 模型清单。ai_models 这张表线上没有，取不到就当没配，不要连累首页。"""
+    """AI 模型清单，来自 config/models.json。读不到就当没配，不要连累首页。"""
     try:
         from ai_client import list_models
         return list_models() or []
@@ -527,24 +538,11 @@ async def remove_ticker(ticker: str = Form(...)):
     return JSONResponse(result)
 
 
-# ── 采集：已经整个搬到 tt-data-hub ───────────────────────────────────────────
-
-@app.post("/update")
-async def trigger_update():
-    return _moved_to_hub("手动触发更新", "采集任务由服务器上的 tt-data-hub 定时跑。")
-
-
-@app.get("/update/status")
-async def update_status():
-    return _moved_to_hub("更新进度",
-                         "最近一次采集的结果看首页，或者 /api/update/last。")
-
-
-@app.get("/update/stream")
-async def update_stream():
-    return _moved_to_hub("更新日志推送",
-                         "采集日志在 tt-data-hub 那边，这里推不了。")
-
+# ── 只读状态 ─────────────────────────────────────────────────────────────────
+#
+# 「立刻更新 / 更新进度 / 更新日志」三个端点删掉了：采集整个搬到了 tt-data-hub，
+# 这边既没有采集代码也没有写行情的权限，留着只是三个点一下就报错的假按钮。
+# 想看最近一次采集跑成什么样，看下面的 /api/update/last（读 hub 的运行日志）。
 
 @app.get("/status")
 async def get_status():
@@ -816,7 +814,7 @@ async def analyze(req: AnalyzeRequest):
                             status_code=503)
 
     try:
-        messages, _ = _build_analysis_messages(req)
+        messages, info = _build_analysis_messages(req)
     except ValueError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     except Exception as exc:
@@ -827,13 +825,15 @@ async def analyze(req: AnalyzeRequest):
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
-    # 原来这里会把每次分析写进 analysis_history。线上没有这张表，而且写库这件事
-    # 现在只允许发生在自选和持仓上，所以直接不存了（见 /analyze/history）。
+    _save_analysis_history(req.skill, info, result, model_cfg["display_name"])
     return JSONResponse({"ok": True, "skill": req.skill, "analysis": result})
 
 
 def _build_analysis_messages(req: AnalyzeRequest) -> tuple[list[dict], dict]:
-    """把技能提示词和行情上下文拼成一次对话。技能名不认就抛 ValueError。"""
+    """把技能提示词和行情上下文拼成一次对话。技能名不认就抛 ValueError。
+
+    第二个返回值是给「存历史」用的：这次分析针对哪些票、喂进去的上下文是什么。
+    """
     from skills import SKILL_NAMES, gather_context, get_lang, load_skill_prompt
 
     if req.skill not in SKILL_NAMES:
@@ -864,7 +864,9 @@ def _build_analysis_messages(req: AnalyzeRequest) -> tuple[list[dict], dict]:
          "content": f"Based on the following market data, perform the "
                     f"analysis:\n\n{context}"},
     ]
-    return messages, params
+    tickers = params.get("tickers") or [
+        p["ticker"] for p in params.get("positions", []) if p.get("ticker")]
+    return messages, {"tickers": tickers, "context": context}
 
 
 @app.post("/analyze/stream")
@@ -887,7 +889,7 @@ async def analyze_stream(req: AnalyzeRequest):
         return sse_error("还没有配置 AI 模型，去设置页加一个。")
 
     try:
-        messages, _ = _build_analysis_messages(req)
+        messages, info = _build_analysis_messages(req)
     except Exception as exc:
         return sse_error(str(exc))
 
@@ -896,38 +898,105 @@ async def analyze_stream(req: AnalyzeRequest):
             "model": model_cfg["display_name"],
             "supports_thinking": model_cfg.get("supports_thinking", False),
         }}, ensure_ascii=False) + "\n\n")
+        # 网页上点「分析」走的就是这条流式接口，所以历史必须在这里也存一份，
+        # 否则历史页永远是空的。正文边推边攒，推完了再落库。
+        parts: list[str] = []
         try:
             for item in chat_stream(model_cfg, messages):
+                if item.get("type") == "content":
+                    parts.append(item.get("chunk") or "")
                 yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
                 await asyncio.sleep(0)
         except Exception as exc:
             yield ("data: " + json.dumps({"type": "error", "chunk": str(exc)},
                                          ensure_ascii=False) + "\n\n")
+        _save_analysis_history(req.skill, info, "".join(parts),
+                               model_cfg["display_name"])
         yield "event: done\ndata: ok\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+# ── 分析历史 ──────────────────────────────────────────────────────────────────
+#
+# analysis_history 是本项目**唯一一张自己写的非用户数据表**（此前只写自选和
+# 持仓）。它原来在本地 DuckDB 里，迁库时漏掉了，所以历史页一直是空的；
+# 2026-08-29 用户确认功能保留，表按 sql/001_analysis_history.sql 建好了。
+
+_HISTORY_INSERT_SQL = """
+    insert into analysis_history
+        (skill, tickers, ticker_count, context_json, analysis_text, model)
+    values (%s, %s, %s, %s, %s, %s)
+"""
+
+# 历史页只列不读正文全文，但预览要用前几百字，所以正文一起取回来。
+# context_json 不在列表里返回：那是几十上百 KB 的行情快照，只有详情才给。
+_HISTORY_LIST_COLUMNS = """
+    id, created_at, skill, tickers, ticker_count, analysis_text, model
+"""
+
+
+def _save_analysis_history(skill: str, info: dict, analysis_text: str,
+                           model: str) -> bool:
+    """把一次分析落库。**失败只记日志，绝不往上抛。**
+
+    理由：分析结果这时候已经算出来、也已经（或即将）返回给用户了。为了存
+    历史失败而把整次分析变成一个 500，是拿一个次要功能去砸主功能。
+    """
+    if not (analysis_text or "").strip():
+        return False
+    tickers = [t for t in (info.get("tickers") or []) if t]
+    try:
+        pg.execute_write(_HISTORY_INSERT_SQL, (
+            skill,
+            ",".join(tickers) or None,
+            len(tickers) or None,
+            info.get("context"),
+            analysis_text,
+            model,
+        ))
+        return True
+    except Exception as exc:
+        log.warning("分析历史没存上（分析本身已经完成）：%s", exc)
+        return False
+
+
 @app.get("/analyze/history")
 async def analyze_history(skill: str = None, limit: int = 20):
-    """历史分析记录。
+    """历史分析记录列表，按时间倒序。库挂了也要给页面一个能渲染的空列表。"""
+    from skills import SKILL_NAMES
 
-    原来存在本地 DuckDB 的 analysis_history 表里，线上库没有这张表，而且这个项目
-    现在只允许往自选和持仓写，所以分析结果不再落库。返回空列表让页面正常显示
-    「暂无记录」，而不是抛错。
-    """
-    return JSONResponse({
-        "history": [],
-        "note": "分析记录不再落库（只读消费端只往自选和持仓写）。",
-    })
+    params: dict = {"limit": max(1, min(int(limit or 20), 200))}
+    where = ""
+    # 技能名只认白名单里的三个：不认识就当没筛，绝不把用户输入拼进 SQL
+    if skill in SKILL_NAMES:
+        where = "where skill = %(skill)s"
+        params["skill"] = skill
+
+    sql = (f"select {_HISTORY_LIST_COLUMNS} from analysis_history {where} "
+           f"order by created_at desc, id desc limit %(limit)s")
+    try:
+        rows = pg.query(sql, params)
+    except Exception as exc:
+        return JSONResponse({"history": [], "error": str(exc)})
+    # created_at 是 datetime，JSONResponse 自己序列化不了
+    return JSONResponse(json.loads(json.dumps({"history": rows}, default=str)))
 
 
 @app.get("/analyze/history/{history_id}")
 async def analyze_history_detail(history_id: int):
-    return JSONResponse({
-        "ok": False,
-        "error": "分析记录不再落库，没有可查的历史。",
-    }, status_code=404)
+    """一条历史的全文，外加当时喂给模型的行情快照。"""
+    try:
+        row = pg.query_one(
+            "select id, created_at, skill, tickers, ticker_count, "
+            "       context_json, analysis_text, model "
+            "from analysis_history where id = %s", (history_id,))
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    if not row:
+        return JSONResponse({"ok": False, "error": f"没有这条历史：{history_id}"},
+                            status_code=404)
+    return JSONResponse(json.loads(json.dumps(row, default=str)))
 
 
 @app.get("/analyze/status")
@@ -951,99 +1020,93 @@ async def analyze_status():
     return JSONResponse(payload)
 
 
-# ── 设置：这几项的存储表线上都没有 ────────────────────────────────────────────
+# ── 设置：自定义技能提示词，存 config/skill_prompts.json ──────────────────────
+#
+# 语言切换（原 /settings/lang，存 app_settings 表）整个删掉了：那张表线上没有，
+# 而且用户 2026-08-29 决定不要这个功能。语言现在固定看环境变量 LANG_UI。
 
-@app.get("/settings/lang")
-async def get_language():
-    try:
-        from skills import SUPPORTED_LANGS, get_lang
-        return JSONResponse({"lang": get_lang(), "supported": SUPPORTED_LANGS})
-    except Exception as exc:
-        return JSONResponse({"lang": "en", "supported": ["en", "cn"],
-                            "error": str(exc)})
-
-
-@app.post("/settings/lang")
-async def set_language(request: Request):
-    return JSONResponse({
-        "ok": False,
-        "error": "语言偏好原来存在本地库的 app_settings 表里，线上没有这张表。"
-                 "现在改用环境变量 LANG_UI（en / cn）。",
-    }, status_code=410)
+class PromptRequest(BaseModel):
+    skill: str
+    prompt: Optional[str] = ""
 
 
 @app.get("/settings/prompts")
 async def get_prompts():
-    """技能提示词。自定义覆盖原来存在 skill_prompts 表里，线上没有这张表，
-    所以只返回内置的默认提示词。"""
+    """三个技能各自的默认提示词、自定义覆盖，以及实际生效的那份。"""
     try:
-        from skills import SKILL_NAMES, get_lang, load_default_skill_prompt
+        from skills import (SKILL_NAMES, get_custom_prompt, get_lang,
+                            load_default_skill_prompt)
         lang = get_lang()
         result = {}
         for skill in SKILL_NAMES:
             default = load_default_skill_prompt(skill, lang)
-            result[skill] = {"default": default, "custom": "",
-                             "active": default, "is_custom": False}
+            custom = get_custom_prompt(skill, lang) or ""
+            result[skill] = {
+                "default": default,
+                "custom": custom,
+                "active": custom or default,
+                "is_custom": bool(custom),
+            }
         return JSONResponse({"prompts": result, "lang": lang,
-                             "note": "自定义提示词暂不可用，改提示词请直接改 "
-                                     "skills/ 下的 md 文件。"})
+                             "note": "自定义提示词存在 config/skill_prompts.json，"
+                                     "没有自定义就用 skills/ 下的 md 文件。"})
     except Exception as exc:
         return JSONResponse({"prompts": {}, "lang": "en", "error": str(exc)})
 
 
 @app.post("/settings/prompts")
-async def save_prompt(request: Request):
-    return JSONResponse({
-        "ok": False,
-        "error": "自定义提示词原来存在本地库的 skill_prompts 表里，线上没有这张表。"
-                 "改提示词请直接改 skills/ 下对应的 md 文件。",
-    }, status_code=410)
+async def save_prompt(req: PromptRequest):
+    """存一条自定义提示词。存空白等于重置回默认。"""
+    from skills import delete_custom_prompt, get_lang, save_custom_prompt
+
+    lang = get_lang()
+    text = req.prompt or ""
+    try:
+        if text.strip():
+            save_custom_prompt(req.skill, lang, text)
+        else:
+            delete_custom_prompt(req.skill, lang)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except OSError as exc:
+        return JSONResponse({"ok": False, "error": f"写配置文件失败：{exc}"},
+                            status_code=500)
+    return JSONResponse({"ok": True, "skill": req.skill, "lang": lang,
+                         "is_custom": bool(text.strip())})
 
 
 @app.post("/settings/prompts/reset")
-async def reset_prompt(request: Request):
-    return JSONResponse({
-        "ok": False,
-        "error": "没有自定义提示词可重置，当前用的就是 skills/ 下的默认文件。",
-    }, status_code=410)
+async def reset_prompt(req: PromptRequest):
+    """删掉自定义那一条，回到 skills/<lang>/<skill>.md。"""
+    from skills import delete_custom_prompt, get_lang
+
+    lang = get_lang()
+    try:
+        removed = delete_custom_prompt(req.skill, lang)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except OSError as exc:
+        return JSONResponse({"ok": False, "error": f"写配置文件失败：{exc}"},
+                            status_code=500)
+    return JSONResponse({"ok": True, "skill": req.skill, "lang": lang,
+                         "removed": removed})
 
 
-# ── AI 模型配置：ai_models 表线上没有 ─────────────────────────────────────────
-
-class ModelConfig(BaseModel):
-    id: str
-    display_name: str
-    api_base: str
-    api_key: Optional[str] = ""
-    model_id: str
-    api_format: str = "openai"  # openai | anthropic
-    role: str = "both"  # sentiment | analysis | both
-    supports_thinking: bool = False
-    is_default_sentiment: bool = False
-    is_default_analysis: bool = False
-
+# ── AI 模型配置：只读，配置在 config/models.json ──────────────────────────────
+#
+# 原来这里有一整套增删改（POST /models、DELETE /models/{id}），存 ai_models 表。
+# 那张表线上没有，所以表单填完就消失。现在配置挪到了 config/models.json，
+# 网页只负责展示 —— 加模型、改默认、删模型都是直接改那个文件。
+# 密钥不在 JSON 里，每个模型只写一个环境变量名，值在 .env。
 
 @app.get("/models")
 async def get_models():
-    return JSONResponse({"models": _get_ai_models(),
-                         "note": "模型配置表线上没有，模型现在从环境变量读。"})
-
-
-@app.post("/models")
-async def add_model(cfg: ModelConfig):
     return JSONResponse({
-        "ok": False,
-        "error": "模型配置原来存在本地库的 ai_models 表里，线上没有这张表。"
-                 "现在用环境变量 AI_API_BASE / AI_API_KEY / AI_MODEL 配。",
-    }, status_code=410)
-
-
-@app.delete("/models/{model_id}")
-async def delete_model(model_id: str):
-    return JSONResponse({
-        "ok": False,
-        "error": "模型配置表线上没有，没有可删的记录。",
-    }, status_code=410)
+        "models": _get_ai_models(),
+        "editable": False,
+        "note": "模型配置在 config/models.json 里改（密钥在 .env，"
+                "JSON 里只写环境变量名）。",
+    })
 
 
 if __name__ == "__main__":

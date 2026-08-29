@@ -21,6 +21,15 @@ WATCHLIST_USER_ID = os.getenv(
 
 UW_API_TOKEN = os.getenv("UW_API_TOKEN", "")
 
+# AI 模型的正式配置在 config/models.json（原来是 DuckDB 的 ai_models 表，
+# 迁库时漏了，线上没有）。**密钥不在那个 JSON 里**：每个模型只写一个
+# api_key_env 字段指明环境变量名（ANTHROPIC_API_KEY / DASHSCOPE_API_KEY /
+# OPENAI_API_KEY / AI_API_KEY 之类），值放 .env，由 ai_client 直接 os.getenv 取。
+# 所以这里不需要、也不该把那些密钥列成常量。
+#
+# 下面这两组只是**兜底**：config/models.json 不存在、读不动、或者一个模型都
+# 没有的时候，ai_client 才回到它们身上。
+
 # AI: news sentiment analysis (small/cheap model)
 SENTIMENT_API_BASE = os.getenv("SENTIMENT_API_BASE", "")
 SENTIMENT_API_KEY = os.getenv("SENTIMENT_API_KEY", "")
@@ -30,6 +39,11 @@ SENTIMENT_MODEL = os.getenv("SENTIMENT_MODEL", "")
 AI_API_BASE = os.getenv("AI_API_BASE", "")
 AI_API_KEY = os.getenv("AI_API_KEY", "")
 AI_MODEL = os.getenv("AI_MODEL", "")
+
+# 输出语言。原来还能在设置页上切换（存 app_settings 表），那张表线上没有，
+# 2026-08-29 这个功能整个删掉了 —— 只剩这一个环境变量，en / cn，默认 en。
+# skills.get_lang() 自己读它，这里列出来只是为了让 .env 里的键名有个出处。
+LANG_UI = os.getenv("LANG_UI", "en")
 
 # MCP remote server
 MCP_PORT = int(os.getenv("MCP_PORT", "8766"))

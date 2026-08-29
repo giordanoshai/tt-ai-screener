@@ -108,6 +108,136 @@ class TestPrompts:
             skills.load_skill_prompt("no_such_skill")
 
 
+class TestLanguageIsFixed:
+    """语言切换整个删掉了：不再有「存在库里的偏好」这回事。
+
+    原来 get_lang() 先去查 app_settings 表。那张表是本地 DuckDB 时代的东西，
+    自建 Postgres 里根本没有，所以每次调用都白撞一次连接再退回默认值。
+    2026-08-29 用户决定这个功能不要了 —— 语言只从环境变量 LANG_UI 来，
+    没配就是英文。
+    """
+
+    def test_no_app_settings_query_left(self):
+        code = TestPortedOffDuckDB._code()
+        assert "app_settings" not in code
+
+    def test_env_var_decides(self, monkeypatch):
+        monkeypatch.setenv("LANG_UI", "cn")
+        assert skills.get_lang() == "cn"
+        monkeypatch.setenv("LANG_UI", "en")
+        assert skills.get_lang() == "en"
+
+    def test_unset_or_garbage_falls_back_to_default(self, monkeypatch):
+        monkeypatch.delenv("LANG_UI", raising=False)
+        assert skills.get_lang() == skills.DEFAULT_LANG
+        monkeypatch.setenv("LANG_UI", "klingon")
+        assert skills.get_lang() == skills.DEFAULT_LANG
+
+    def test_get_lang_never_hits_the_database(self, monkeypatch):
+        """连不上库也得能拿到语言——它跟数据库已经没关系了。"""
+        def boom(*_a, **_kw):
+            raise AssertionError("get_lang() 不该碰数据库")
+        monkeypatch.setattr(skills.pg, "query_one", boom)
+        monkeypatch.setattr(skills.pg, "query", boom)
+        assert skills.get_lang() in skills.SUPPORTED_LANGS
+
+
+class TestCustomPromptsLiveInJson:
+    """自定义提示词从 skill_prompts 表搬到 config/skill_prompts.json。
+
+    那张表跟 app_settings 一样，迁库时漏掉了、线上没有，所以网页上「保存
+    提示词」一直是存不进去的。现在存本地 JSON：有条目就用，没有就退回
+    skills/<lang>/<skill>.md。
+    """
+
+    @pytest.fixture
+    def prompts_file(self, tmp_path, monkeypatch):
+        path = tmp_path / "skill_prompts.json"
+        monkeypatch.setattr(skills, "PROMPTS_JSON", path)
+        return path
+
+    def test_missing_file_falls_back_to_md(self, prompts_file):
+        assert not prompts_file.exists()
+        assert skills.load_skill_prompt("swing_screen", "en") == \
+            skills.load_default_skill_prompt("swing_screen", "en")
+
+    def test_broken_file_falls_back_instead_of_crashing(self, prompts_file):
+        prompts_file.write_text("{ not json at all", encoding="utf-8")
+        assert len(skills.load_skill_prompt("swing_screen", "en")) > 100
+
+    def test_custom_entry_wins_over_md(self, prompts_file):
+        prompts_file.write_text(json.dumps(
+            {"swing_screen": {"en": "CUSTOM-PROMPT-FOR-TEST"}}), encoding="utf-8")
+        assert skills.load_skill_prompt("swing_screen", "en") == \
+            "CUSTOM-PROMPT-FOR-TEST"
+
+    def test_custom_entry_is_per_language(self, prompts_file):
+        prompts_file.write_text(json.dumps(
+            {"swing_screen": {"cn": "只覆盖中文"}}), encoding="utf-8")
+        assert skills.load_skill_prompt("swing_screen", "cn") == "只覆盖中文"
+        assert skills.load_skill_prompt("swing_screen", "en") == \
+            skills.load_default_skill_prompt("swing_screen", "en")
+
+    def test_blank_custom_entry_is_ignored(self, prompts_file):
+        """存了个空白的不算自定义，还是用默认的，不要给 AI 一个空提示词。"""
+        prompts_file.write_text(json.dumps(
+            {"swing_screen": {"en": "   \n  "}}), encoding="utf-8")
+        assert len(skills.load_skill_prompt("swing_screen", "en")) > 100
+
+    def test_load_default_ignores_the_custom_entry(self, prompts_file):
+        prompts_file.write_text(json.dumps(
+            {"swing_screen": {"en": "CUSTOM"}}), encoding="utf-8")
+        assert skills.load_default_skill_prompt("swing_screen", "en") != "CUSTOM"
+
+    def test_save_then_load_round_trip(self, prompts_file):
+        skills.save_custom_prompt("longterm_screen", "en", "SAVED-BY-TEST")
+        assert skills.load_skill_prompt("longterm_screen", "en") == "SAVED-BY-TEST"
+        assert json.loads(prompts_file.read_text(encoding="utf-8")) == \
+            {"longterm_screen": {"en": "SAVED-BY-TEST"}}
+
+    def test_save_creates_the_config_directory(self, tmp_path, monkeypatch):
+        nested = tmp_path / "brand" / "new" / "skill_prompts.json"
+        monkeypatch.setattr(skills, "PROMPTS_JSON", nested)
+        skills.save_custom_prompt("swing_screen", "en", "X")
+        assert nested.exists()
+
+    def test_save_keeps_other_entries(self, prompts_file):
+        skills.save_custom_prompt("swing_screen", "en", "A")
+        skills.save_custom_prompt("position_review", "cn", "B")
+        data = json.loads(prompts_file.read_text(encoding="utf-8"))
+        assert data["swing_screen"]["en"] == "A"
+        assert data["position_review"]["cn"] == "B"
+
+    def test_delete_falls_back_to_md_again(self, prompts_file):
+        skills.save_custom_prompt("swing_screen", "en", "TEMP")
+        assert skills.delete_custom_prompt("swing_screen", "en") is True
+        assert skills.load_skill_prompt("swing_screen", "en") == \
+            skills.load_default_skill_prompt("swing_screen", "en")
+
+    def test_delete_when_nothing_stored_is_not_an_error(self, prompts_file):
+        assert skills.delete_custom_prompt("swing_screen", "en") is False
+
+    def test_unknown_skill_or_lang_rejected(self, prompts_file):
+        with pytest.raises(ValueError):
+            skills.save_custom_prompt("no_such_skill", "en", "X")
+        with pytest.raises(ValueError):
+            skills.save_custom_prompt("swing_screen", "klingon", "X")
+        with pytest.raises(ValueError):
+            skills.delete_custom_prompt("no_such_skill", "en")
+
+    def test_no_skill_prompts_table_query_left(self):
+        """文件名里出现 skill_prompts.json 没问题，查表的 SQL 不该再有。"""
+        code = TestPortedOffDuckDB._code().lower()
+        assert "from skill_prompts" not in code
+
+    def test_prompts_never_hit_the_database(self, prompts_file, monkeypatch):
+        def boom(*_a, **_kw):
+            raise AssertionError("提示词不该碰数据库")
+        monkeypatch.setattr(skills.pg, "query_one", boom)
+        monkeypatch.setattr(skills.pg, "query", boom)
+        assert len(skills.load_skill_prompt("swing_screen", "en")) > 100
+
+
 # ---------------------------------------------------------------- 按代码取数
 
 

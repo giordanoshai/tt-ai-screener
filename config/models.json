@@ -1,0 +1,122 @@
+{
+  "_说明": "AI 模型配置。原来存在本地 DuckDB 的 ai_models 表里，2026-08-29 迁到这个文件。密钥【不在这里】——每个模型用 api_key_env 指向一个环境变量名，实际的值放 .env。改模型直接改这个文件，不用重启以外的操作。",
+  "models": [
+    {
+      "id": "claude-haiku",
+      "display_name": "Claude Haiku 4.5",
+      "api_base": "https://api.anthropic.com",
+      "model_id": "claude-haiku-4-5-20251001",
+      "api_format": "anthropic",
+      "role": "sentiment",
+      "supports_thinking": false,
+      "is_default_sentiment": false,
+      "is_default_analysis": false,
+      "enabled": true,
+      "api_key_env": "ANTHROPIC_API_KEY"
+    },
+    {
+      "id": "claude-opus-47",
+      "display_name": "Claude Opus 4.7",
+      "api_base": "https://api.anthropic.com",
+      "model_id": "claude-opus-4-7-20250507",
+      "api_format": "anthropic",
+      "role": "analysis",
+      "supports_thinking": true,
+      "is_default_sentiment": false,
+      "is_default_analysis": false,
+      "enabled": true,
+      "api_key_env": "ANTHROPIC_API_KEY"
+    },
+    {
+      "id": "claude-opus-48",
+      "display_name": "Claude Opus 4.8",
+      "api_base": "https://api.anthropic.com",
+      "model_id": "claude-opus-4-8-20250610",
+      "api_format": "anthropic",
+      "role": "analysis",
+      "supports_thinking": true,
+      "is_default_sentiment": false,
+      "is_default_analysis": false,
+      "enabled": true,
+      "api_key_env": "ANTHROPIC_API_KEY"
+    },
+    {
+      "id": "claude-sonnet-46",
+      "display_name": "Claude Sonnet 4.6",
+      "api_base": "https://api.anthropic.com",
+      "model_id": "claude-sonnet-4-6-20250514",
+      "api_format": "anthropic",
+      "role": "both",
+      "supports_thinking": true,
+      "is_default_sentiment": false,
+      "is_default_analysis": false,
+      "enabled": true,
+      "api_key_env": "ANTHROPIC_API_KEY"
+    },
+    {
+      "id": "ds-v4-flash",
+      "display_name": "DeepSeek V4 Flash",
+      "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model_id": "deepseek-v4-flash",
+      "api_format": "openai",
+      "role": "sentiment",
+      "supports_thinking": false,
+      "is_default_sentiment": true,
+      "is_default_analysis": false,
+      "enabled": true,
+      "api_key_env": "DASHSCOPE_API_KEY"
+    },
+    {
+      "id": "ds-v4-pro",
+      "display_name": "DeepSeek V4 Pro",
+      "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model_id": "deepseek-v4-pro",
+      "api_format": "openai",
+      "role": "both",
+      "supports_thinking": false,
+      "is_default_sentiment": false,
+      "is_default_analysis": false,
+      "enabled": true,
+      "api_key_env": "DASHSCOPE_API_KEY"
+    },
+    {
+      "id": "gpt-55",
+      "display_name": "GPT-5.5",
+      "api_base": "https://api.openai.com/v1",
+      "model_id": "gpt-5.5",
+      "api_format": "openai",
+      "role": "both",
+      "supports_thinking": true,
+      "is_default_sentiment": false,
+      "is_default_analysis": false,
+      "enabled": true,
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    {
+      "id": "qwen-max",
+      "display_name": "Qwen3.7 Max",
+      "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model_id": "qwen3.7-max",
+      "api_format": "openai",
+      "role": "analysis",
+      "supports_thinking": true,
+      "is_default_sentiment": false,
+      "is_default_analysis": true,
+      "enabled": true,
+      "api_key_env": "DASHSCOPE_API_KEY"
+    },
+    {
+      "id": "qwen-plus",
+      "display_name": "Qwen3.7 Plus",
+      "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model_id": "qwen3.7-plus",
+      "api_format": "openai",
+      "role": "both",
+      "supports_thinking": false,
+      "is_default_sentiment": false,
+      "is_default_analysis": false,
+      "enabled": true,
+      "api_key_env": "DASHSCOPE_API_KEY"
+    }
+  ]
+}

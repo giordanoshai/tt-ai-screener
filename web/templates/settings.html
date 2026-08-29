@@ -17,26 +17,8 @@
 
   <div class="max-w-4xl mx-auto px-6 py-6 space-y-5">
 
-    <!-- ═══ Language ═══ -->
-    <div class="bg-gray-900 border border-gray-800 rounded-xl">
-      <div class="px-5 py-3 flex items-center justify-between">
-        <div>
-          <h3 class="text-sm font-medium text-gray-200">Language / 语言</h3>
-          <p class="text-[10px] text-gray-500 mt-0.5">Controls analysis output language and skill prompts</p>
-        </div>
-        <div class="flex items-center gap-2">
-          <button @click="setLang('en')"
-            class="text-xs px-3 py-1.5 rounded-md transition"
-            :class="lang === 'en' ? 'bg-indigo-600 text-white' : 'bg-gray-800 text-gray-400 hover:text-white'">English</button>
-          <button @click="setLang('cn')"
-            class="text-xs px-3 py-1.5 rounded-md transition"
-            :class="lang === 'cn' ? 'bg-indigo-600 text-white' : 'bg-gray-800 text-gray-400 hover:text-white'">中文</button>
-        </div>
-      </div>
-    </div>
-
     <!-- ══════════════════════════════════════════════════════════════════════ -->
-    <!-- AI Models (collapsible)                                              -->
+    <!-- AI Models — read only, edit config/models.json                       -->
     <!-- ══════════════════════════════════════════════════════════════════════ -->
     <div class="bg-gray-900 border border-gray-800 rounded-xl">
       <div class="px-5 py-3 flex items-center justify-between cursor-pointer hover:bg-gray-800/30 transition" @click="modelsOpen = !modelsOpen">
@@ -48,17 +30,23 @@
       </div>
 
       <div x-show="modelsOpen" x-transition class="border-t border-gray-800">
+        <!-- Where to edit -->
+        <div class="px-5 py-2.5 text-[11px] text-gray-500 border-b border-gray-800/50">
+          Read only. Models live in <span class="mono text-gray-400">config/models.json</span> —
+          edit that file to add, remove, or change the default model.
+          API keys are <b class="text-gray-400">not</b> in the JSON: each model names an
+          environment variable, and the value stays in <span class="mono text-gray-400">.env</span>.
+        </div>
         <!-- News Sentiment -->
         <div class="px-5 py-2 border-b border-gray-800/50">
           <h3 class="text-[11px] font-medium text-amber-400">News Sentiment</h3>
-          <p class="text-[9px] text-gray-600">Used during data update to score news articles. Prefer fast, cheap models.</p>
+          <p class="text-[9px] text-gray-600">Scores news articles. Prefer fast, cheap models.</p>
         </div>
         <div class="divide-y divide-gray-800/30">
           <template x-for="m in sentimentModels" :key="m.id">
-            <div class="flex items-center gap-3 px-5 py-2.5 hover:bg-gray-800/30 transition cursor-pointer" @click="editModel(m)">
-              <button @click.stop="setDefault(m.id, 'sentiment')"
-                class="w-4 h-4 rounded-full border-2 flex-shrink-0 transition"
-                :class="m.is_default_sentiment ? 'border-amber-500 bg-amber-500' : 'border-gray-600 hover:border-gray-400'"></button>
+            <div class="flex items-center gap-3 px-5 py-2.5">
+              <span class="w-4 h-4 rounded-full border-2 flex-shrink-0"
+                :class="m.is_default_sentiment ? 'border-amber-500 bg-amber-500' : 'border-gray-700'"></span>
               <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-2">
                   <span class="text-xs font-medium text-gray-200" x-text="m.display_name"></span>
@@ -70,7 +58,6 @@
               </div>
               <div class="flex items-center gap-2">
                 <span class="text-[10px]" :class="m.has_key ? 'text-green-500' : 'text-red-400'" x-text="m.has_key ? 'Key set' : 'No key'"></span>
-                <svg class="w-3.5 h-3.5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
               </div>
             </div>
           </template>
@@ -83,10 +70,9 @@
         </div>
         <div class="divide-y divide-gray-800/30">
           <template x-for="m in analysisModels" :key="m.id">
-            <div class="flex items-center gap-3 px-5 py-2.5 hover:bg-gray-800/30 transition cursor-pointer" @click="editModel(m)">
-              <button @click.stop="setDefault(m.id, 'analysis')"
-                class="w-4 h-4 rounded-full border-2 flex-shrink-0 transition"
-                :class="m.is_default_analysis ? 'border-indigo-500 bg-indigo-500' : 'border-gray-600 hover:border-gray-400'"></button>
+            <div class="flex items-center gap-3 px-5 py-2.5">
+              <span class="w-4 h-4 rounded-full border-2 flex-shrink-0"
+                :class="m.is_default_analysis ? 'border-indigo-500 bg-indigo-500' : 'border-gray-700'"></span>
               <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-2">
                   <span class="text-xs font-medium text-gray-200" x-text="m.display_name"></span>
@@ -98,18 +84,9 @@
               </div>
               <div class="flex items-center gap-2">
                 <span class="text-[10px]" :class="m.has_key ? 'text-green-500' : 'text-red-400'" x-text="m.has_key ? 'Key set' : 'No key'"></span>
-                <svg class="w-3.5 h-3.5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
               </div>
             </div>
           </template>
-        </div>
-
-        <!-- Add Model -->
-        <div class="px-5 py-3 border-t border-gray-800/50">
-          <button @click="startAddModel()"
-            class="w-full py-2.5 rounded-lg border border-dashed border-gray-700 text-xs text-gray-500 hover:text-white hover:border-gray-500 transition">
-            + Add Model
-          </button>
         </div>
       </div>
     </div>
@@ -352,74 +329,6 @@ Input JSON structure:</p>
 
   </div>
 
-  <!-- ═══ Edit Model Modal ═══ -->
-  <div x-show="editOpen" x-transition.opacity class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-    <div class="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl w-[520px] p-6 space-y-4" @click.away="editOpen=false">
-      <div class="flex items-center justify-between">
-        <h3 class="text-sm font-medium" x-text="editForm._isEdit ? 'Edit Model' : 'Add Model'"></h3>
-        <button @click="editOpen=false" class="text-gray-500 hover:text-white">
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
-        </button>
-      </div>
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="text-[10px] text-gray-500 block mb-1">ID</label>
-          <input x-model="editForm.id" :disabled="editForm._isEdit" type="text" placeholder="my-gpt4o"
-            class="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-2 text-xs mono focus:outline-none focus:border-indigo-500 disabled:opacity-50">
-        </div>
-        <div>
-          <label class="text-[10px] text-gray-500 block mb-1">Display Name</label>
-          <input x-model="editForm.display_name" type="text" placeholder="GPT-4o"
-            class="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-2 text-xs focus:outline-none focus:border-indigo-500">
-        </div>
-      </div>
-      <div>
-        <label class="text-[10px] text-gray-500 block mb-1">API Base URL</label>
-        <input x-model="editForm.api_base" type="text" placeholder="https://api.openai.com/v1"
-          class="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-2 text-xs mono focus:outline-none focus:border-indigo-500">
-      </div>
-      <div>
-        <label class="text-[10px] text-gray-500 block mb-1">API Key</label>
-        <input x-model="editForm.api_key" type="password" :placeholder="editForm._isEdit ? '(leave empty to keep current)' : 'sk-...'"
-          class="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-2 text-xs mono focus:outline-none focus:border-indigo-500">
-      </div>
-      <div class="grid grid-cols-3 gap-3">
-        <div>
-          <label class="text-[10px] text-gray-500 block mb-1">Model ID</label>
-          <input x-model="editForm.model_id" type="text" placeholder="gpt-4o"
-            class="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-2 text-xs mono focus:outline-none focus:border-indigo-500">
-        </div>
-        <div>
-          <label class="text-[10px] text-gray-500 block mb-1">API Format</label>
-          <select x-model="editForm.api_format"
-            class="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-2 text-xs focus:outline-none focus:border-indigo-500">
-            <option value="openai">OpenAI</option>
-            <option value="anthropic">Anthropic</option>
-          </select>
-        </div>
-        <div>
-          <label class="text-[10px] text-gray-500 block mb-1">Role</label>
-          <select x-model="editForm.role"
-            class="w-full bg-gray-800 border border-gray-700 rounded px-2.5 py-2 text-xs focus:outline-none focus:border-indigo-500">
-            <option value="both">Both</option>
-            <option value="sentiment">Sentiment Only</option>
-            <option value="analysis">Analysis Only</option>
-          </select>
-        </div>
-      </div>
-      <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
-        <input type="checkbox" x-model="editForm.supports_thinking" class="rounded bg-gray-800 border-gray-600 text-indigo-500 focus:ring-0 w-3.5 h-3.5">
-        Supports Thinking / Reasoning (Qwen-max, Claude Opus/Sonnet)
-      </label>
-      <div class="flex gap-2 pt-2">
-        <button @click="saveModel()" class="flex-1 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-medium transition">Save</button>
-        <button @click="editOpen=false" class="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm text-gray-400 transition">Cancel</button>
-        <button x-show="editForm._isEdit" @click="deleteModel(editForm.id)"
-          class="px-4 py-2 bg-red-900/30 hover:bg-red-800/50 rounded-lg text-sm text-red-400 transition">Delete</button>
-      </div>
-    </div>
-  </div>
-
   <!-- ═══ View Default Modal ═══ -->
   <div x-show="defaultViewOpen" x-transition.opacity class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
     <div class="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl w-[700px] max-h-[80vh] flex flex-col" @click.away="defaultViewOpen=false">
@@ -440,8 +349,6 @@ Input JSON structure:</p>
       return {
         models: [],
         lang: 'en',
-        editOpen: false,
-        editForm: {},
         modelsOpen: false,
         promptsOpen: false,
         // prompts
@@ -469,9 +376,6 @@ Input JSON structure:</p>
 
         async init() {
           await this.refreshModels()
-          const langRes = await fetch('/settings/lang')
-          const langData = await langRes.json()
-          this.lang = langData.lang || 'en'
           await this.refreshPrompts()
           if (window.location.hash === '#skill-prompts') {
             this.promptsOpen = true
@@ -479,22 +383,12 @@ Input JSON structure:</p>
           }
         },
 
-        async setLang(newLang) {
-          await fetch('/settings/lang', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ lang: newLang }),
-          })
-          this.lang = newLang
-          this.promptEdits = {}
-          this.promptOpen = null
-          await this.refreshPrompts()
-        },
-
+        // 语言不再可切换：固定看服务端环境变量 LANG_UI，这里只是显示它。
         async refreshPrompts() {
           const res = await fetch('/settings/prompts')
           const data = await res.json()
           this.prompts = data.prompts || {}
+          this.lang = data.lang || 'en'
         },
 
         toggleSkillEditor(key) {
@@ -550,65 +444,11 @@ Input JSON structure:</p>
           this.defaultViewOpen = true
         },
 
+        // 模型清单只读：加/删/换默认都是直接改 config/models.json。
         async refreshModels() {
           const res = await fetch('/models')
           const data = await res.json()
           this.models = data.models || []
-        },
-
-        editModel(m) {
-          this.editForm = {
-            id: m.id, display_name: m.display_name, api_base: m.api_base,
-            api_key: '', model_id: m.model_id, api_format: m.api_format,
-            role: m.role, supports_thinking: m.supports_thinking, _isEdit: true,
-          }
-          this.editOpen = true
-        },
-
-        startAddModel() {
-          this.editForm = {
-            id: '', display_name: '', api_base: '', api_key: '',
-            model_id: '', api_format: 'openai', role: 'both',
-            supports_thinking: false, _isEdit: false,
-          }
-          this.editOpen = true
-        },
-
-        async saveModel() {
-          const f = this.editForm
-          if (!f.id || !f.display_name || !f.api_base || !f.model_id) {
-            alert('Please fill ID, Name, API Base, and Model ID')
-            return
-          }
-          await fetch('/models', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(f),
-          })
-          this.editOpen = false
-          await this.refreshModels()
-        },
-
-        async deleteModel(id) {
-          if (!confirm('Delete model ' + id + '?')) return
-          await fetch('/models/' + id, { method: 'DELETE' })
-          this.editOpen = false
-          await this.refreshModels()
-        },
-
-        async setDefault(id, role) {
-          const m = this.models.find(m => m.id === id)
-          if (!m) return
-          await fetch('/models', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              ...m, api_key: '',
-              is_default_sentiment: role === 'sentiment' ? true : m.is_default_sentiment,
-              is_default_analysis: role === 'analysis' ? true : m.is_default_analysis,
-            }),
-          })
-          await this.refreshModels()
         },
       }
     }

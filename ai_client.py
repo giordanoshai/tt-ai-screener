@@ -3,7 +3,11 @@ Multi-format AI client — supports OpenAI and Anthropic API formats.
 All functions accept model config dict with api_format field.
 """
 import json
+import os
+from pathlib import Path
+
 import requests
+
 import config
 
 
@@ -189,17 +193,36 @@ def chat_stream(model_cfg: dict, messages: list[dict],
         yield from _openai_stream(model_cfg, messages, temperature, max_tokens)
 
 
-# ── 模型配置：从环境变量读 ────────────────────────────────────────────────
+# ── 模型配置：读本地 JSON 文件 ────────────────────────────────────────────
 #
-# 原来这两个函数查的是 ai_models 这张表。2026-08-29 实测：线上 Postgres 里
-# 【根本没有这张表】，所以 get_model() 永远返回 None —— 网页里的 AI 分析
-# 是完全不能用的，而且表现为「没配置模型」，会让人以为是自己配错了。
-# 网页那套增删改模型的表单也存不进去，填完就消失。
+# 这套配置原来存在本地 DuckDB 的 ai_models 表里。2026-08-29 实测：迁到自建
+# Postgres 的时候这张表漏掉了，线上库里根本没有，所以 get_model() 永远返回
+# None —— 网页里的 AI 分析完全不能用，界面上还只显示「没配置模型」，会让人
+# 以为是自己配错了；那套增删改模型的表单也存不进去，填完就消失。
 #
-# 而 config.py 里本来就有 AI_API_BASE / AI_API_KEY / AI_MODEL 和一套
-# SENTIMENT_*，.env.example 里也一直列着。所以直接从环境变量读，
-# 数据库这条路整个去掉（它依赖的 db.init 也随采集代码一起删了）。
+# 现在改成读 config/models.json：九个模型（不同厂商、不同价位，分析和情绪
+# 打分各用各的）都在里面，改模型直接改这个文件。
+#
+# **密钥不在 JSON 里。** 每个模型带一个 api_key_env 字段，写的是环境变量的
+# 名字（ANTHROPIC_API_KEY / DASHSCOPE_API_KEY / OPENAI_API_KEY / AI_API_KEY），
+# 真实的值在 .env。这样 JSON 可以进版本库而不泄密。
+#
+# 环境变量那一套（AI_API_BASE / AI_MODEL 等）保留成兜底，只在 JSON 文件不
+# 存在、读不动或者里面一个模型都没有的时候才走。
+#
+# 文件每次都重新读，不做缓存：它只有几 KB，而改完能立刻生效比省这点开销值。
 
+CONFIG_DIR = Path(__file__).parent / "config"
+
+#: 模型清单文件。测试里会把这个名字指到临时文件上。
+MODELS_JSON = CONFIG_DIR / "models.json"
+
+#: JSON 里没写 role 时按哪个角色算。
+DEFAULT_ROLE = "analysis"
+
+_ROLES = ("analysis", "sentiment")
+
+# 兜底用：每个角色对应 config.py 里的哪三个变量。
 _ROLE_ENV = {
     "analysis": ("AI_API_BASE", "AI_API_KEY", "AI_MODEL", "分析模型"),
     "sentiment": ("SENTIMENT_API_BASE", "SENTIMENT_API_KEY", "SENTIMENT_MODEL",
@@ -207,51 +230,132 @@ _ROLE_ENV = {
 }
 
 
+def _load_models_file() -> list[dict]:
+    """读模型清单。文件缺失、读不动、格式不对都返回空列表，不抛异常。"""
+    try:
+        raw = json.loads(MODELS_JSON.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    entries = raw.get("models") if isinstance(raw, dict) else raw
+    if not isinstance(entries, list):
+        return []
+    return [m for m in entries if isinstance(m, dict) and m.get("id")]
+
+
+def _enabled_models() -> list[dict]:
+    """启用中的模型。enabled 没写按启用算，写了 false 就不出现在任何地方。"""
+    return [m for m in _load_models_file() if m.get("enabled", True)]
+
+
+def _api_key_of(model: dict) -> str:
+    """按 api_key_env 指的名字去环境里取密钥。没配就是空串，不报错。"""
+    env_name = (model.get("api_key_env") or "").strip()
+    return os.getenv(env_name, "") if env_name else ""
+
+
+def _as_config(model: dict) -> dict:
+    """把 JSON 里的一条变成调用方要的配置（这一步才把密钥填进去）。"""
+    return {
+        "id": model["id"],
+        "display_name": model.get("display_name") or model["id"],
+        "api_base": model.get("api_base", ""),
+        "api_key": _api_key_of(model),
+        "model_id": model.get("model_id", ""),
+        "api_format": model.get("api_format", "openai"),
+        "role": model.get("role", DEFAULT_ROLE),
+        "supports_thinking": bool(model.get("supports_thinking")),
+    }
+
+
+def _serves(model: dict, role: str) -> bool:
+    """这个模型能不能干这个角色的活。role=both 的两边都能干。"""
+    return model.get("role", DEFAULT_ROLE) in (role, "both")
+
+
 def _model_from_env(role: str) -> dict | None:
-    base_k, key_k, model_k, label = _ROLE_ENV.get(role, _ROLE_ENV["analysis"])
+    """兜底：从环境变量拼一个模型配置。没配返回 None。"""
+    base_k, key_k, model_k, label = _ROLE_ENV.get(role, _ROLE_ENV[DEFAULT_ROLE])
     api_base = getattr(config, base_k, "")
     model_id = getattr(config, model_k, "")
     if not api_base or not model_id:
         return None
     return {
         "id": role,
+        "display_name": "%s（%s）" % (label, model_id),
         "api_base": api_base,
         "api_key": getattr(config, key_k, ""),
         "model_id": model_id,
         "api_format": "openai",
+        "role": role,
         "supports_thinking": False,
-        "display_name": "%s（%s）" % (label, model_id),
     }
 
 
 def get_model(model_id: str = None, role: str = "analysis") -> dict | None:
     """取一个模型配置。没配返回 None，上层显示「未配置」。
 
-    `model_id` 现在当作角色名用（"analysis" / "sentiment"）——环境变量这套
-    配置下每个角色只有一个模型，没有多模型可选。传别的值按角色回退。
+    指定了 `model_id` 就用那一个；那个 id 不在清单里（比如网页上选过之后
+    配置被删了）就退回按角色取默认的，不要让整个分析都用不了。
     """
-    if model_id in _ROLE_ENV:
-        role = model_id
-    return _model_from_env(role)
+    role = role if role in _ROLES else DEFAULT_ROLE
+    models = _enabled_models()
+    if not models:
+        return _model_from_env(role)
+
+    if model_id:
+        for model in models:
+            if model["id"] == model_id:
+                return _as_config(model)
+        # 兼容旧写法：曾经把角色名当 model_id 传进来
+        if model_id in _ROLES:
+            role = model_id
+
+    usable = [m for m in models if _serves(m, role)]
+    if not usable:
+        return None
+
+    flag = "is_default_analysis" if role == "analysis" else "is_default_sentiment"
+    for model in usable:
+        if model.get(flag):
+            return _as_config(model)
+    return _as_config(usable[0])
 
 
 def list_models(role: str = None) -> list[dict]:
-    """列出当前配好的模型。环境变量里配了几个就是几个，最多两个。"""
-    roles = [role] if role in _ROLE_ENV else list(_ROLE_ENV)
+    """列出可用的模型，给设置页和 /analyze/status 用。
+
+    **不带密钥**，只带一个 has_key 说明那个环境变量配没配。
+    """
+    models = _enabled_models()
+    if not models:
+        cfgs = [_model_from_env(r) for r in (
+            [role] if role in _ROLES else list(_ROLES))]
+        return [{
+            "id": c["id"], "display_name": c["display_name"],
+            "api_base": c["api_base"], "model_id": c["model_id"],
+            "api_format": c["api_format"], "role": c["role"],
+            "supports_thinking": c["supports_thinking"],
+            "is_default_sentiment": c["role"] == "sentiment",
+            "is_default_analysis": c["role"] == "analysis",
+            "has_key": bool(c["api_key"]),
+        } for c in cfgs if c]
+
     out = []
-    for r in roles:
-        cfg = _model_from_env(r)
-        if cfg:
-            out.append({
-                "id": cfg["id"],
-                "display_name": cfg["display_name"],
-                "model_id": cfg["model_id"],
-                "api_format": cfg["api_format"],
-                "role": r,
-                "supports_thinking": cfg["supports_thinking"],
-                "is_default_sentiment": r == "sentiment",
-                "is_default_analysis": r == "analysis",
-            })
+    for model in models:
+        if role and not _serves(model, role):
+            continue
+        out.append({
+            "id": model["id"],
+            "display_name": model.get("display_name") or model["id"],
+            "api_base": model.get("api_base", ""),
+            "model_id": model.get("model_id", ""),
+            "api_format": model.get("api_format", "openai"),
+            "role": model.get("role", DEFAULT_ROLE),
+            "supports_thinking": bool(model.get("supports_thinking")),
+            "is_default_sentiment": bool(model.get("is_default_sentiment")),
+            "is_default_analysis": bool(model.get("is_default_analysis")),
+            "has_key": bool(_api_key_of(model)),
+        })
     return out
 
 
@@ -315,7 +419,6 @@ def submit_news_sentiment_batch(articles: list[dict]) -> str | None:
 
     Returns the created batch_id, or None if submission failed.
     """
-    import os
     import time
     model_cfg = get_model(role="sentiment")
     if not model_cfg or not model_cfg.get("api_base") or not model_cfg.get("model_id"):
