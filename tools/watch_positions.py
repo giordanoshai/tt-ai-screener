@@ -26,10 +26,18 @@
 UW 实时警报（`/api/alerts`）同理：同一只票在 100 条里触发好几条自定义规则
 时，也合并成一条，把命中的规则名都列出来，不按规则条数扇出。
 
-## 每条告警说清三件事
+## 每条告警说清三件事，还要说清是哪一路测出来的
 
 发生了什么、对我的仓位意味着什么、建议怎么处理。只说「NVDA 出现大额看跌期权」
 是没用的——用户还得自己算这对手上 20 股意味着什么。
+
+**每条告警都带一个 `source` 字段**，说明这条结论是从哪一路数据算出来的
+（`price`/`earnings`/`options_flow_archive`/`cn_fund_flow`/`lhb`/`news`/
+`uw_live_alert`）。这不是摆设：`options_flow_archive`（数据库里聚合的
+整体期权异动）和 `uw_live_alert`（用户自己配置的实时扫描规则命中）是
+两种独立的测量，同一只票上完全可能给出相反的方向结论，`source` 字段
+让用户一眼看出这两条不是同一件事的重复播报（详见下面「两路期权信号
+可能打架」一节）。
 
 ## UW 实时警报的坑
 
@@ -57,6 +65,29 @@ UW 实时警报（`/api/alerts`）同理：同一只票在 100 条里触发好�
 异动但方向判断不了」，并把这一路的这个空缺写进 `data_gaps`。宁可说不知道，
 不许猜一个方向说得像知道——那样错的代价，是用户按「有资金在看多」去加仓，
 实际那批钱在看空。
+
+## 两路期权信号可能打架，打架时不能装作没这回事
+
+`big_bullish_flow` / `big_bearish_flow` 这两个 kind 可能来自两条完全不同
+的测量：
+
+1. `options_flow_archive`——数据库里聚合的 `flow_alerts_archive`，看的是
+   这段时间（`hours` 参数决定）**整体权利金往哪边压**。
+2. `uw_live_alert`——用户自己配置的 UW 实时扫描规则命中的**单笔大单**。
+
+这两路**合法地可以方向不一致**——不是 bug，一个是统计口径，一个是单笔事件
+口径，本来就可能各说各话。但如果原样把两条方向相反的结论并列摆出来
+（2026-08-30/31 实测：AMZN、GOOGL 都命中过这个场景——整体权利金流向偏多，
+但 UW 扫描器抓到的单笔大单偏空），交易者要么无所适从、要么只信先读到的
+那条；而且两个 kind 各自的默认严重度（`big_bearish_flow` 70、
+`big_bullish_flow` 45）纯粹是历史遗留的分档，**不代表哪一路更权威**，把
+它们并列摆出来还会让人误读成「看空那条更重要」。
+
+所以两路信号方向不一致时，**合成一条 `options_signal_conflict`**，把双方
+原始结论都摆出来，并且明说「这是两种独立测量，谁也不比谁权威，分歧本身
+就是信息」——不替用户选边，也不用一个具体的严重度去暗示某一边更可信
+（见 `_conflict_alert()`）。方向一致时两条照常都发，只是各自带上 `source`
+字段。
 
 ## 实时接口挂了也要能用，某一路挂了也不能连累别的路
 
@@ -140,6 +171,10 @@ AMZN、GOOGL 的「重大正面消息」。现在补上 `neutral_news` 这一档
 这个工具的定位是「我这只仓位现在要不要处理」，一条泛大盘的宏观新闻不构成
 针对某一个具体仓位的处理理由，所以这里选择直接不发，而不是发出来再标注。
 
+新闻三档的严重度（`bad_news`/`good_news`/`neutral_news`）都在 `SEVERITY`
+里给了显式值，不再走 `.get(kind, 30)` 的默认档——依据见 `SEVERITY` 定义处
+的注释。
+
 ## 「阶段新低」窗口跟文字要对得上
 
 早期实现里 SQL 窗口是 40 个自然日（约 27~28 个交易日），但告警文字曾经
@@ -166,6 +201,17 @@ BIG_PREMIUM = 500_000
 #: 严重度。数字只用来排序。
 #: `stop_breached` / `trailing_stop_touched` 不在这里——它们的严重度按跌破
 #: 幅度动态算，见 `_stop_alert_severity()`，不是查这张表。
+#: `options_signal_conflict` 的依据见 `_conflict_alert()`：两路期权信号
+#: 打架时的不确定性本身值得关注，但不该盖过已经确凿的价格类信号
+#: （止损、跌破均线），所以定在中等档，也不刻意偏向 70 或 45 哪一边。
+#: `bad_news`/`good_news`/`neutral_news` 三档不能都走默认的 30 分——
+#: 一条「重大负面消息」明显比一条「情绪中性、连方向都判断不出来」的消息
+#: 更贴近「现在要不要处理」这个问题，`bad_news` 定得比一般期权信号
+#: （45~70）低、但比价格已经跌破止损/均线（60~95）更低——毕竟消息还没
+#: 反映到价格上，可能已经计入也可能根本不影响；`good_news` 对已经持有
+#: 多头仓位的人来说信息量有限，不构成任何需要现在处理的理由，定得比看多
+#: 的期权信号（45）还低；`neutral_news` 连方向都判断不出来，对「要不要
+#: 处理」这个问题贡献最小，垫底。
 SEVERITY = {
     "below_ma50": 80,
     "earnings_soon": 75,
@@ -173,8 +219,12 @@ SEVERITY = {
     "cn_outflow": 65,
     "below_ma20": 60,
     "new_low": 60,
+    "options_signal_conflict": 55,
+    "bad_news": 55,
     "lhb": 50,
     "big_bullish_flow": 45,
+    "good_news": 35,
+    "neutral_news": 20,
 }
 
 #: 财报还有几个交易日算「临近」（5 个交易日 ≈ 7 个自然日）
@@ -301,7 +351,8 @@ def _uw_live_direction(item: dict) -> str | None:
     return "bullish" if up > down else "bearish"
 
 
-def _alert(ticker, kind, what, means, action, severity: int | None = None) -> dict:
+def _alert(ticker, kind, what, means, action, source: str,
+           severity: int | None = None) -> dict:
     return {
         "ticker": ticker,
         "kind": kind,
@@ -309,6 +360,41 @@ def _alert(ticker, kind, what, means, action, severity: int | None = None) -> di
         "what_it_means": means,
         "suggested_action": action,
         "severity": severity if severity is not None else SEVERITY.get(kind, 30),
+        # 这条结论是从哪一路数据算出来的：price/earnings/
+        # options_flow_archive/cn_fund_flow/lhb/news/uw_live_alert。
+        # 见模块 docstring「每条告警说清三件事，还要说清是哪一路测出来的」
+        "source": source,
+    }
+
+
+def _conflict_alert(ticker: str, of_alert: dict, uw_alert: dict) -> dict:
+    """期权异动统计（数据库聚合，看的是这段时间整体权利金往哪边压）和
+    UW 实时警报（单笔扫描命中）是两种独立的测量，方向可能合法地不一致。
+
+    这时不能把两条矛盾的结论原样并列摆出来——那样用户要么无所适从，要么
+    只信先读到的那条；而且两个 kind 各自的默认严重度（比如 70 对 45）
+    本身不代表谁更权威，不该被读成「看空那条更重要」。所以两边打架时
+    合成一条，把双方原始结论都摆出来、并且明说「这是两种独立测量，谁也
+    不比谁权威」——不替用户选边，也不用某个具体严重度去暗示某一边更可信
+    （见 `SEVERITY["options_signal_conflict"]` 的注释）。
+    """
+    return {
+        "ticker": ticker,
+        "kind": "options_signal_conflict",
+        "what_happened": (
+            f"两路期权信号方向不一致：整体权利金流向统计说"
+            f"「{of_alert['what_happened']}」；UW 实时警报说"
+            f"「{uw_alert['what_happened']}」"),
+        "what_it_means": (
+            "这是两种独立的测量——一个看这段时间整体权利金往哪边压，"
+            "一个是你自己配置的实时扫描规则命中的单笔大单——谁也不比谁"
+            "更权威。分歧本身就是信息：说明这只票的期权市场眼下没有形成"
+            "一致方向"),
+        "suggested_action": (
+            "别只挑一条信自己想信的方向；等价格自己给出确认（站稳或跌破"
+            "关键均线）再决定，不要单靠期权信号下判断"),
+        "severity": SEVERITY.get("options_signal_conflict", 55),
+        "source": f"{of_alert.get('source')}+{uw_alert.get('source')}",
     }
 
 
@@ -337,8 +423,11 @@ def watch_positions(hours: int = 24) -> str:
     实时警报流里命中持仓的部分。
 
     **没事就说没事**——不触发就返回空列表加一句话，不制造噪音。
-    每条告警都会说清楚：发生了什么、对你的仓位意味着什么、建议怎么处理。
-    同一只票的多笔期权异动会合并成一条，不会因为一只票交易活跃就刷屏。
+    每条告警都会说清楚：发生了什么、对你的仓位意味着什么、建议怎么处理，
+    还带一个 `source` 字段说明是哪一路数据算出来的。同一只票的多笔期权
+    异动会合并成一条，不会因为一只票交易活跃就刷屏；期权异动统计
+    （数据库聚合）和 UW 实时警报（单笔扫描命中）方向不一致时也不会原样
+    并列摆出来，会合成一条说清楚分歧（`options_signal_conflict`）。
 
     止损相关的告警分两种、严重度按跌破幅度分档，不是固定分：`stop_breached`
     是仓位已经浮亏时的真实破位（跌破越深分越高）；`trailing_stop_touched`
@@ -442,7 +531,7 @@ def watch_positions(hours: int = 24) -> str:
                     ticker, kind,
                     f"现价 {close} 跌破了建议止损位 {stop['suggested_stop']}"
                     f"（依据：{stop['basis']}，跌破幅度 {depth:.2f}%）",
-                    pnl_text, action,
+                    pnl_text, action, source="price",
                     severity=_stop_alert_severity(kind, depth)))
                 if stop.get("basis") == "ma_20":
                     suppress_below_ma20 = True
@@ -451,20 +540,23 @@ def watch_positions(hours: int = 24) -> str:
                     ticker, "below_ma50",
                     f"跌破 50 日均线（{snap['ma_50']}）",
                     "中期趋势转弱了，波段的多头依据没了",
-                    "波段仓位考虑离场；要留就当成中线仓，重新定止损"))
+                    "波段仓位考虑离场；要留就当成中线仓，重新定止损",
+                    source="price"))
             elif snap.get("above_ma20") is False and not suppress_below_ma20:
                 alerts.append(_alert(
                     ticker, "below_ma20",
                     f"跌破 20 日均线（{snap['ma_20']}）",
                     "短期动能转弱，但中期趋势还在",
-                    "先减一部分观察，等站回均线再补"))
+                    "先减一部分观察，等站回均线再补",
+                    source="price"))
             low_20 = lows.get(ticker)
             if low_20 is not None and close is not None and close <= low_20:
                 alerts.append(_alert(
                     ticker, "new_low",
                     f"创 20 个交易日新低（{close}）",
                     "没有买盘接，下跌还在延续",
-                    "别在下跌途中摊平成本，先等企稳信号"))
+                    "别在下跌途中摊平成本，先等企稳信号",
+                    source="price"))
 
         # ---- 第二路：财报临近。同样只用已经拿到的数据 ----
         for ticker, info in earnings.items():
@@ -474,9 +566,15 @@ def watch_positions(hours: int = 24) -> str:
                     ticker, "earnings_soon",
                     f"{days_until} 天后财报（{info['next_earnings_date']}）",
                     "财报是掷骰子，一晚上可能跳 10% 以上，方向不可预测",
-                    "波段仓位建议财报前减到能承受的量，或者干脆先出来"))
+                    "波段仓位建议财报前减到能承受的量，或者干脆先出来",
+                    source="earnings"))
 
         # ---- 第三路：期权异动（美股）/ 主力资金和龙虎榜（A股）----
+        # 期权异动统计的方向暂存在这里，不直接进 alerts——要等 UW 实时
+        # 警报那一路也算完，两边合并检查方向是否打架（模块 docstring
+        # 「两路期权信号可能打架」一节）
+        options_flow_direction: dict[str, dict] = {}
+
         us_tickers = by_market.get("US", [])
         if us_tickers:
             try:
@@ -500,7 +598,7 @@ def watch_positions(hours: int = 24) -> str:
                     biggest = max(big_rows,
                                  key=lambda r: float(r["total_premium"] or 0))
                     net_bearish = bearish_sum > bullish_sum
-                    alerts.append(_alert(
+                    options_flow_direction[ticker] = _alert(
                         ticker,
                         "big_bearish_flow" if net_bearish else "big_bullish_flow",
                         f"近 {days} 天有 {len(big_rows)} 笔大额期权交易：看涨 "
@@ -513,7 +611,8 @@ def watch_positions(hours: int = 24) -> str:
                         ("跟你的多头仓位是反的" if net_bearish else "跟你的方向一致"),
                         "别只凭这一条动手，配合价格看——"
                         "价格同时跌破均线才是真信号" if net_bearish
-                        else "可以作为继续持有的旁证，不构成加仓理由"))
+                        else "可以作为继续持有的旁证，不构成加仓理由",
+                        source="options_flow_archive")
             except Exception as exc:
                 gaps.append(f"期权异动拉取失败：{exc}")
 
@@ -530,7 +629,8 @@ def watch_positions(hours: int = 24) -> str:
                             ticker, "cn_outflow",
                             f"主力 5 日净流出 {abs(net_5d) / 1e8:.2f} 亿",
                             "机构资金在持续出货，散户接盘的行情很难走远",
-                            "考虑减仓，至少不要在这个位置加"))
+                            "考虑减仓，至少不要在这个位置加",
+                            source="cn_fund_flow"))
             except Exception as exc:
                 gaps.append(f"A股主力资金拉取失败：{exc}")
 
@@ -541,7 +641,8 @@ def watch_positions(hours: int = 24) -> str:
                             ticker, "lhb",
                             f"近 5 天上过龙虎榜（{records[0]['reason']}）",
                             "游资在这只票上进出，波动会明显放大",
-                            "把止损放宽一点或者减小仓位，别被日内波动扫掉"))
+                            "把止损放宽一点或者减小仓位，别被日内波动扫掉",
+                            source="lhb"))
             except Exception as exc:
                 gaps.append(f"龙虎榜拉取失败：{exc}")
 
@@ -579,11 +680,15 @@ def watch_positions(hours: int = 24) -> str:
                         else f"重大消息（情绪中性）：{item['title']}",
                         means,
                         "先看股价反应过了没有——已经跳完的消息不用再动作；"
-                        "还没反应的才需要决定"))
+                        "还没反应的才需要决定",
+                        source="news"))
         except Exception as exc:
             gaps.append(f"消息拉取失败：{exc}")
 
-        # ---- UW 实时警报：解出标的、解方向，同一只票多条规则合并成一条 ----
+        # ---- UW 实时警报：解出标的、解方向，同一只票多条规则合并成一条。
+        # 方向已解出的暂存在这里，跟期权异动统计合并检查方向打不打架
+        # （模块 docstring「两路期权信号可能打架」一节）----
+        uw_live_direction: dict[str, dict] = {}
         try:
             if uw.available():
                 live = uw.alerts(limit=100)
@@ -627,13 +732,14 @@ def watch_positions(hours: int = 24) -> str:
                                    if bullish or bearish else "") + "）")
 
                         if kind:
-                            alerts.append(_alert(
+                            uw_live_direction[ticker] = _alert(
                                 ticker, kind,
                                 f"实时警报触发：{'、'.join(names)}",
                                 "你配置的扫描规则在这只持仓上触发了，"
                                 "解出来的期权方向是"
                                 + ("看多" if kind == "big_bullish_flow" else "看空"),
-                                "去 Unusual Whales 看这条警报的细节再决定"))
+                                "去 Unusual Whales 看这条警报的细节再决定",
+                                source="uw_live_alert")
                         else:
                             alerts.append(_alert(
                                 ticker, "uw_alert_direction_unknown",
@@ -641,9 +747,24 @@ def watch_positions(hours: int = 24) -> str:
                                 "你配置的扫描规则触发了，但这批数据没法"
                                 "确定是偏多还是偏空",
                                 "去 Unusual Whales 看这条警报的细节，"
-                                "自己判断方向"))
+                                "自己判断方向",
+                                source="uw_live_alert"))
         except Exception as exc:
             gaps.append(f"UW 实时警报拉取失败：{exc}")
+
+        # ---- 合并期权异动统计和 UW 实时警报两路的方向信号。方向一致就
+        # 两条都正常发；方向不一致就合成一条说清楚分歧，不原样并列摆出来
+        # （模块 docstring「两路期权信号可能打架」一节）----
+        for ticker in sorted(set(options_flow_direction) | set(uw_live_direction)):
+            of_alert = options_flow_direction.get(ticker)
+            uw_alert = uw_live_direction.get(ticker)
+            if of_alert and uw_alert and of_alert["kind"] != uw_alert["kind"]:
+                alerts.append(_conflict_alert(ticker, of_alert, uw_alert))
+            else:
+                if of_alert:
+                    alerts.append(of_alert)
+                if uw_alert:
+                    alerts.append(uw_alert)
 
         alerts.sort(key=lambda a: (-a["severity"], a["ticker"]))
         alert_count = len(alerts)

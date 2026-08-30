@@ -464,7 +464,13 @@ def test_uw_live_alert_uses_resolved_direction_not_hardcoded_bullish(
         monkeypatch):
     """早期 bug：不管三七二十一一律标 big_bullish_flow。真实样本
     （PUT，ask 远大于 bid = 买方追价买看跌 = 看空）应该被判成
-    big_bearish_flow，不是 big_bullish_flow。"""
+    big_bearish_flow，不是 big_bullish_flow。
+
+    这条只测「UW 实时警报的方向解析对不对」，要跟修复轮 2 加的「两路
+    信号打架就合并」逻辑隔开——不然如果这只票凑巧同时有一条方向相反的
+    期权异动统计告警，两条会被合并成 options_signal_conflict，这条测试
+    就测不出方向解析本身对不对了。所以把期权异动统计那一路的原始查询
+    钉死成空结果，只留 UW 实时警报这一路。"""
     from db import pg
 
     held = [r["ticker"] for r in pg.query("select ticker from user_positions")]
@@ -477,6 +483,15 @@ def test_uw_live_alert_uses_resolved_direction_not_hardcoded_bullish(
                  "ask_volume": 1741, "bid_volume": 636},
         "name": "Stealth Accumulation Scanner",
     }
+
+    original_query = wp.pg.query
+
+    def fake_query(sql, params=None):
+        if "from flow_alerts_archive" in sql:
+            return []  # 期权异动统计这一路钉死成空，隔离掉合并逻辑
+        return original_query(sql, params)
+
+    monkeypatch.setattr(wp.pg, "query", fake_query)
     monkeypatch.setattr(wp.uw, "available", lambda: True)
     monkeypatch.setattr(wp.uw, "alerts", lambda limit=100: [fake_item])
     out = run()
@@ -485,6 +500,7 @@ def test_uw_live_alert_uses_resolved_direction_not_hardcoded_bullish(
     assert len(matched) == 1
     assert matched[0]["kind"] == "big_bearish_flow", (
         f"PUT 且 ask 远大于 bid 是看空，不该被标成 {matched[0]['kind']}")
+    assert matched[0]["source"] == "uw_live_alert"
 
 
 def test_uw_live_alert_direction_unknown_is_reported_not_guessed(monkeypatch):
@@ -837,3 +853,176 @@ def test_no_truncation_when_under_the_cap():
     if not out["truncated"]:
         assert out["alert_count"] == out["returned_count"]
         assert len(out["alerts"]) == out["alert_count"]
+
+
+# ---------------- 修复轮2 / 一：每条告警要能看出来源；两路期权信号打架不能装作没这回事 ----------------
+
+def test_every_alert_has_a_source_field():
+    """每条告警都该带一个说明来源的字段，不能让用户猜这条结论是哪一路
+    数据算出来的。"""
+    out = run()
+    checked = 0
+    for alert in out["alerts"]:
+        assert alert.get("source"), (
+            f"{alert['ticker']}/{alert['kind']} 缺少 source 字段")
+        checked += 1
+    assert checked > 0, "今天应该真的有告警，不然这条测试测不出东西"
+
+
+def test_conflicting_option_signals_are_merged_with_disagreement_stated(
+        monkeypatch):
+    """期权异动统计（数据库聚合，看整体权利金流向）和 UW 实时警报（用户
+    自己配置的单笔扫描命中）是两种独立的测量，方向可能合法地不一致。
+    这时不能把两条矛盾的结论原样并列摆出来，要合成一条说清楚分歧。
+
+    用假数据构造一个确定性的冲突场景（不依赖 UW /api/alerts 这个滚动
+    窗口今天恰好命中什么）：整体权利金流向判成看涨，UW 扫描器命中判成
+    看跌（PUT 且 ask 远大于 bid）。"""
+    from db import pg
+
+    held = [r["ticker"] for r in
+           pg.query("select ticker from user_positions where market = 'US'")]
+    if not held:
+        pytest.skip("没有美股持仓，测不出这条")
+    target = held[0]
+
+    original_query = wp.pg.query
+
+    def fake_query(sql, params=None):
+        if "from flow_alerts_archive" in sql and "percentile_cont" in sql:
+            return [{"ticker": target, "p90": 60.0}]
+        if "from flow_alerts_archive" in sql:
+            # 整体权利金流向：看涨占优 -> big_bullish_flow
+            return [{"ticker": target, "opt_type": "call",
+                     "total_premium": 900_000, "score": 70,
+                     "sentiment": "bullish", "day": "2026-08-28",
+                     "strike": 100, "expiry": "2026-09-19"}]
+        return original_query(sql, params)
+
+    # UW 实时警报：PUT + ask 远大于 bid = 买方追价买看跌 = 看空
+    fake_uw_item = {
+        "symbol": f"{target}260831P00347500",
+        "meta": {"underlying_symbol": target,
+                 "ask_volume": 1741, "bid_volume": 636},
+        "name": "Stealth Accumulation Scanner",
+    }
+
+    monkeypatch.setattr(wp.pg, "query", fake_query)
+    monkeypatch.setattr(wp.uw, "available", lambda: True)
+    monkeypatch.setattr(wp.uw, "alerts", lambda limit=100: [fake_uw_item])
+
+    out = run()
+    conflicts = [a for a in out["alerts"] if a["ticker"] == target
+                and a["kind"] == "options_signal_conflict"]
+    assert len(conflicts) == 1, "方向相反的两路信号应该合成一条冲突告警"
+    alert = conflicts[0]
+    assert "不一致" in alert["what_happened"]
+    assert "整体权利金流向统计说" in alert["what_happened"]
+    assert "UW 实时警报说" in alert["what_happened"]
+    assert "options_flow_archive" in alert["source"]
+    assert "uw_live_alert" in alert["source"]
+    assert alert["severity"] == wp.SEVERITY["options_signal_conflict"]
+
+    # 原来那两条方向各自的结论不该再单独出现——不能原样并列摆出来
+    assert not any(a["ticker"] == target
+                  and a["kind"] in ("big_bullish_flow", "big_bearish_flow")
+                  for a in out["alerts"]), (
+        "方向相反时，两条矛盾的原始结论不该被原样并列摆出来")
+
+
+def test_agreeing_option_signals_are_not_merged(monkeypatch):
+    """方向一致时按现在这样正常发，不用合并——两条都保留，各自带来源。"""
+    from db import pg
+
+    held = [r["ticker"] for r in
+           pg.query("select ticker from user_positions where market = 'US'")]
+    if not held:
+        pytest.skip("没有美股持仓，测不出这条")
+    target = held[0]
+
+    original_query = wp.pg.query
+
+    def fake_query(sql, params=None):
+        if "from flow_alerts_archive" in sql and "percentile_cont" in sql:
+            return [{"ticker": target, "p90": 60.0}]
+        if "from flow_alerts_archive" in sql:
+            return [{"ticker": target, "opt_type": "call",
+                     "total_premium": 900_000, "score": 70,
+                     "sentiment": "bullish", "day": "2026-08-28",
+                     "strike": 100, "expiry": "2026-09-19"}]
+        return original_query(sql, params)
+
+    # UW 实时警报也判成看涨（call + ask 占优）——跟上面那条同方向
+    fake_uw_item = {
+        "symbol": f"{target}260831C00347500",
+        "meta": {"underlying_symbol": target,
+                 "ask_volume": 1741, "bid_volume": 636},
+        "name": "Stealth Accumulation Scanner",
+    }
+
+    monkeypatch.setattr(wp.pg, "query", fake_query)
+    monkeypatch.setattr(wp.uw, "available", lambda: True)
+    monkeypatch.setattr(wp.uw, "alerts", lambda limit=100: [fake_uw_item])
+
+    out = run()
+    assert not any(a["ticker"] == target and a["kind"] == "options_signal_conflict"
+                  for a in out["alerts"]), "方向一致时不该报冲突"
+    matched = [a for a in out["alerts"] if a["ticker"] == target
+              and a["kind"] == "big_bullish_flow"]
+    assert len(matched) == 2, "方向一致时两条应该都正常发出来"
+    assert {a["source"] for a in matched} == {"options_flow_archive",
+                                               "uw_live_alert"}
+
+
+def test_real_conflicting_signals_are_merged_when_present_today():
+    """协调者复核（2026-08-30/31）时 AMZN、GOOGL 的期权异动统计和 UW
+    实时警报方向相反，用真实数据核对过这个具体场景已经修好。但
+    `/api/alerts` 是滚动窗口，命中的规则会随时间滚出前 100 条，所以
+    「今天真有冲突样本」这个前提不一定每次跑都成立——先查一次今天的
+    真实输出确认，不成立就跳过并说明原因，不放松断言（假数据那条测试
+    已经把合并逻辑本身钉死了）。"""
+    out = run()
+    conflicts = {a["ticker"] for a in out["alerts"]
+                if a["kind"] == "options_signal_conflict"}
+    if not conflicts:
+        pytest.skip("这次跑没有票在期权异动统计和 UW 实时警报之间出现"
+                   "方向分歧（/api/alerts 是滚动窗口，命中会随时间滚出），"
+                   "测不出真实场景下这条合并逻辑，用假数据的那条测试已经"
+                   "覆盖了合并逻辑本身")
+    for ticker in conflicts:
+        assert not any(a["ticker"] == ticker
+                       and a["kind"] in ("big_bullish_flow", "big_bearish_flow")
+                       for a in out["alerts"])
+
+
+# ---------------- 修复轮2 / 二：新闻三档要有显式严重度，不能都走默认 30 分 ----------------
+
+def test_news_kinds_have_explicit_severities_not_the_default():
+    """一条重大负面消息不该跟一条中性消息同分——三档都要有显式值，且
+    相对紧要程度要有意义的顺序：重大负面 > 重大正面 > 情绪中性。"""
+    assert wp.SEVERITY["bad_news"] != 30
+    assert wp.SEVERITY["good_news"] != 30
+    assert wp.SEVERITY["neutral_news"] != 30
+    assert wp.SEVERITY["bad_news"] > wp.SEVERITY["good_news"] > wp.SEVERITY["neutral_news"]
+
+
+def test_bad_news_alert_carries_the_explicit_severity(monkeypatch):
+    from db import pg
+
+    held = [r["ticker"] for r in pg.query("select ticker from user_positions")]
+    if not held:
+        pytest.skip("没有持仓，测不出这条")
+    target = held[0]
+
+    def fake_news_for(tickers, days, min_significance, per_ticker):
+        return {target: [{"title": "重大负面消息示例",
+                          "sentiment_label": "Negative",
+                          "significant": "High", "tickers": [target]}]}
+
+    monkeypatch.setattr(wp.catalyst, "news_for", fake_news_for)
+    out = run()
+    matched = [a for a in out["alerts"] if a["ticker"] == target
+              and a["kind"] == "bad_news"]
+    assert len(matched) == 1
+    assert matched[0]["severity"] == wp.SEVERITY["bad_news"]
+    assert matched[0]["severity"] != 30
