@@ -38,6 +38,26 @@ UW 实时警报（`/api/alerts`）同理：同一只票在 100 条里触发好�
 `potus_schedule` 这种噪音，`symbol` 直接是 null。拿 symbol 直接跟持仓比对
 会一条都对不上，必须先用 uw.underlying_of() 解出标的。
 
+这个接口不像 `flow_alerts_archive` 那样直接给 `sentiment` 字段，**不代表
+它没有方向可判断**——2026-08-31 实测：`meta` 里有 `ask_volume` / `bid_volume`
+（这批合约成交量里，多少手是在卖价成交、多少手是在买价成交），`symbol` 里
+的 OCC 合约代码能解出这是看涨还是看跌期权（到期日后紧跟着的那个字符，
+`C`=call、`P`=put）。这两样凑在一起，跟 `core/uw.split_premium()` 判断
+`flow_alerts_archive` 里期权异动方向用的是**同一套逻辑**：在卖价成交=
+买方主动，在买价成交=卖方主动；买看涨=看多、卖看涨=看空、买看跌=看空、
+卖看跌=看多。所以这里直接复用 `split_premium()`，不用自己另造一套判断。
+
+早期写法图省事，不管三七二十一把这条来源的告警一律标成 `big_bullish_flow`——
+这不是「少给了信息」，是**告诉用户一个可能错的方向**：2026-08-30 实测命中
+的两条都是 `Stealth Accumulation Scanner`，解出来一看，AMZN/GOOGL 那两条
+的合约都是 **PUT**，而且 `ask_volume` 远大于 `bid_volume`（买方在追价买入
+看跌期权），按上面那套逻辑读出来是**看空**，原来的写法却报成了「看多」——
+方向整个反了。现在按合约代码解方向，解不出来（比如合约代码格式不对、或者
+`ask_volume`/`bid_volume` 缺失/相等分不出谁占优）就**不猜**，改成「有大额
+异动但方向判断不了」，并把这一路的这个空缺写进 `data_gaps`。宁可说不知道，
+不许猜一个方向说得像知道——那样错的代价，是用户按「有资金在看多」去加仓，
+实际那批钱在看空。
+
 ## 实时接口挂了也要能用，某一路挂了也不能连累别的路
 
 价格触发（跌破均线、跌破止损、创新低）和财报临近都是从库里算的，
@@ -51,15 +71,82 @@ UW 实时警报（`/api/alerts`）同理：同一只票在 100 条里触发好�
 `warnings`——跟前面几个工具的约定一致，「行情是新的但某个采集任务挂了」
 这种情况必须无条件报出来，不能挂在「行情陈旧」判断下面变成潜台词。
 
-## 止损告警的盈亏描述要跟真实盈亏方向一致
+## 止损告警：浮盈还是浮亏、跌破多深，都要说清楚
 
-`position_stop()` 的止损位在成本上方时会抬到均线（护浮盈），这时候破位是
-「浮盈还在但保护线没了」，不是「亏钱了」。2026-08-30 用真实持仓跑出来才
-发现：早期写法不分青红皂白一律印「浮亏 {数字}」，AMZN 那天明明浮盈 204
-美元，被印成「浮亏 204 USD」；亏钱的几只（GOOGL/MP/ORCL/RKLB）又会印成
-「浮亏 -184 USD」这种双重负号。前者是把赚钱的仓位说成在亏钱，后者是让
-数字费解——都属于「这份输出会不会误导交易者」要挡住的那一类。现在按
-盈亏正负分别措辞，且数字一律取绝对值。
+`position_stop()` 的止损位是「成本-2×ATR」和「20 日均线」取高的那个——均线
+在成本上方时说明有浮盈，止损会抬到均线护住。这带来两个坑，都是拿真实持仓
+（AMZN/GOOGL/MP/NVO/ORCL/RKLB）实测跑出来才发现的（2026-08-30/31）：
+
+**坑一：浮盈还是浮亏，文案要跟真实盈亏方向一致。** 早期写法不分青红皂白
+一律印「浮亏 {数字}」，AMZN 当天明明浮盈 204 美元（成本 246、现价
+266.43），被印成「浮亏 204 USD」——把赚钱的仓位说成在亏钱。现在按盈亏
+正负分别措辞，数字一律取绝对值（不再出现「浮亏 -184」这种双重负号）。
+
+**坑二：「止损位是均线、仓位还在浮盈」跟「止损是成本减 ATR、仓位已经亏钱」
+是两件性质完全不同的事，不能用同一个严重度。** 6 只真实持仓里：
+
+```
+        跌破幅度   盈亏      止损依据
+AMZN    0.17%     浮盈 8.3%   ma_20
+NVO     1.69%     浮盈 3.7%   ma_20
+GOOGL   1.06%     浮亏 5.0%   ma_20
+MP     10.86%    浮亏 19.0%   成本 - 2×ATR
+ORCL   13.80%    浮亏 19.8%   成本 - 2×ATR
+RKLB   13.11%    浮亏 23.3%   成本 - 2×ATR
+```
+
+AMZN 只是轻触均线、账面还赚 8.3%，跟 MP 那种已经深跌穿成本止损 10.86%、
+浮亏近两成的仓位，读起来不该是同一个「马上处理」。所以现在拆成两个 kind：
+
+- `stop_breached`：**仓位已经浮亏**时触发。这才是真正意义上的「止损被
+  击穿」——这笔交易已经错了，按纪律该走。严重度按跌破幅度分两档（深/浅），
+  界值是按上面这批真实数据的分布定的：跌破 ≥8% 判「深度击穿」（MP/ORCL/
+  RKLB 都在 10.86%~13.80%，明显该是最高档）；跌破 <8% 判「浅破但仍是
+  真亏损」（GOOGL 只跌破 1.06%，但已经是浮亏，不该跟浮盈的那两只同档，
+  又不该跟深度击穿的那三只同档）。
+- `trailing_stop_touched`：**仓位还在浮盈**、只是碰到了用来护盈利的移动
+  止损线，这是「该考虑落袋一部分利润了」，不是「这笔错了」。同样按跌破
+  幅度分两档，但整体严重度远低于 `stop_breached`（AMZN/NVO 分别是
+  0.17%/1.69%，都落在低档）。
+
+跟 `review_positions.py` 用的是同一套词汇习惯——那个工具已经区分了
+`stop_breached`（真击穿，严重度最高）和 `stop_breached_recovering`
+（已经站回均线，严重度降档）两档；这里的 `trailing_stop_touched` 是同一个
+「破位不等于都一样紧急」的思路在持仓盯盘这个场景下的对应物（触发条件不
+完全一样——那边看的是「有没有站回均线」，这边看的是「止损依据是不是均线
+且账面还在赚钱」——两个工具面对的判断条件本来就不同，不能照抄同一个
+kind 名，但严重度该拉开档位、破位不该无脑扣最高分，这个原则是一致的）。
+
+**坑三：止损依据就是 20 日均线时，不要再单独发一条「跌破 20 日均线」的
+告警**——那是同一件事。`position_stop()` 的 `basis` 只有两种取值：`ma_20`
+或 `成本 - 2×ATR`（没有 `ma_50` 这个选项），所以这个去重只会跟
+`below_ma20` 冲突，不会影响 `below_ma50`（那是独立的中期趋势信号）。
+
+## 突发消息：中性情绪不算「正面」，大盘综述不算个股专属
+
+**中性情绪不该被硬塞进「正面」。** 早期写法是「负面否则正面」的二分法，
+2026-08-30 实测抓到一个真实反例：一条 `sentiment_label=Neutral`、同时挂了
+8 只票（NVDA/MRVL/GOOGL/AMZN/AAPL/MSFT/META/TSLA）的科技股综述，被报成
+AMZN、GOOGL 的「重大正面消息」。现在补上 `neutral_news` 这一档：情绪中性
+的重大消息照样告诉用户「出了件大事」，但不替它编一个方向。
+
+**挂了很多只票的新闻是大盘综述，不是这只票的专属消息，直接不发这条。**
+`tools/detect_catalysts.py` 已经用真实分布定过这条线：实测近 7 天 759 条
+新闻，95.1% 挂在 6 只票以内，挂 7 只以上的抽查全是「大盘/行业综述」而非
+个股专属消息（`MARKET_WIDE_TICKER_COUNT = 7`）。这里直接复用同一个数字和
+同一条实测依据，不凭空另定一个阈值——上面那条 8 只票的综述，用这条线一过，
+自然就被过滤掉了，不需要额外再判断情绪。跟 `detect_catalysts.py` 不同的
+是：那个工具的定位是「出了什么事」，大盘综述本身有信息量，标出来但保留；
+这个工具的定位是「我这只仓位现在要不要处理」，一条泛大盘的宏观新闻不构成
+针对某一个具体仓位的处理理由，所以这里选择直接不发，而不是发出来再标注。
+
+## 「阶段新低」窗口跟文字要对得上
+
+早期实现里 SQL 窗口是 40 个自然日（约 27~28 个交易日），但告警文字曾经
+写的是「20 日新低」——文字和窗口对不上，用户会按字面理解成 20 个交易日。
+现在把 SQL 改成真正的「最近 20 根日线」（用 `row_number()` 按票分组取最近
+20 行，不是拍一个自然日窗口去近似），文字也相应写成「创 20 个交易日新
+低」，跟 `core/snapshot.py` 里 `high_20`（20 个交易日高点）的口径保持一致。
 
 ## 返回体大小有上限
 
@@ -77,14 +164,15 @@ from db import pg
 BIG_PREMIUM = 500_000
 
 #: 严重度。数字只用来排序。
+#: `stop_breached` / `trailing_stop_touched` 不在这里——它们的严重度按跌破
+#: 幅度动态算，见 `_stop_alert_severity()`，不是查这张表。
 SEVERITY = {
-    "stop_breached": 95,
     "below_ma50": 80,
     "earnings_soon": 75,
     "big_bearish_flow": 70,
+    "cn_outflow": 65,
     "below_ma20": 60,
     "new_low": 60,
-    "cn_outflow": 65,
     "lhb": 50,
     "big_bullish_flow": 45,
 }
@@ -94,6 +182,18 @@ EARNINGS_SOON_DAYS = 7
 
 #: alerts 最多返回这么多条。见模块 docstring「返回体大小有上限」。
 MAX_ALERTS = 50
+
+#: 一条新闻挂到这么多只票以上，就不是个股新闻而是大盘综述，直接不发。
+#: 数字和依据照抄 `tools/detect_catalysts.py` 的 `MARKET_WIDE_TICKER_COUNT`
+#: ——同一批新闻数据，同一天，同一个用户会同时用到两个工具，判据没道理不同。
+MARKET_WIDE_TICKER_COUNT = 7
+
+#: 止损告警严重度分档的跌破幅度界值。2026-08-30/31 用真实 6 只持仓的分布定的
+#: （见模块 docstring「止损告警」一节的表格）：MP/ORCL/RKLB 跌破 10.86%~
+#: 13.80%（且都是浮亏），明显该是最高档；GOOGL 只跌破 1.06%但也是浮亏；
+#: AMZN/NVO 跌破 0.17%/1.69%但还在浮盈。
+STOP_BREACH_DEEP_PCT = 8.0
+TRAILING_TOUCH_DEEP_PCT = 3.0
 
 _POSITIONS_SQL = """
 select ticker, market, avg_cost, shares,
@@ -122,12 +222,18 @@ where ticker = any(%s)
 group by ticker
 """
 
+# 真正的「最近 20 根日线」（按票分组、按日期倒排取前 20 行），不是拍一个
+# 自然日窗口去近似——这条踩过坑，见模块 docstring「阶段新低窗口」一节。
 _NEW_LOW_SQL = """
 select ticker, min(low) as low_20
-from stock_ohlcv_daily
-where ticker = any(%s)
-  and market = %s
-  and date >= current_date - 40
+from (
+    select ticker, low,
+           row_number() over (partition by ticker order by date desc) as rn
+    from stock_ohlcv_daily
+    where ticker = any(%s)
+      and market = %s
+) ranked
+where rn <= 20
 group by ticker
 """
 
@@ -143,14 +249,66 @@ def is_big_flow(row: dict, p90: float | None) -> bool:
     return False
 
 
-def _alert(ticker, kind, what, means, action) -> dict:
+def _stop_alert_severity(kind: str, breach_depth_pct: float) -> int:
+    """止损相关告警的严重度：跌破幅度越深越严重，且「止损被击穿」
+    （已经在浮亏）整体比「移动止损被触及」（还在浮盈）更严重。
+
+    界值和分档依据见模块 docstring「止损告警」一节——用 2026-08-30/31
+    六只真实持仓的分布定的，不是拍脑袋。
+    """
+    depth = abs(breach_depth_pct)
+    if kind == "stop_breached":
+        return 95 if depth >= STOP_BREACH_DEEP_PCT else 75
+    # trailing_stop_touched
+    return 55 if depth >= TRAILING_TOUCH_DEEP_PCT else 40
+
+
+def _uw_live_direction(item: dict) -> str | None:
+    """从一条 `/api/alerts` 实时警报里判断方向：看涨还是看跌。
+
+    这个接口不像 `flow_alerts_archive` 那样直接给 `sentiment` 字段，但给了
+    期权合约代码（能解出 call/put）和 `meta` 里的 `ask_volume`/`bid_volume`
+    （在卖价成交的量 vs 在买价成交的量）。用跟 `core/uw.split_premium()`
+    判断 `flow_alerts_archive` 期权异动方向**同一套逻辑**：在卖价成交=
+    买方主动，在买价成交=卖方主动；买看涨=看多、卖看涨=看空、买看跌=看空、
+    卖看跌=看多。
+
+    解不出合约类型、或者拿不到/两边打平分不出谁占优时返回 None——
+    不知道就说不知道，不猜一个方向出来（见模块 docstring）。
+    """
+    symbol = item.get("symbol")
+    # OCC 合约代码：股票代码 + 6 位到期日 + C/P + 8 位行权价，
+    # 后缀（到期日+C/P+行权价）固定 15 位，第 7 个字符（索引 6）是 C/P。
+    if not symbol or len(symbol) <= 15:
+        return None
+    tail = symbol[-15:]
+    kind = {"C": "call", "P": "put"}.get(tail[6])
+    if kind is None:
+        return None
+
+    meta = item.get("meta") or {}
+    ask_vol, bid_vol = meta.get("ask_volume"), meta.get("bid_volume")
+    if ask_vol is None or bid_vol is None:
+        return None
+    try:
+        ask_vol, bid_vol = float(ask_vol), float(bid_vol)
+    except (TypeError, ValueError):
+        return None
+
+    up, down = uw.split_premium(kind, ask_vol, bid_vol)
+    if up == down:
+        return None
+    return "bullish" if up > down else "bearish"
+
+
+def _alert(ticker, kind, what, means, action, severity: int | None = None) -> dict:
     return {
         "ticker": ticker,
         "kind": kind,
         "what_happened": what,
         "what_it_means": means,
         "suggested_action": action,
-        "severity": SEVERITY.get(kind, 30),
+        "severity": severity if severity is not None else SEVERITY.get(kind, 30),
     }
 
 
@@ -174,13 +332,19 @@ def _freshness_warnings(market: str, fresh: dict) -> list[str]:
 def watch_positions(hours: int = 24) -> str:
     """我的持仓上有没有需要立刻处理的信号。
 
-    四路一起看：价格触发（跌破均线、跌破止损、创 20 日新低）、财报临近、
-    期权异动（A股换成主力资金和龙虎榜）、突发消息，外加 UW 实时警报流里
-    命中持仓的部分。
+    四路一起看：价格触发（跌破均线、跌破止损、创 20 个交易日新低）、
+    财报临近、期权异动（A股换成主力资金和龙虎榜）、突发消息，外加 UW
+    实时警报流里命中持仓的部分。
 
     **没事就说没事**——不触发就返回空列表加一句话，不制造噪音。
     每条告警都会说清楚：发生了什么、对你的仓位意味着什么、建议怎么处理。
     同一只票的多笔期权异动会合并成一条，不会因为一只票交易活跃就刷屏。
+
+    止损相关的告警分两种、严重度按跌破幅度分档，不是固定分：`stop_breached`
+    是仓位已经浮亏时的真实破位（跌破越深分越高）；`trailing_stop_touched`
+    是仓位还在浮盈、只是碰到了用来护盈利的移动止损线（整体严重度远低于
+    前者）。止损依据本来就是 20 日均线时，不会重复再发一条「跌破 20 日
+    均线」。详见模块 docstring「止损告警」一节。
 
     价格触发和财报临近不依赖任何外部接口，UW 那两路（期权异动、实时警报）
     挂了不连累其它路，会在 `checked_sources` 里少一项、在 `data_gaps`
@@ -251,34 +415,44 @@ def watch_positions(hours: int = 24) -> str:
             close = snap["close"]
             currency = currency_of[ticker]
             stop = scoring.position_stop(cost_of[ticker], snap)
+            # 止损依据就是 20 日均线、且这条已经发过告警时，跌破 20 日均线
+            # 是同一件事，不再单独重复一条（模块 docstring「坑三」）
+            suppress_below_ma20 = False
             if stop.get("breached"):
                 pnl = (close - cost_of[ticker]) * shares_of[ticker]
-                # 触发这条不等于亏钱：均线在成本上方时止损本来就抬到了均线上
-                # （护浮盈），这时候破位是「浮盈还在，但保护线没了」，不是
-                # 「浮亏了」。原来这里不分青红皂白一律印「浮亏 {loss}」，
-                # 浮盈时会把正数印成「浮亏 204」——把赚钱的仓位说成在亏钱，
-                # 是会让人恐慌割肉的那种误导（2026-08-30 实测：AMZN 浮盈
-                # 204 USD 时曾被报成「浮亏 204 USD」，NVO 同理）。
+                depth = abs(stop.get("distance_pct") or 0.0)
+                # 均线在成本上方时止损本来就抬到了均线上（护浮盈），这时候
+                # 破位是「浮盈还在，但保护线没了」，不是「亏钱了」——两者
+                # 对交易者的含义完全不同，必须用不同的 kind、不同的措辞和
+                # 不同的严重度区分开（模块 docstring「止损告警」一节）
                 if pnl >= 0:
+                    kind = "trailing_stop_touched"
                     pnl_text = (f"这笔仓位现在还是浮盈 {pnl:.0f} {currency}，"
                                "但价格已经跌破了用来锁定利润的止损线")
+                    action = ("考虑先落袋一部分利润，或者把止损重新定在一个"
+                              "你能接受的位置；这不是「这笔交易错了」，"
+                              "不必马上清仓")
                 else:
+                    kind = "stop_breached"
                     pnl_text = (f"这笔仓位当前浮亏 {abs(pnl):.0f} {currency}，"
                                "已经跌出了当初设的容错范围")
+                    action = ("按纪律该减仓或清掉。要留就得说清楚新的止损"
+                              "放哪、为什么这次不一样")
                 alerts.append(_alert(
-                    ticker, "stop_breached",
+                    ticker, kind,
                     f"现价 {close} 跌破了建议止损位 {stop['suggested_stop']}"
-                    f"（依据：{stop['basis']}）",
-                    pnl_text,
-                    "按纪律该减仓或清掉。要留就得说清楚新的止损放哪、"
-                    "为什么这次不一样"))
+                    f"（依据：{stop['basis']}，跌破幅度 {depth:.2f}%）",
+                    pnl_text, action,
+                    severity=_stop_alert_severity(kind, depth)))
+                if stop.get("basis") == "ma_20":
+                    suppress_below_ma20 = True
             if snap.get("above_ma50") is False:
                 alerts.append(_alert(
                     ticker, "below_ma50",
                     f"跌破 50 日均线（{snap['ma_50']}）",
                     "中期趋势转弱了，波段的多头依据没了",
                     "波段仓位考虑离场；要留就当成中线仓，重新定止损"))
-            elif snap.get("above_ma20") is False:
+            elif snap.get("above_ma20") is False and not suppress_below_ma20:
                 alerts.append(_alert(
                     ticker, "below_ma20",
                     f"跌破 20 日均线（{snap['ma_20']}）",
@@ -288,7 +462,7 @@ def watch_positions(hours: int = 24) -> str:
             if low_20 is not None and close is not None and close <= low_20:
                 alerts.append(_alert(
                     ticker, "new_low",
-                    f"创阶段新低（{close}）",
+                    f"创 20 个交易日新低（{close}）",
                     "没有买盘接，下跌还在延续",
                     "别在下跌途中摊平成本，先等企稳信号"))
 
@@ -371,7 +545,8 @@ def watch_positions(hours: int = 24) -> str:
             except Exception as exc:
                 gaps.append(f"龙虎榜拉取失败：{exc}")
 
-        # ---- 第四路：突发消息 ----
+        # ---- 第四路：突发消息。中性情绪不算正面；挂票数够多的大盘综述
+        # 不算这只仓位的专属消息，直接不发（模块 docstring 有详细说明）----
         try:
             news = catalyst.news_for(all_tickers, days=max(1, hours // 24),
                                      min_significance="High", per_ticker=1)
@@ -379,37 +554,94 @@ def watch_positions(hours: int = 24) -> str:
                 sources.append("news")
             for ticker, items in news.items():
                 for item in items:
-                    negative = (item.get("sentiment_label") or "").lower() == "negative"
+                    if len(item.get("tickers") or []) >= MARKET_WIDE_TICKER_COUNT:
+                        continue  # 大盘综述，不是这只票的专属消息
+                    label = (item.get("sentiment_label") or "").lower()
+                    if label == "negative":
+                        kind, tag, means = ("bad_news", "负面",
+                                            "重大消息通常会改变这只票未来"
+                                            "几天的走势方向")
+                    elif label == "positive":
+                        kind, tag, means = ("good_news", "正面",
+                                            "重大消息通常会改变这只票未来"
+                                            "几天的走势方向")
+                    else:
+                        # 情绪中性（或缺失）：告诉用户出了件大事，但不替
+                        # 它编一个正面/负面的方向（模块 docstring 有真实
+                        # 案例：一条中性、挂 8 只票的综述曾被报成「正面」）
+                        kind, tag, means = ("neutral_news", "",
+                                            "这条消息的情绪判断是中性的，"
+                                            "没有明确指向利好还是利空，"
+                                            "自己看一眼原文再判断")
                     alerts.append(_alert(
-                        ticker, "bad_news" if negative else "good_news",
-                        f"重大{'负面' if negative else '正面'}消息：{item['title']}",
-                        "重大消息通常会改变这只票未来几天的走势方向",
+                        ticker, kind,
+                        f"重大{tag}消息：{item['title']}" if tag
+                        else f"重大消息（情绪中性）：{item['title']}",
+                        means,
                         "先看股价反应过了没有——已经跳完的消息不用再动作；"
                         "还没反应的才需要决定"))
         except Exception as exc:
             gaps.append(f"消息拉取失败：{exc}")
 
-        # ---- UW 实时警报：解出标的再跟持仓比对，同一只票多条规则合并成一条 ----
+        # ---- UW 实时警报：解出标的、解方向，同一只票多条规则合并成一条 ----
         try:
             if uw.available():
                 live = uw.alerts(limit=100)
                 if live is not None:
                     sources.append("uw_alerts")
                     held = set(all_tickers)
-                    rules_by_ticker: dict[str, list[str]] = {}
+                    # ticker -> {"bullish": [规则名...], "bearish": [...],
+                    #            "unknown": [...]}
+                    grouped: dict[str, dict[str, list[str]]] = {}
                     for item in live:
                         underlying = uw.underlying_of(item)
-                        if underlying and underlying in held:
-                            name = item.get("name") or item.get("noti_type") or "?"
-                            rules_by_ticker.setdefault(underlying, [])
-                            if name not in rules_by_ticker[underlying]:
-                                rules_by_ticker[underlying].append(name)
-                    for ticker, names in rules_by_ticker.items():
-                        alerts.append(_alert(
-                            ticker, "big_bullish_flow",
-                            f"实时警报触发：{'、'.join(names)}",
-                            "你配置的扫描规则在这只持仓上触发了",
-                            "去 Unusual Whales 看这条警报的细节再决定"))
+                        if not underlying or underlying not in held:
+                            continue
+                        name = item.get("name") or item.get("noti_type") or "?"
+                        direction = _uw_live_direction(item) or "unknown"
+                        bucket = grouped.setdefault(
+                            underlying, {"bullish": [], "bearish": [],
+                                        "unknown": []})
+                        if name not in bucket[direction]:
+                            bucket[direction].append(name)
+
+                    for ticker, buckets in grouped.items():
+                        bullish, bearish, unknown = (buckets["bullish"],
+                                                     buckets["bearish"],
+                                                     buckets["unknown"])
+                        if bullish and not bearish:
+                            kind, names = "big_bullish_flow", bullish
+                        elif bearish and not bullish:
+                            kind, names = "big_bearish_flow", bearish
+                        else:
+                            # 方向不明（拿不到 ask/bid 量、解不出合约类型），
+                            # 或者同一只票里既有看多又有看空的规则，方向
+                            # 说不清——不猜，如实说不知道
+                            kind = None
+                            names = bullish + bearish + unknown
+                            gaps.append(
+                                f"{ticker} 的 UW 实时警报方向判断不了"
+                                f"（{len(unknown)} 条缺方向数据"
+                                + (f"，{len(bullish)} 条看多、"
+                                   f"{len(bearish)} 条看空，方向不统一"
+                                   if bullish or bearish else "") + "）")
+
+                        if kind:
+                            alerts.append(_alert(
+                                ticker, kind,
+                                f"实时警报触发：{'、'.join(names)}",
+                                "你配置的扫描规则在这只持仓上触发了，"
+                                "解出来的期权方向是"
+                                + ("看多" if kind == "big_bullish_flow" else "看空"),
+                                "去 Unusual Whales 看这条警报的细节再决定"))
+                        else:
+                            alerts.append(_alert(
+                                ticker, "uw_alert_direction_unknown",
+                                f"实时警报触发但方向判断不了：{'、'.join(names)}",
+                                "你配置的扫描规则触发了，但这批数据没法"
+                                "确定是偏多还是偏空",
+                                "去 Unusual Whales 看这条警报的细节，"
+                                "自己判断方向"))
         except Exception as exc:
             gaps.append(f"UW 实时警报拉取失败：{exc}")
 

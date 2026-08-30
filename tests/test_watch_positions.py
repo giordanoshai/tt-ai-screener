@@ -120,8 +120,9 @@ def test_price_snapshot_failing_does_not_crash_the_tool_or_hide_other_sources(
     assert any("行情快照拉取失败" in g for g in out["data_gaps"])
     assert "options_flow" in out["checked_sources"]
     # 没有快照，价格触发那几种告警一条都不该出现
-    assert not any(a["kind"] in ("stop_breached", "below_ma20", "below_ma50",
-                                 "new_low") for a in out["alerts"])
+    assert not any(a["kind"] in ("stop_breached", "trailing_stop_touched",
+                                 "below_ma20", "below_ma50", "new_low")
+                  for a in out["alerts"])
 
 
 def test_earnings_source_failing_is_isolated(monkeypatch):
@@ -158,6 +159,44 @@ def test_uw_unavailable_is_excluded_from_sources_without_error(monkeypatch):
     assert "error" not in out
     assert "uw_alerts" not in out["checked_sources"]
     assert "price" in out["checked_sources"]
+
+
+def test_regime_freshness_failure_is_isolated_and_still_lets_other_data_through(
+        monkeypatch):
+    """`regime.freshness()` 自己挂了（比如 ingest_runlog 查询超时）：
+    不该报错，要写进 data_gaps，其它数据照常给。"""
+    def boom(market):
+        raise RuntimeError("模拟新鲜度检测失败")
+
+    monkeypatch.setattr(wp.regime, "freshness", boom)
+    out = run()
+    assert "error" not in out
+    assert any("行情新鲜度检测失败" in g for g in out["data_gaps"])
+    assert out["checked"] > 0
+
+
+def test_cn_signal_source_failure_is_isolated_from_us_sources(monkeypatch):
+    """A股那两条路径挂了，不该连累美股那几条已经拿到的结果。"""
+    real_query = wp.pg.query
+
+    def fake_query(sql, params=None):
+        if "from user_positions" in sql:
+            return [{"ticker": "600378.SH", "market": "CN",
+                     "avg_cost": 10.0, "shares": 100.0, "currency": "CNY"},
+                    {"ticker": "AMZN", "market": "US",
+                     "avg_cost": 246.0, "shares": 10.0, "currency": "USD"}]
+        return real_query(sql, params)
+
+    def boom(tickers):
+        raise RuntimeError("模拟 A股主力资金拉取失败")
+
+    monkeypatch.setattr(wp.pg, "query", fake_query)
+    monkeypatch.setattr(wp.cn_signals, "fund_flow", boom)
+    out = run()
+    assert "error" not in out
+    assert any("A股主力资金拉取失败" in g for g in out["data_gaps"])
+    assert "options_flow" in out["checked_sources"], (
+        "A股那一路挂了，美股期权异动这一路不该被连累")
 
 
 # ---------------- 采集陈旧 / 失败 / 半途 三种警告，各自能真的被测到 ----------------
@@ -221,8 +260,7 @@ def test_failed_and_partial_job_warnings_reach_the_tool_output(monkeypatch):
 
 def test_failed_job_warning_is_backed_by_real_ingest_runlog():
     """用今天真实的 ingest_runlog 验证，不是只测纯函数。查不到失败任务就
-    跳过并说明原因，不放松断言（2026-08-30 实测 US 确实有
-    us_news(failed)，这条今天应该真的跑到断言那一行，不会跳过）。"""
+    跳过并说明原因，不放松断言。"""
     from core import regime
 
     fresh = regime.freshness("US")  # 6 只持仓全是美股
@@ -244,28 +282,98 @@ def test_partial_job_warning_is_backed_by_real_ingest_runlog():
     assert any("采集任务只跑了一半" in w for w in out["warnings"])
 
 
-def test_regime_freshness_failure_is_isolated_and_still_lets_other_data_through(
-        monkeypatch):
-    """`regime.freshness()` 自己挂了（比如 ingest_runlog 查询超时）：
-    不该报错，要写进 data_gaps，其它数据照常给。"""
-    def boom(market):
-        raise RuntimeError("模拟新鲜度检测失败")
+# ---------------- 修复轮1 / 一：止损告警严重度按跌破幅度分档，不是定值 ----------------
 
-    monkeypatch.setattr(wp.regime, "freshness", boom)
+def test_stop_alert_severity_is_not_a_constant():
+    """纯函数：跌破越深越严重，且'止损被击穿'(浮亏中)整体比
+    '移动止损被触及'(浮盈中)更严重。"""
+    deep_breach = wp._stop_alert_severity("stop_breached", 10.0)
+    shallow_breach = wp._stop_alert_severity("stop_breached", 1.0)
+    deep_touch = wp._stop_alert_severity("trailing_stop_touched", 5.0)
+    shallow_touch = wp._stop_alert_severity("trailing_stop_touched", 1.0)
+
+    assert deep_breach > shallow_breach, "跌破越深应该越严重，不能是定值"
+    assert shallow_breach > deep_touch, (
+        "'止损被击穿'（真亏钱）哪怕只是浅破，也该比'移动止损被触及'（还在赚钱）"
+        "的深档更严重——两者不是同一件事")
+    assert deep_touch > shallow_touch
+
+
+def test_stop_breach_severity_scales_with_real_breach_depth_and_pnl_sign():
+    """用真实持仓独立算一遍：严重度必须真的随跌破幅度和盈亏方向变化，
+    不能是抄回同一个定值。今天的 6 只真实持仓分布：MP/ORCL/RKLB 深度击穿
+    （浮亏中），GOOGL 浅破但也浮亏，AMZN/NVO 只是移动止损被触及（还在浮
+    盈）——一个浮盈只是轻触均线的仓位，严重度必须低于一个浮亏且远远跌穿
+    止损的仓位（协调者原话）。"""
+    from core import scoring
+    from core import snapshot as snap_mod
+    from db import pg
+
+    positions = pg.query("select ticker, market, avg_cost, shares "
+                         "from user_positions")
     out = run()
-    assert "error" not in out
-    assert any("行情新鲜度检测失败" in g for g in out["data_gaps"])
-    assert out["checked"] > 0
+    by_key = {(a["ticker"], a["kind"]): a for a in out["alerts"]
+             if a["kind"] in ("stop_breached", "trailing_stop_touched")}
+
+    # (跌破幅度, 严重度, kind)，分浮盈/浮亏两桶，用来做协调者要求的
+    # 那个直接比较：浮盈里最浅的 vs 浮亏里最深的。
+    touched, breached = [], []
+    checked = 0
+    for pos in positions:
+        snap = snap_mod.get([pos["ticker"]], pos["market"]).get(pos["ticker"])
+        if not snap or snap.get("close") is None:
+            continue
+        stop = scoring.position_stop(float(pos["avg_cost"]), snap)
+        if not stop.get("breached"):
+            continue
+        pnl = ((snap["close"] - float(pos["avg_cost"]))
+              * float(pos["shares"]))
+        expected_kind = "trailing_stop_touched" if pnl >= 0 else "stop_breached"
+        alert = by_key.get((pos["ticker"], expected_kind))
+        assert alert is not None, (
+            f"{pos['ticker']} 应该有一条 {expected_kind} 告警")
+        depth = abs(stop["distance_pct"])
+        expected_severity = wp._stop_alert_severity(expected_kind, depth)
+        assert alert["severity"] == expected_severity, (
+            f"{pos['ticker']} 严重度应该是 {expected_severity}"
+            f"（{expected_kind}，跌破 {depth:.2f}%），实际是 {alert['severity']}")
+        (touched if expected_kind == "trailing_stop_touched" else breached).append(
+            (depth, alert["severity"]))
+        checked += 1
+
+    assert checked > 0, "今天应该真的有票触发止损相关告警（6 只持仓一直都有）"
+    severities = {a["severity"] for a in by_key.values()}
+    assert len(severities) > 1, (
+        "止损相关告警的严重度全都一样，说明分档没有真正生效")
+
+    if touched and breached:
+        shallowest_touch_severity = min(touched, key=lambda t: t[0])[1]
+        deepest_breach_severity = max(breached, key=lambda t: t[0])[1]
+        assert shallowest_touch_severity < deepest_breach_severity, (
+            f"浮盈中只是轻触均线的严重度（{shallowest_touch_severity}）应该"
+            f"低于浮亏中远远跌穿止损的严重度（{deepest_breach_severity}）")
 
 
-# ---------------- 止损告警：浮盈/浮亏的措辞必须跟真实盈亏方向一致 ----------------
+def test_no_duplicate_below_ma20_when_stop_basis_is_ma20():
+    """止损依据就是 20 日均线时，不该再单独发一条「跌破 20 日均线」——
+    那是同一件事。今天真实数据里至少有一只票的止损依据是 ma_20。"""
+    out = run()
+    ma20_stop_tickers = {a["ticker"] for a in out["alerts"]
+                         if a["kind"] in ("stop_breached", "trailing_stop_touched")
+                         and "依据：ma_20" in a["what_happened"]}
+    if not ma20_stop_tickers:
+        pytest.skip("今天没有票的止损依据正好是 ma_20，测不出这条去重")
+    below_ma20_tickers = {a["ticker"] for a in out["alerts"]
+                          if a["kind"] == "below_ma20"}
+    assert not (ma20_stop_tickers & below_ma20_tickers), (
+        f"{ma20_stop_tickers & below_ma20_tickers} 同时出现了基于 ma_20 的"
+        "止损告警和单独的跌破 20 日均线告警，这是同一件事被算成了两条")
+
 
 def test_stop_breach_pnl_wording_matches_the_real_sign():
-    """2026-08-30 实测抓到的真 bug：止损破位不等于亏钱——均线在成本上方时
-    止损本来就抬到均线（护浮盈），这时候破位是「浮盈还在但保护线没了」。
-    早期写法一律印「浮亏 {数字}」，把 AMZN 当天浮盈 204 美元印成
-    「浮亏 204 USD」，把真亏钱的几只印成「浮亏 -184 USD」这种双重负号。
-    这里独立算一遍真实盈亏（不复用被测代码的算法），核对文案措辞。"""
+    """`stop_breached` 只在浮亏时出现，措辞必须是「浮亏」且不带负号；
+    `trailing_stop_touched` 只在浮盈时出现，措辞必须是「浮盈」。
+    独立算一遍真实盈亏（不复用被测代码的算法）核对。"""
     from core import snapshot as snap_mod
     from db import pg
 
@@ -275,7 +383,7 @@ def test_stop_breach_pnl_wording_matches_the_real_sign():
     out = run()
     checked = 0
     for alert in out["alerts"]:
-        if alert["kind"] != "stop_breached":
+        if alert["kind"] not in ("stop_breached", "trailing_stop_touched"):
             continue
         pos = positions.get(alert["ticker"])
         if not pos:
@@ -291,12 +399,273 @@ def test_stop_breach_pnl_wording_matches_the_real_sign():
             f"{alert['ticker']} 盈亏描述里不该出现负号（双重负号读着费解）："
             f"{text}")
         if pnl >= 0:
-            assert "浮盈" in text and "浮亏" not in text, (
-                f"{alert['ticker']} 实际浮盈 {pnl:.0f}，文案却说：{text}")
+            assert alert["kind"] == "trailing_stop_touched", (
+                f"{alert['ticker']} 实际浮盈 {pnl:.0f}，"
+                f"不该被归为 stop_breached")
+            assert "浮盈" in text and "浮亏" not in text
         else:
-            assert "浮亏" in text and "浮盈" not in text, (
-                f"{alert['ticker']} 实际浮亏 {pnl:.0f}，文案却说：{text}")
-    assert checked > 0, "样本里应该真的核对到至少一条止损告警（今天 6 只持仓都有）"
+            assert alert["kind"] == "stop_breached", (
+                f"{alert['ticker']} 实际浮亏 {pnl:.0f}，"
+                f"不该被归为 trailing_stop_touched")
+            assert "浮亏" in text and "浮盈" not in text
+    assert checked > 0, "样本里应该真的核对到至少一条止损相关告警（今天 6 只持仓都有）"
+
+
+# ---------------- 修复轮1 / 二：UW 实时警报的方向不能瞎猜 ----------------
+
+# 2026-08-30 真实抓到的样本：GOOGL 的 Stealth Accumulation Scanner，
+# 期权是 PUT，ask_volume(1741) 远大于 bid_volume(636)——买方在追价买入
+# 看跌期权，是看空；早期写法不管三七二十一一律标成「看多」，方向反了。
+_REAL_UW_PUT_SAMPLE = {
+    "meta": {"ask_volume": 1741, "bid_volume": 636, "total_premium": "592304"},
+    "name": "Stealth Accumulation Scanner",
+    "symbol": "GOOGL260831P00347500",
+}
+
+
+def test_uw_live_direction_reads_bearish_from_real_captured_sample():
+    assert wp._uw_live_direction(_REAL_UW_PUT_SAMPLE) == "bearish"
+
+
+def test_uw_live_direction_call_ask_heavy_is_bullish():
+    """买看涨 = 看多：在卖价成交、且是看涨期权。"""
+    assert wp._uw_live_direction(
+        {"symbol": "AAPL260831C00347500",
+         "meta": {"ask_volume": 1000, "bid_volume": 100}}) == "bullish"
+
+
+def test_uw_live_direction_call_bid_heavy_is_bearish():
+    """卖看涨 = 看空：在买价成交、且是看涨期权。"""
+    assert wp._uw_live_direction(
+        {"symbol": "AAPL260831C00347500",
+         "meta": {"ask_volume": 100, "bid_volume": 1000}}) == "bearish"
+
+
+def test_uw_live_direction_put_bid_heavy_is_bullish():
+    """卖看跌 = 看多：在买价成交、且是看跌期权。"""
+    assert wp._uw_live_direction(
+        {"symbol": "AAPL260831P00347500",
+         "meta": {"ask_volume": 100, "bid_volume": 1000}}) == "bullish"
+
+
+def test_uw_live_direction_unresolvable_cases_return_none_not_a_guess():
+    """解不出来就说不知道，不猜一个方向。"""
+    assert wp._uw_live_direction({"symbol": None, "meta": {}}) is None
+    assert wp._uw_live_direction(
+        {"symbol": "AAPL", "meta": {"ask_volume": 1, "bid_volume": 1}}) is None
+    assert wp._uw_live_direction(
+        {"symbol": "AAPL260831P00347500", "meta": {}}) is None
+    assert wp._uw_live_direction(
+        {"symbol": "AAPL260831P00347500",
+         "meta": {"ask_volume": 500, "bid_volume": 500}}) is None
+
+
+def test_uw_live_alert_uses_resolved_direction_not_hardcoded_bullish(
+        monkeypatch):
+    """早期 bug：不管三七二十一一律标 big_bullish_flow。真实样本
+    （PUT，ask 远大于 bid = 买方追价买看跌 = 看空）应该被判成
+    big_bearish_flow，不是 big_bullish_flow。"""
+    from db import pg
+
+    held = [r["ticker"] for r in pg.query("select ticker from user_positions")]
+    if not held:
+        pytest.skip("没有持仓，测不出这条")
+    target = held[0]
+    fake_item = {
+        "symbol": f"{target}260831P00347500",
+        "meta": {"underlying_symbol": target,
+                 "ask_volume": 1741, "bid_volume": 636},
+        "name": "Stealth Accumulation Scanner",
+    }
+    monkeypatch.setattr(wp.uw, "available", lambda: True)
+    monkeypatch.setattr(wp.uw, "alerts", lambda limit=100: [fake_item])
+    out = run()
+    matched = [a for a in out["alerts"] if a["ticker"] == target
+              and "实时警报触发" in a["what_happened"]]
+    assert len(matched) == 1
+    assert matched[0]["kind"] == "big_bearish_flow", (
+        f"PUT 且 ask 远大于 bid 是看空，不该被标成 {matched[0]['kind']}")
+
+
+def test_uw_live_alert_direction_unknown_is_reported_not_guessed(monkeypatch):
+    """方向解不出来时（比如拿不到 ask_volume/bid_volume），不该硬套一个
+    看多/看空的 kind，要如实说不知道并写进 data_gaps。"""
+    from db import pg
+
+    held = [r["ticker"] for r in pg.query("select ticker from user_positions")]
+    if not held:
+        pytest.skip("没有持仓，测不出这条")
+    target = held[0]
+    fake_item = {
+        "symbol": f"{target}260831P00347500",
+        "meta": {"underlying_symbol": target},  # 没有 ask_volume/bid_volume
+        "name": "Some Custom Rule",
+    }
+    monkeypatch.setattr(wp.uw, "available", lambda: True)
+    monkeypatch.setattr(wp.uw, "alerts", lambda limit=100: [fake_item])
+    out = run()
+    matched = [a for a in out["alerts"] if a["ticker"] == target
+              and a["kind"] == "uw_alert_direction_unknown"]
+    assert len(matched) == 1
+    assert "方向判断不了" in matched[0]["what_happened"]
+    assert any("方向判断不了" in g for g in out["data_gaps"])
+    assert not any(a["ticker"] == target
+                  and a["kind"] in ("big_bullish_flow", "big_bearish_flow")
+                  and "实时警报触发" in a["what_happened"]
+                  for a in out["alerts"]), (
+        "方向解不出来时不该被误标成看多或看空（注意：这只票可能另外还有"
+        "来自期权异动那一路、不相关的 big_bullish_flow/big_bearish_flow，"
+        "这里只查 UW 实时警报这一条，用 '实时警报触发' 文案区分）")
+
+
+# ---------------- 修复轮1 / 三：中性消息不算正面；大盘综述不算个股专属 ----------------
+
+def test_neutral_news_gets_its_own_kind_not_labeled_positive(monkeypatch):
+    from db import pg
+
+    held = [r["ticker"] for r in pg.query("select ticker from user_positions")]
+    if not held:
+        pytest.skip("没有持仓，测不出这条")
+    target = held[0]
+
+    def fake_news_for(tickers, days, min_significance, per_ticker):
+        return {target: [{"title": "某中性大新闻", "sentiment_label": "Neutral",
+                          "significant": "High", "tickers": [target]}]}
+
+    monkeypatch.setattr(wp.catalyst, "news_for", fake_news_for)
+    out = run()
+    matched = [a for a in out["alerts"] if a["ticker"] == target
+              and "某中性大新闻" in a["what_happened"]]
+    assert len(matched) == 1
+    assert matched[0]["kind"] == "neutral_news"
+    assert matched[0]["kind"] not in ("good_news", "bad_news")
+
+
+def test_market_wide_news_is_not_reported_as_position_specific(monkeypatch):
+    """挂票数够多（>= MARKET_WIDE_TICKER_COUNT）的新闻是大盘综述，不是
+    这只票的专属消息，直接不发。"""
+    from db import pg
+
+    held = [r["ticker"] for r in pg.query("select ticker from user_positions")]
+    if not held:
+        pytest.skip("没有持仓，测不出这条")
+    target = held[0]
+    wide_tickers = [target] + [f"FAKE{i}" for i in
+                               range(wp.MARKET_WIDE_TICKER_COUNT)]
+
+    def fake_news_for(tickers, days, min_significance, per_ticker):
+        return {target: [{"title": "大盘综述新闻", "sentiment_label": "Positive",
+                          "significant": "High", "tickers": wide_tickers}]}
+
+    monkeypatch.setattr(wp.catalyst, "news_for", fake_news_for)
+    out = run()
+    assert not any("大盘综述新闻" in a["what_happened"] for a in out["alerts"])
+
+
+def test_market_wide_threshold_matches_detect_catalysts_not_a_new_number():
+    """这个阈值照抄 detect_catalysts.py 的 MARKET_WIDE_TICKER_COUNT，
+    不是凭空另定的数——同一批新闻数据，同一天，判据不该不一样。"""
+    from tools import detect_catalysts as dc
+    assert wp.MARKET_WIDE_TICKER_COUNT == dc.MARKET_WIDE_TICKER_COUNT
+
+
+def test_real_neutral_market_wide_news_does_not_become_good_news():
+    """2026-08-30 真实抓到的案例：一条 Neutral、挂 8 只票的科技股综述曾被
+    报成 AMZN/GOOGL 的「重大正面消息」。用真实数据核对这个具体场景已经
+    修好——它现在应该完全不出现在 good_news/bad_news 里（要么被挡在
+    大盘综述这道过滤，要么就算漏网也该归到 neutral_news 而不是
+    good_news）。"""
+    held_rows = json.loads(wp.watch_positions())  # 触发一次，顺带拿 checked
+    from db import pg
+
+    held = [r["ticker"] for r in pg.query("select ticker from user_positions")]
+    wide_neutral_titles = set()
+    for ticker in held:
+        for item in wp.catalyst.news_for(
+                [ticker], days=1, min_significance="High",
+                per_ticker=3).get(ticker, []):
+            if (item.get("sentiment_label") == "Neutral"
+                    and len(item.get("tickers") or [])
+                    >= wp.MARKET_WIDE_TICKER_COUNT):
+                wide_neutral_titles.add(item["title"])
+    if not wide_neutral_titles:
+        pytest.skip("今天没有满足「中性+大盘综述」条件的真实新闻，"
+                   "测不出这个具体场景")
+    out = run()
+    good_bad_titles = {a["what_happened"].split("：", 1)[-1]
+                       for a in out["alerts"]
+                       if a["kind"] in ("good_news", "bad_news")}
+    assert not (wide_neutral_titles & good_bad_titles), (
+        f"{wide_neutral_titles & good_bad_titles} 这些中性大盘综述"
+        "不该被报成正面/负面消息")
+
+
+# ---------------- 修复轮1 / 四：「20 交易日新低」窗口要跟文字对得上 ----------------
+
+def test_new_low_window_matches_a_real_20_trading_day_low():
+    """SQL 窗口现在是真正的最近 20 根日线，不是 40 个自然日的近似
+    ——独立按票查最近 20 行验证数值对得上。"""
+    from db import pg
+
+    held = [r["ticker"] for r in
+           pg.query("select ticker from user_positions where market='US'")]
+    if not held:
+        pytest.skip("没有美股持仓")
+    rows = {r["ticker"]: r["low_20"]
+           for r in pg.query(wp._NEW_LOW_SQL, (held, "US"))}
+    checked = 0
+    for ticker in held:
+        manual = pg.query(
+            "select low from stock_ohlcv_daily where ticker=%s "
+            "and market='US' order by date desc limit 20", (ticker,))
+        if not manual or ticker not in rows:
+            continue
+        expected = min(r["low"] for r in manual)
+        assert abs(rows[ticker] - expected) < 1e-6, (
+            f"{ticker} 的 20 交易日最低价算出来是 {rows[ticker]}，"
+            f"手工核对应该是 {expected}")
+        checked += 1
+    assert checked > 0, "没有核对到任何一只票，这条测试测不出东西"
+
+
+def test_new_low_alert_fires_with_correct_wording_on_a_real_qualifying_ticker(
+        monkeypatch):
+    """找一只真实数据里今天确实创了 20 交易日新低的票，验证告警文字
+    跟真实窗口对得上（不再是「20 日新低」这种跟旧的 40 自然日窗口对不上
+    的文案）。"""
+    from db import pg as real_pg_mod
+
+    candidates = real_pg_mod.query("""
+        with recent as (
+          select ticker, low, close, date,
+                 row_number() over (partition by ticker order by date desc) as rn
+          from stock_ohlcv_daily where market = 'US'
+        )
+        select r1.ticker
+        from recent r1
+        join (select ticker, min(low) as low_20 from recent
+             where rn <= 20 group by ticker) m on m.ticker = r1.ticker
+        where r1.rn = 1 and r1.close <= m.low_20 and r1.close > 1
+        limit 1
+    """)
+    if not candidates:
+        pytest.skip("今天没有真实票创 20 交易日新低，测不出这条告警")
+    target = candidates[0]["ticker"]
+
+    original_query = wp.pg.query
+
+    def fake_query(sql, params=None):
+        if "from user_positions" in sql:
+            return [{"ticker": target, "market": "US", "avg_cost": 1.0,
+                     "shares": 1.0, "currency": "USD"}]
+        return original_query(sql, params)
+
+    monkeypatch.setattr(wp.pg, "query", fake_query)
+    out = run()
+    matched = [a for a in out["alerts"]
+              if a["ticker"] == target and a["kind"] == "new_low"]
+    assert len(matched) == 1, f"{target} 应该触发一条 new_low 告警"
+    assert "20 个交易日新低" in matched[0]["what_happened"]
 
 
 # ---------------- 期权异动：按票汇总，不按笔数扇出 ----------------
@@ -354,8 +723,9 @@ def test_options_flow_alerts_are_aggregated_per_ticker_not_fanned_out(
 
 def test_uw_live_alert_maps_underlying_and_merges_multiple_rules(monkeypatch):
     """/api/alerts 的 symbol 是期权合约代码不是股票代码，标的在
-    meta.underlying_symbol 里；同一只票命中好几条自定义规则时合并成一条，
-    不落在持仓里的票、symbol 为 null 的噪音（potus_schedule）都不该生成告警。"""
+    meta.underlying_symbol 里；同一只票命中好几条同方向自定义规则时合并
+    成一条，不落在持仓里的票、symbol 为 null 的噪音（potus_schedule）都
+    不该生成告警。"""
     from db import pg
 
     held = [r["ticker"] for r in pg.query("select ticker from user_positions")]
@@ -364,16 +734,22 @@ def test_uw_live_alert_maps_underlying_and_merges_multiple_rules(monkeypatch):
     target = held[0]
     not_held = "ZZZNOTHELDXYZ"
 
+    # Rule A / Rule B 都给同一个可解出方向的 call+ask 占优样本（看多），
+    # 这样合并逻辑和方向解析可以分开测——这里只测合并，方向解析在
+    # 上面 UW 方向那组测试里单独测过
+    common_meta = {"underlying_symbol": target,
+                   "ask_volume": 1000, "bid_volume": 50}
     fake_items = [
-        {"symbol": f"{target}261002C00250000",
-         "meta": {"underlying_symbol": target}, "name": "Rule A"},
-        {"symbol": f"{target}261002C00250000",
-         "meta": {"underlying_symbol": target}, "name": "Rule A"},   # 重复规则名
-        {"symbol": f"{target}261002P00250000",
-         "meta": {"underlying_symbol": target}, "name": "Rule B"},
+        {"symbol": f"{target}261002C00250000", "meta": common_meta,
+         "name": "Rule A"},
+        {"symbol": f"{target}261002C00250000", "meta": common_meta,
+         "name": "Rule A"},   # 重复规则名
+        {"symbol": f"{target}261002C00251000", "meta": common_meta,
+         "name": "Rule B"},
         {"symbol": None, "meta": {}, "noti_type": "potus_schedule"},  # 噪音
         {"symbol": f"{not_held}261002C00250000",
-         "meta": {"underlying_symbol": not_held}, "name": "Rule C"},
+         "meta": {"underlying_symbol": not_held, "ask_volume": 1000,
+                  "bid_volume": 50}, "name": "Rule C"},
     ]
 
     monkeypatch.setattr(wp.uw, "available", lambda: True)
@@ -430,30 +806,6 @@ def test_cn_outflow_and_lhb_alerts_trigger_on_the_documented_shapes(monkeypatch)
     lhb_alert = next(a for a in out["alerts"]
                      if a["ticker"] == fake_ticker and a["kind"] == "lhb")
     assert "日内成交异常波动" in lhb_alert["what_happened"]
-
-
-def test_cn_signal_source_failure_is_isolated_from_us_sources(monkeypatch):
-    """A股那两条路径挂了，不该连累美股那几条已经拿到的结果。"""
-    real_query = wp.pg.query
-
-    def fake_query(sql, params=None):
-        if "from user_positions" in sql:
-            return [{"ticker": "600378.SH", "market": "CN",
-                     "avg_cost": 10.0, "shares": 100.0, "currency": "CNY"},
-                    {"ticker": "AMZN", "market": "US",
-                     "avg_cost": 246.0, "shares": 10.0, "currency": "USD"}]
-        return real_query(sql, params)
-
-    def boom(tickers):
-        raise RuntimeError("模拟 A股主力资金拉取失败")
-
-    monkeypatch.setattr(wp.pg, "query", fake_query)
-    monkeypatch.setattr(wp.cn_signals, "fund_flow", boom)
-    out = run()
-    assert "error" not in out
-    assert any("A股主力资金拉取失败" in g for g in out["data_gaps"])
-    assert "options_flow" in out["checked_sources"], (
-        "A股那一路挂了，美股期权异动这一路不该被连累")
 
 
 # ---------------- 返回体大小：如实标注截断，不默默丢数据 ----------------
