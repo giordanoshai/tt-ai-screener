@@ -201,6 +201,16 @@ def test_position_stop_flags_breach():
     assert out["breached"] is True
 
 
+def test_position_stop_gives_a_reachable_forward_stop_when_deeply_underwater():
+    """浮亏很深时，成本那一档止损位会落在市价上方——那是几周前就破了的
+    历史事实。这时必须另给一个在市价下方的止损位，不然「止损」这个词没意义。"""
+    out = scoring.position_stop(100.0, snap(close=56.0, atr_14=3.5, ma_20=54.0))
+    assert out["breached"] is True
+    assert out["suggested_stop"] > 56.0        # 历史止损，已经不可达
+    assert out["forward_stop"] == 54.0         # 继续拿的话，止损放这
+    assert out["forward_stop"] < 56.0          # 永远在市价下方
+
+
 # ---------------- 补测（评审修 4）：score_mid、缺均线、异常兜底 ----------------
 
 def test_score_mid_uses_fundamentals():

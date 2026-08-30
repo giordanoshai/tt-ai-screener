@@ -29,6 +29,7 @@ URGENCY = {
     "stop_breached": 90,
     "earnings_soon": 70,
     "bad_news": 65,
+    "stop_breached_recovering": 60,   # 早已跌破，但已站回 20 日均线
     "bearish_flow": 55,
     "cn_outflow": 55,
     "normal": 20,
@@ -64,13 +65,20 @@ def _num(value):
 def _flags_and_urgency(stop: dict, earnings: dict | None,
                        news: list[dict], flow: dict | None,
                        cn_flow: dict | None,
-                       lhb_rows: list[dict]) -> tuple[list[str], int]:
+                       lhb_rows: list[dict],
+                       snap: dict | None = None) -> tuple[list[str], int]:
     """把一堆数字翻成「要不要动手」。返回人话标签和紧急度。"""
     flags, urgency = [], URGENCY["normal"]
 
     if stop.get("breached"):
-        flags.append("跌破止损")
-        urgency = max(urgency, URGENCY["stop_breached"])
+        if snap and snap.get("above_ma20"):
+            # 已经站回 20 日均线：止损是早就破了的历史事实，仓位在修复。
+            # 跟「今天刚破位」按同一个最高档报警，会把真正紧急的那几只淹掉
+            flags.append("已跌破当初止损，但已站回 20 日均线")
+            urgency = max(urgency, URGENCY["stop_breached_recovering"])
+        else:
+            flags.append("跌破止损")
+            urgency = max(urgency, URGENCY["stop_breached"])
 
     days_until = (earnings or {}).get("days_until")
     if days_until is not None and 0 <= days_until <= EARNINGS_SOON_DAYS:
@@ -122,7 +130,7 @@ def _one(row: dict, snap: dict | None, stop: dict, earnings: dict | None,
         gaps.append("没有主力资金数据")
 
     flags, urgency = _flags_and_urgency(stop, earnings, news, flow,
-                                        cn_flow, lhb_rows)
+                                        cn_flow, lhb_rows, snap)
 
     return {
         "ticker": row["ticker"],
@@ -243,6 +251,10 @@ def review_positions(ticker: str | None = None) -> str:
                     f"{market} 行情最新只到 {fresh['latest_trading_day']}，"
                     f"距今 {fresh['days_since']} 天。"
                     f"最近失败的采集任务：{fresh['failed_jobs'] or '无'}")
+            if fresh["partial_jobs"]:
+                warnings.append(
+                    f"{market} 有采集任务只跑了一半（数据写了，某个可选源没取到）："
+                    f"{fresh['partial_jobs']}")
 
         positions = []
         for row in rows:
@@ -251,12 +263,14 @@ def review_positions(ticker: str | None = None) -> str:
             stop = (scoring.position_stop(_num(row["avg_cost"]), snap)
                     if snap else {"suggested_stop": None, "basis": None,
                                   "distance_pct": None, "breached": None,
+                                  "forward_stop": None,
                                   "gaps": ["没有行情，算不出止损"]})
             positions.append(_one(
                 row, snap, stop, earnings.get(code), news.get(code, []),
                 flows.get(code), cn_flows.get(code), lhbs.get(code, [])))
 
-        positions.sort(key=lambda p: (-p["urgency"], p["ticker"]))
+        positions.sort(key=lambda p: (-p["urgency"], p["pnl_pct"] or 0,
+                                      p["ticker"]))
         as_of = max((s["date"] for s in snaps.values() if s), default=None)
 
         return json.dumps({

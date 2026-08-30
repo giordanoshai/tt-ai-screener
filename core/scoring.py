@@ -492,6 +492,10 @@ def position_stop(avg_cost: float, snap: dict) -> dict:
 
     取高的那个是因为：均线在成本上方时，说明已经有浮盈，该把止损抬上来护住；
     均线在下方时，用成本减 ATR 才不会被日常波动扫掉。
+
+    **但仓位深度浮亏时，成本那一档会落在市价上方**——那个止损几周前就破了，
+    是历史事实，不是今天能用的价位。所以另给一个 `forward_stop`：要继续拿的话，
+    止损该放哪。它永远在市价下方，不然就不叫止损了。
     """
     close = _num(snap.get("close"))
     atr = _num(snap.get("atr_14"))
@@ -505,13 +509,26 @@ def position_stop(avg_cost: float, snap: dict) -> dict:
         candidates.append(("ma_20", ma_20))
     if not candidates:
         return {"suggested_stop": None, "basis": None, "distance_pct": None,
-                "breached": None, "gaps": ["没有 ATR 也没有均线，算不出止损"]}
+                "breached": None, "forward_stop": None,
+                "gaps": ["没有 ATR 也没有均线，算不出止损"]}
 
     basis, stop = max(candidates, key=lambda item: item[1])
+
+    # 继续持有的话止损放哪：候选里落在市价下方的取最高的；
+    # 全都在市价上方（深度浮亏）就用现价往下 2 个 ATR
+    forward_stop = None
+    if close is not None:
+        below = [level for _, level in candidates if level < close]
+        if below:
+            forward_stop = round(max(below), 2)
+        elif atr:
+            forward_stop = round(close - POSITION_STOP_ATR_MULT * atr, 2)
+
     return {
         "suggested_stop": round(stop, 2),
         "basis": basis,
         "distance_pct": round((close - stop) / close * 100, 2) if close else None,
         "breached": bool(close is not None and close < stop),
+        "forward_stop": forward_stop,
         "gaps": [],
     }
