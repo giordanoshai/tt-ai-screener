@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
 """分析引擎的取数层：把库里的数据拼成一份上下文，交给 AI 模型去分析。
 
-`analyze_watchlist` 和 `analyze_positions` 两个 MCP 工具都靠这里取数，
-网页端的「分析」按钮也走这里。它们都是**在函数体里** import 本模块的，
-所以这里坏掉的时候 import 阶段不报错，要等真调用才炸，然后被外面的
-except 吞成 `{"error": ...}`——从工具返回值上看不出是这一层坏了。
-所以改这个文件的时候，务必跑 `tests/test_skills.py`。
+**现在只有网页端的「分析」按钮走这里**（`web/app.py` 的 `/analyze` 与
+`/analyze/stream`，以及设置页的技能提示词读写）。原来靠这里取数的
+`analyze_watchlist` 和 `analyze_positions` 两个 MCP 工具已经下线，
+被 `scan_swing` 和 `review_positions` 取代，那两个新工具走的是
+`core/` 下的模块，不经过本文件。
+
+调用方都是**在函数体里** import 本模块的，所以这里坏掉的时候 import
+阶段不报错，要等真调用才炸，然后被外面的 except 吞成 `{"error": ...}`
+——从返回值上看不出是这一层坏了。所以改这个文件的时候，务必跑
+`tests/test_skills.py`。
+
+注意本文件直接查库，拿到的 `dist_ma20_pct`、`revenue_growth_yoy` 这类
+字段是**小数**（0.15 = 15%），跟 `core/snapshot.py`、`core/fundamental.py`
+交出来的百分点不是一回事。这里的写法是对的，别照着 `core/` 改。
 
 数据源已经从本地 DuckDB 换成自建 Postgres（采集那一摊在 tt-data-hub），
 移植时踩过的坑，每一条都能让查询直接报错或者悄悄给出错误结果：
