@@ -87,6 +87,13 @@ from cn_limit_pool_daily
 where snapshot_date = (select max(snapshot_date) from cn_limit_pool_daily)
 """
 
+_DATES_SQL = """
+select (select max(snapshot_date) from cn_fund_flow_daily)  as fund_flow,
+       (select max(snapshot_date) from cn_board_flow_daily) as board_flow,
+       (select max(snapshot_date) from cn_limit_pool_daily) as limit_pool,
+       (select max(list_date)     from cn_lhb_daily)        as lhb
+"""
+
 
 def _clean(tickers) -> list[str]:
     return [t.upper().strip() for t in (tickers or []) if t and t.strip()]
@@ -206,4 +213,30 @@ def limit_sentiment() -> dict:
         "broken_count": broken,
         "broken_rate": round(broken / limit_up, 3) if limit_up else None,
         "max_streak": row.get("max_streak"),
+    }
+
+
+def signal_dates() -> dict:
+    """四张 A股信号表各自最新到哪天，以及它们齐不齐。
+
+    这四张表是四个独立的采集任务写的，进度可能不一致。把三个不同交易日的
+    资金流、板块和情绪拼成一个结论而不说破，用户会以为看到的是同一天的
+    东西——那正是设计文档第八节禁止的静默降级。
+
+    龙虎榜天然比别的晚（当天收盘后才披露），所以它不参与齐不齐的判断，
+    只把日期报出来。
+    """
+    row = pg.query_one(_DATES_SQL) or {}
+    same_day = {row.get(k) for k in ("fund_flow", "board_flow", "limit_pool")}
+    in_sync = len(same_day - {None}) <= 1
+    return {
+        "fund_flow": row.get("fund_flow"),
+        "board_flow": row.get("board_flow"),
+        "limit_pool": row.get("limit_pool"),
+        "lhb": row.get("lhb"),
+        "in_sync": in_sync,
+        "gap": None if in_sync else (
+            f"A股四张信号表不在同一天："
+            f"资金流 {row.get('fund_flow')}、板块 {row.get('board_flow')}、"
+            f"涨停 {row.get('limit_pool')}。跨天的数据不能当成同一天读"),
     }
