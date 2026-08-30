@@ -1,0 +1,316 @@
+# -*- coding: utf-8 -*-
+"""消息面：新闻、财报日、期权异动、内部人买卖、gamma 墙。
+
+## 新闻表的两个坑
+
+1. **`news` 没有 ticker 列。** 代码在 `related_tickers` 里，是个 text[]，
+   建了 GIN 索引，所以要用数组重叠运算符 `&&` 匹配，写 `= any()` 用不上索引。
+2. **没有 headline 列**，标题在 `title`。中文标题在 `title_cn`，可能为空。
+
+重要性分级 `significant` 是 text，值只有 High / Medium / Low 三种，
+是 tt-data-hub 那边 AI 打好的。UW 的实时新闻接口**没有分级**（只有一个
+is_major 布尔值），所以「按重要性排序」这件事只有库里的数据能做。
+
+## 财报日和市值是短线的合法例外
+
+它俩存在 stock_fundamentals 里，但短波段需要它们避雷和过流动性门槛
+（设计文档第三节）。所以 `earnings_for()` **只 select ticker /
+next_earnings_date / last_earnings_date / market_cap 这四列**，
+不写 `select *`，免得把整行基本面顺手带进短线链路。
+
+## 期权异动有两条路
+
+- `options_flow()` 查库里的 `flow_alerts_archive`。全市场扫描用它，快。
+- `options_flow_live()` 调 UW 实时接口，取不到就自动退回库里的数据，
+  并把 `source` 标成 `db`。持仓盯盘和个股分析用它——库里的期权数据一天
+  只灌两次，拿它盯盘名不副实。
+"""
+import datetime
+
+from core import uw
+from db import pg
+
+#: 重要性从高到低。min_significance='Medium' 的意思是 High + Medium。
+SIGNIFICANCE_ORDER = ("High", "Medium", "Low")
+
+#: 内部人交易代码：P = 公开市场买入，S = 卖出。
+#: A（授予）、M（期权行权）、F（代扣税）、D（处置）不是主动买卖，是噪音。
+#: 实测近 30 天：S 4697 条、M 1981 条、A 1870 条、F 996 条、P 770 条。
+_INSIDER_CODES = {"P": "buy", "S": "sell"}
+
+_NEWS_SQL = """
+select id, title, title_cn, url, published_at, source,
+       sentiment_label, sentiment_score, significant, related_tickers
+from news
+where related_tickers && %s::text[]
+  and published_at >= now() - make_interval(days => %s)
+  and significant = any(%s)
+order by published_at desc
+limit %s
+"""
+
+_NEWS_RECENT_SQL = """
+select id, title, title_cn, url, published_at, source,
+       sentiment_label, sentiment_score, significant, related_tickers
+from news
+where published_at >= now() - make_interval(hours => %s)
+  and significant = any(%s)
+  and (%s::text[] is null or related_tickers && %s::text[])
+order by published_at desc
+limit %s
+"""
+
+# 只取这四列。别改成 select *，见模块注释。
+_EARNINGS_SQL = """
+select distinct on (ticker)
+       ticker, next_earnings_date, last_earnings_date, market_cap
+from stock_fundamentals
+where ticker = any(%s)
+  and market = %s
+order by ticker, updated_at desc
+"""
+
+_FLOW_SQL = """
+select ticker,
+       count(*) as alert_count,
+       sum(case when opt_type = 'call' then ask_prem else bid_prem end)
+           as bullish_premium,
+       sum(case when opt_type = 'call' then bid_prem else ask_prem end)
+           as bearish_premium,
+       max(total_premium) as biggest_premium,
+       max(day) as last_day
+from flow_alerts_archive
+where ticker = any(%s)
+  and day >= %s
+group by ticker
+"""
+
+_INSIDER_SQL = """
+select ticker,
+       payload->>'transaction_code' as code,
+       count(*) as n,
+       sum((payload->>'amount')::numeric) as amount
+from uw_insider_tx
+where ticker = any(%s)
+  and filing_date >= %s
+  and payload->>'transaction_code' = any(%s)
+group by ticker, payload->>'transaction_code'
+"""
+
+# 国会议员申报的交易。金额是个区间字符串（"$50,001 - $100,000"），
+# 原样带出来——把它折算成一个数会假装精确。
+_CONGRESS_SQL = """
+select ticker, transaction_date, filed_at_date,
+       payload->>'name' as member,
+       payload->>'member_type' as member_type,
+       payload->>'txn_type' as txn_type,
+       payload->>'amounts' as amounts
+from uw_congress
+where ticker = any(%s)
+  and transaction_date >= %s
+order by transaction_date desc
+limit 40
+"""
+
+_GEX_SQL = """
+select distinct on (ticker)
+       ticker, snapshot_date, call_wall, put_wall, gamma_flip, gamma_magnet
+from uw_gex_daily
+where ticker = any(%s)
+order by ticker, snapshot_date desc
+"""
+
+
+def _clean(tickers) -> list[str]:
+    return [t.upper().strip() for t in (tickers or []) if t and t.strip()]
+
+
+def _levels(min_significance: str) -> list[str]:
+    """'Medium' -> ['High', 'Medium']。认不出的当 Medium。"""
+    try:
+        cut = SIGNIFICANCE_ORDER.index(min_significance)
+    except ValueError:
+        cut = 1
+    return list(SIGNIFICANCE_ORDER[:cut + 1])
+
+
+def _shape_news(row: dict) -> dict:
+    return {
+        "title": row.get("title_cn") or row.get("title"),
+        "title_en": row.get("title"),
+        "url": row.get("url"),
+        "published_at": row.get("published_at"),
+        "source": row.get("source"),
+        "sentiment_label": row.get("sentiment_label"),
+        "sentiment_score": row.get("sentiment_score"),
+        "significant": row.get("significant"),
+        "tickers": row.get("related_tickers") or [],
+    }
+
+
+def news_for(tickers: list[str], days: int = 7,
+             min_significance: str = "Medium",
+             per_ticker: int = 3) -> dict[str, list[dict]]:
+    """按票分组的近期新闻，每票最多 per_ticker 条。"""
+    tickers = _clean(tickers)
+    if not tickers:
+        return {}
+
+    # 一次查回来再在 Python 里分组。一条新闻可能同时关联几只票，
+    # 按票分别查会把同一条新闻查很多遍。
+    rows = pg.query(_NEWS_SQL, (tickers, days, _levels(min_significance),
+                                per_ticker * len(tickers) * 4))
+    out: dict[str, list[dict]] = {t: [] for t in tickers}
+    wanted = set(tickers)
+    for row in rows:
+        item = _shape_news(row)
+        for ticker in wanted & set(item["tickers"]):
+            if len(out[ticker]) < per_ticker:
+                out[ticker].append(item)
+    return out
+
+
+def news_recent(tickers: list[str] | None = None, hours: int = 24,
+                min_significance: str = "Medium",
+                limit: int = 60) -> list[dict]:
+    """最近 N 小时的新闻，按时间倒序。tickers 为 None 就是全市场。"""
+    tickers = _clean(tickers) if tickers else None
+    rows = pg.query(_NEWS_RECENT_SQL,
+                    (hours, _levels(min_significance), tickers, tickers, limit))
+    return [_shape_news(row) for row in rows]
+
+
+def earnings_for(tickers: list[str], market: str) -> dict[str, dict | None]:
+    """下次财报日还有几天。没有数据的票值是 None。"""
+    tickers = _clean(tickers)
+    if not tickers:
+        return {}
+
+    today = datetime.date.today()
+    found = {}
+    for row in pg.query(_EARNINGS_SQL, (tickers, market.upper())):
+        next_date = row.get("next_earnings_date")
+        days_until = None
+        if isinstance(next_date, datetime.date):
+            days_until = (next_date - today).days
+        found[row["ticker"]] = {
+            "next_earnings_date": next_date,
+            "last_earnings_date": row.get("last_earnings_date"),
+            "days_until": days_until,
+            "market_cap": row.get("market_cap"),
+        }
+    return {t: found.get(t) for t in tickers}
+
+
+def options_flow(tickers: list[str], days: int = 5) -> dict[str, dict]:
+    """库里的期权异动汇总。没记录的票返回零值，不返回 None。
+
+    看多看空怎么分：在卖价成交说明买方主动，在买价成交说明卖方主动。
+    买看涨=看多、卖看涨=看空、买看跌=看空、卖看跌=看多。
+    """
+    tickers = _clean(tickers)
+    if not tickers:
+        return {}
+
+    since = datetime.date.today() - datetime.timedelta(days=days)
+    found = {}
+    for row in pg.query(_FLOW_SQL, (tickers, since)):
+        bullish = float(row.get("bullish_premium") or 0)
+        bearish = float(row.get("bearish_premium") or 0)
+        found[row["ticker"]] = {
+            "bullish_premium": round(bullish, 2),
+            "bearish_premium": round(bearish, 2),
+            "net_premium": round(bullish - bearish, 2),
+            "biggest_premium": float(row.get("biggest_premium") or 0),
+            "alert_count": int(row.get("alert_count") or 0),
+            "last_day": row.get("last_day"),
+            "source": "db",
+        }
+    empty = {"bullish_premium": 0.0, "bearish_premium": 0.0,
+             "net_premium": 0.0, "biggest_premium": 0.0,
+             "alert_count": 0, "last_day": None, "source": "db"}
+    return {t: found.get(t, dict(empty)) for t in tickers}
+
+
+def options_flow_live(tickers: list[str]) -> dict[str, dict]:
+    """实时期权异动。取不到就退回库里的数据，并把 source 标成 db。
+
+    库里一天只灌两次，做盯盘要实时的；但实时接口 3.6 秒一只票，
+    而且会超时，所以永远要有退路。
+    """
+    tickers = _clean(tickers)
+    if not tickers:
+        return {}
+
+    fallback = options_flow(tickers)
+    if not uw.available():
+        return fallback
+
+    live = uw.flow_alerts_many(tickers)
+    out = {}
+    for ticker in tickers:
+        rows = live.get(ticker)
+        out[ticker] = uw.summarize_flow(rows) if rows else fallback[ticker]
+    return out
+
+
+def insider_for(tickers: list[str], days: int = 90) -> dict[str, dict]:
+    """内部人在公开市场的买卖。授予、行权、代扣税不算，见模块注释。"""
+    tickers = _clean(tickers)
+    if not tickers:
+        return {}
+
+    since = datetime.date.today() - datetime.timedelta(days=days)
+    out = {t: {"buy_count": 0, "sell_count": 0,
+               "buy_amount": 0.0, "sell_amount": 0.0, "net_amount": 0.0}
+           for t in tickers}
+    for row in pg.query(_INSIDER_SQL, (tickers, since, list(_INSIDER_CODES))):
+        entry = out.get(row["ticker"])
+        if entry is None:
+            continue
+        side = _INSIDER_CODES[row["code"]]
+        amount = float(row.get("amount") or 0)
+        entry[f"{side}_count"] = int(row["n"])
+        entry[f"{side}_amount"] = round(amount, 2)
+    for entry in out.values():
+        entry["net_amount"] = round(entry["buy_amount"] - entry["sell_amount"], 2)
+    return out
+
+
+def congress_for(tickers: list[str],
+                 days: int = 180) -> dict[str, list[dict]]:
+    """国会议员申报的这几只票的交易。申报有滞后，所以窗口默认放到半年。"""
+    tickers = _clean(tickers)
+    if not tickers:
+        return {}
+    since = datetime.date.today() - datetime.timedelta(days=days)
+    out: dict[str, list[dict]] = {t: [] for t in tickers}
+    for row in pg.query(_CONGRESS_SQL, (tickers, since)):
+        out.setdefault(row["ticker"], []).append({
+            "transaction_date": row["transaction_date"],
+            "filed_at_date": row.get("filed_at_date"),
+            "member": row.get("member"),
+            "member_type": row.get("member_type"),
+            "txn_type": row.get("txn_type"),
+            "amounts": row.get("amounts"),
+        })
+    return out
+
+
+def gamma_walls(tickers: list[str]) -> dict[str, dict | None]:
+    """期权 gamma 墙（短期的压力位和支撑位）。
+
+    `uw_gex_daily` 实测只覆盖 41 只大盘股，绝大多数票会是 None。
+    这是加分项，缺了不致命，但要明写缺失，不能编。
+    """
+    tickers = _clean(tickers)
+    if not tickers:
+        return {}
+    found = {row["ticker"]: {
+        "snapshot_date": row["snapshot_date"],
+        "call_wall": row.get("call_wall"),
+        "put_wall": row.get("put_wall"),
+        "gamma_flip": row.get("gamma_flip"),
+        "gamma_magnet": row.get("gamma_magnet"),
+    } for row in pg.query(_GEX_SQL, (tickers,))}
+    return {t: found.get(t) for t in tickers}
