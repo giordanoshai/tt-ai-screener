@@ -146,3 +146,58 @@ def test_cn_new_highs_20_window_excludes_today():
     assert got != including, (
         f"返回值等于「把当天算进 high_20」那种口径的 {including}，"
         "说明窗口又把当天算进去了")
+
+
+def test_cn_new_highs_needs_a_full_window():
+    """A股「创 20 日新高」也要窗口够 20 根才算数。
+
+    跟 `tools/watch_positions.py` 的新低是同一个问题：窗口帧不足时
+    `max() over (rows between 20 preceding and 1 preceding)` 照样给值
+    （只有 3 根就拿 3 根的最高价），刚上市的票会被算成创新高。
+
+    做法是在库里用两种写法独立复算——检查帧数的和不检查的——然后断言
+    `core/regime.py` 返回的是**检查帧数**那个数。
+
+    **诚实说明它的局限**：只有在「窗口帧不足的票里恰好有人创新高」的那天，
+    两个数才不一样，这条测试才真能区分对错；两个数相同的日子它是过得
+    平凡的。所以另外断言了「两数不同时必须等于小的那个」。真正在今天
+    就能抓住这类 bug 的是 `tests/test_watch_positions.py` 里的
+    `test_new_low_needs_a_full_window_not_just_whatever_bars_exist`——
+    那边今天实打实有 6 只日线不足 20 根的票。
+    """
+    from db import pg
+
+    row = pg.query("""
+        with recent as (
+            select ticker, date, high,
+                   max(high) over (partition by ticker order by date
+                       rows between 20 preceding and 1 preceding) as prior_high,
+                   count(high) over (partition by ticker order by date
+                       rows between 20 preceding and 1 preceding) as prior_bars
+            from stock_ohlcv_daily
+            where market = 'CN'
+              and date > (select max(date) from stock_ohlcv_daily
+                          where market = 'CN')::date - 60
+        ), latest as (
+            select max(date) d from stock_ohlcv_daily where market = 'CN'
+        )
+        select count(*) filter (where prior_high is not null
+                                  and high >= prior_high) as loose,
+               count(*) filter (where prior_high is not null
+                                  and prior_bars = 20
+                                  and high >= prior_high) as strict,
+               count(*) filter (where prior_bars < 20) as short_history
+        from recent, latest where recent.date = latest.d
+    """)[0]
+
+    got = regime.get("CN")["new_highs_20"]
+    assert got == row["strict"], (
+        f"core/regime.py 返回 {got}，按「窗口必须够 20 根」独立复算是 "
+        f'{row["strict"]}（不检查帧数会是 {row["loose"]}）')
+
+    if row["loose"] != row["strict"]:
+        assert got != row["loose"], (
+            f'今天有窗口不足的票在创新高（两种算法差 '
+            f'{row["loose"] - row["strict"]} 只），返回的必须是严格的那个')
+    else:
+        assert row["short_history"] >= 0  # 记录当天确实无法区分

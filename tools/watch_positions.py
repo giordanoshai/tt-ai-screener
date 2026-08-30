@@ -472,8 +472,14 @@ NEW_LOW_WINDOW = 20
 _NEW_LOW_SQL = f"""
 select ticker,
        min(low) filter (where rn = 1) as today_low,
-       min(low) filter (where rn between 2 and {NEW_LOW_WINDOW + 1})
-           as prior_low_{NEW_LOW_WINDOW}
+       -- 只有真的凑够 {NEW_LOW_WINDOW} 根历史日线才给结论。刚上市的票
+       -- 可能总共只有 5 根日线，拿 4 天的最低价说「创 {NEW_LOW_WINDOW} 个
+       -- 交易日新低」是在编。凑不够就返回 null，is_new_low() 会当成
+       -- 「判断不了」直接跳过，而不是给一条听起来很确定的假告警。
+       case when count(*) filter (where rn between 2 and {NEW_LOW_WINDOW + 1})
+                 = {NEW_LOW_WINDOW}
+            then min(low) filter (where rn between 2 and {NEW_LOW_WINDOW + 1})
+       end as prior_low_{NEW_LOW_WINDOW}
 from (
     select ticker, low,
            row_number() over (partition by ticker order by date desc) as rn

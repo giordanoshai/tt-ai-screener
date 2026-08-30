@@ -292,9 +292,19 @@ def scan_swing(market: str = "US", horizon: str = "short",
                                scoring.plan_trade(snap, setup),
                                earnings.get(code), [], flows.get(code)))
 
-        # 同分时按量能排：放量更大的说明后面跟的钱更多，比按股票代码排有意义
-        rows.sort(key=lambda r: (-r["score"], -(r.get("vol_ratio") or 0),
-                                 r["ticker"]))
+        # 同分时先看依据足不足，再看量能。
+        #
+        # 为什么依据要进排序键：`horizon="both"` 会把中线档和短线档放进
+        # **同一个列表**，而中线满分里基本面占 35 分、相对强度占 20 分，
+        # A股这两块经常整块缺失（实测 000001.SZ 中线 evidence_pct=45）。
+        # 只按分数排的话，一个用 45% 评分表打出来的 82 分会排在一个用完整
+        # 评分表打出来的 77 分前面——那两个 82 不是一个东西。
+        #
+        # 这里**不给分数打折**（打折等于把「缺数据」重新变成扣分，会让所有
+        # 现有阈值悄悄变味），只在**同分时**让依据足的排前面。不改变任何
+        # 阈值的含义，只决定平局。
+        rows.sort(key=lambda r: (-r["score"], -(r.get("evidence_pct") or 0),
+                                 -(r.get("vol_ratio") or 0), r["ticker"]))
         matched_count = len(rows)
         rows = rows[:limit]
 

@@ -448,3 +448,46 @@ def test_candidate_numbers_are_rounded():
             assert round(value, 2) == value, f"{cand['ticker']} 的 {value} 没四舍五入"
             checked += 1
     assert checked > 0
+
+
+def test_same_score_puts_the_better_evidenced_candidate_first():
+    """同分时，用了更多评分表打出来的那只排前面。
+
+    `horizon="both"` 会把中线档和短线档放进**同一个列表**，而中线满分里
+    基本面占 35 分、相对强度占 20 分，A股这两块经常整块缺失。所以同样是
+    73 分，一只可能是用 75% 的评分表打的、另一只只用了 45%——那两个 73
+    不是一个东西，把依据少的排在前面等于替用户做了个没根据的判断。
+
+    这里**不给分数打折**（打折等于把「缺数据」重新变成扣分，会让所有
+    现有阈值悄悄变味），只在同分时让依据足的排前面。
+
+    A股在 `scope="full"` 下今天真实存在这种同分样本（73 分上有 75% 和
+    45% 两只）。找不到就 skip 并说明，不放松断言。
+    """
+    out = json.loads(ss.scan_swing(market="CN", horizon="both",
+                                   scope="full", limit=30))
+    cands = out.get("candidates") or []
+    if len(cands) < 2:
+        pytest.skip("候选不足两只，比不出顺序")
+
+    # 整体不变式：列表必须按 (分数降序, 依据降序) 排好
+    keys = [(-c["score"], -(c.get("evidence_pct") or 0)) for c in cands]
+    assert keys == sorted(keys), (
+        "候选没有按「分数降序、同分时依据降序」排列：\n" +
+        "\n".join(f'  {c["ticker"]} score={c["score"]} '
+                  f'evidence={c.get("evidence_pct")}' for c in cands[:12]))
+
+    # 能区分对错的样本：同一个分数上出现了不同的依据比例
+    by_score: dict[int, list] = {}
+    for c in cands:
+        by_score.setdefault(c["score"], []).append(c)
+    discriminating = [(s, group) for s, group in by_score.items()
+                      if len({g.get("evidence_pct") for g in group}) > 1]
+    if not discriminating:
+        pytest.skip("今天没有「同分但依据不同」的候选，这条区分不出对错")
+
+    for score, group in discriminating:
+        evs = [g.get("evidence_pct") or 0 for g in group]
+        assert evs == sorted(evs, reverse=True), (
+            f"{score} 分这一组里依据比例没有降序排：" +
+            ", ".join(f'{g["ticker"]}={g.get("evidence_pct")}' for g in group))

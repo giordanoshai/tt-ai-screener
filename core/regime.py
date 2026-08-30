@@ -57,7 +57,13 @@ with recent as (
     select ticker, date, close, high, pct_chg, ma_20, ma_50, ma_200,
            max(high) over (partition by ticker order by date
                            rows between {NEW_HIGH_WINDOW} preceding
-                                    and 1 preceding) as prior_high
+                                    and 1 preceding) as prior_high,
+           -- 窗口帧不足时 max() 照样给值（只有 3 根就拿 3 根的最高价），
+           -- 那样刚上市的票会被算成「创 {NEW_HIGH_WINDOW} 日新高」。
+           -- 数一下帧里到底有几根，不够就不算数。
+           count(high) over (partition by ticker order by date
+                             rows between {NEW_HIGH_WINDOW} preceding
+                                      and 1 preceding) as prior_bars
     from stock_ohlcv_daily
     where market = 'CN'
       and date > %s::date - {_NEW_HIGH_LOOKBACK_DAYS}
@@ -76,6 +82,7 @@ select count(*) as total,
              / nullif(count(*) filter (where ma_200 is not null), 0), 2)
            as pct_above_ma200,
        count(*) filter (where prior_high is not null
+                          and prior_bars = {NEW_HIGH_WINDOW}
                           and high >= prior_high) as new_highs_20
 from recent
 where date = %s

@@ -1762,3 +1762,69 @@ def test_news_title_none_is_not_printed_as_the_word_none(monkeypatch):
     assert len(matched) == 1, "标题缺失也该照常发这条告警，只是文案要兜底"
     assert "None" not in matched[0]["what_happened"], (
         f"标题为空时不能把 None 印给用户：{matched[0]['what_happened']}")
+
+
+def test_new_low_needs_a_full_window_not_just_whatever_bars_exist():
+    """刚上市、日线还不够 20 根的票，不能说它「创 20 个交易日新低」。
+
+    最终评审发现：`_NEW_LOW_SQL` 原来不检查窗口够不够，`min(low)` 有几根
+    算几根。实测美股 218 只命中里有 6 只（CCCT / CSQR / FDMM / IMC /
+    MRCO / OSPR）总共只有 5 根日线——工具拿 4 天的最低价说「创 20 个
+    交易日新低」，那是在编。凑不够就该返回 null，让 `is_new_low()` 当成
+    判断不了直接跳过。
+
+    这个 bug 在修「漏报 96%」之前就在，只是那时整条告警根本不触发，
+    修好之后才露出来。
+    """
+    from db import pg
+
+    short = pg.query("""
+        select ticker, count(*) as bars
+        from stock_ohlcv_daily
+        where market = 'US'
+        group by ticker
+        having count(*) between 2 and %s
+        order by count(*) desc
+        limit 5
+    """, (wp.NEW_LOW_WINDOW,))
+    if not short:
+        pytest.skip("库里没有日线不足 20 根的美股，这条测不了")
+
+    rows = {r["ticker"]: r for r in
+            pg.query(wp._NEW_LOW_SQL, ([r["ticker"] for r in short], "US"))}
+    assert rows, "查询应当返回这些票的行"
+    checked = 0
+    for r in short:
+        row = rows.get(r["ticker"])
+        if row is None:
+            continue
+        checked += 1
+        prior = row.get(f"prior_low_{wp.NEW_LOW_WINDOW}")
+        assert prior is None, (
+            f'{r["ticker"]} 总共只有 {r["bars"]} 根日线，凑不够 '
+            f'{wp.NEW_LOW_WINDOW} 根历史窗口，不该给出 prior_low '
+            f'（拿到的是 {prior}）——给了就会报一条编出来的「创新低」')
+        assert wp.is_new_low(row.get("today_low"), prior) is False, (
+            f'{r["ticker"]} 窗口不足时 is_new_low 必须返回 False')
+    assert checked > 0, "一只都没核到，这条测试等于没跑"
+
+
+def test_full_window_tickers_still_get_a_verdict():
+    """反面：日线够多的票必须照常拿到 prior_low，别把窗口检查写成一刀切。"""
+    from db import pg
+
+    enough = pg.query("""
+        select ticker from stock_ohlcv_daily
+        where market = 'US'
+        group by ticker
+        having count(*) > %s
+        limit 5
+    """, (wp.NEW_LOW_WINDOW + 5,))
+    if not enough:
+        pytest.skip("库里没有日线足够的美股")
+    tickers = [r["ticker"] for r in enough]
+    rows = pg.query(wp._NEW_LOW_SQL, (tickers, "US"))
+    assert rows, "应当返回行"
+    got = [r for r in rows if r.get(f"prior_low_{wp.NEW_LOW_WINDOW}") is not None]
+    assert len(got) == len(rows), (
+        f"日线够多的票应当全部拿到 prior_low，实际 {len(got)}/{len(rows)}")
