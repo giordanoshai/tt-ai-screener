@@ -262,3 +262,47 @@ def test_plan_trade_with_zero_price_does_not_raise():
     """停牌或坏数据可能给出 close=0，不能崩。"""
     plan = scoring.plan_trade(snap(close=0.0), "breakout")
     assert plan["stop_pct"] is None
+
+
+
+# ---------------- 复审修 2、修 3：A股主力资金按占比分档、中线基本面按幅度分档 ----------------
+
+def test_score_short_cn_fund_flow_scales_with_share_of_turnover():
+    """主力资金不能只看正负。0.06 亿和 2.25 亿都是「流入」，
+    但对成交 4 亿和成交 24 亿的票意义完全不同。"""
+    strong = scoring.score_short_cn(
+        snap(market="CN"),
+        fund_flow={"net_amount": 2.25e8, "net_5d": 7.96e8, "amount": 23.67e8})
+    weak = scoring.score_short_cn(
+        snap(market="CN"),
+        fund_flow={"net_amount": 0.06e8, "net_5d": 0.89e8, "amount": 4.27e8})
+    assert strong["score"] > weak["score"]
+
+
+def test_score_short_cn_flags_inflow_without_five_day_follow_through():
+    out = scoring.score_short_cn(
+        snap(market="CN"),
+        fund_flow={"net_amount": 1e8, "net_5d": -3e8, "amount": 10e8})
+    assert any("持续性" in r for r in out["risks"])
+
+
+def test_score_mid_fundamentals_scale_with_magnitude():
+    """净利率 0.1% 的公司不该跟净利率 25% 的拿一样的分。"""
+    thin = {"revenue_growth_yoy": 0.4, "earnings_growth_yoy": 1.1,
+            "profit_margin": 0.1, "week_52_high": 103.0}
+    strong = {"revenue_growth_yoy": 28.0, "earnings_growth_yoy": 35.0,
+              "profit_margin": 24.0, "roe": 22.0, "week_52_high": 103.0}
+    assert (scoring.score_mid(snap(), fund=strong)["score"]
+            > scoring.score_mid(snap(), fund=thin)["score"])
+
+
+def test_score_mid_fundamentals_scale_with_magnitude_holding_fields_equal():
+    """跟上一条不同：这里 thin/strong 有的字段完全一样（都带 roe），
+    只有数值大小不同——专门排除「有没有某个字段」这种非幅度因素，
+    确认真的是幅度分档在起作用，不是字段有无在起作用。"""
+    thin = {"revenue_growth_yoy": 0.4, "earnings_growth_yoy": 1.1,
+            "profit_margin": 0.1, "roe": 11.0}
+    strong = {"revenue_growth_yoy": 28.0, "earnings_growth_yoy": 35.0,
+              "profit_margin": 24.0, "roe": 22.0}
+    assert (scoring.score_mid(snap(), fund=strong)["score"]
+            > scoring.score_mid(snap(), fund=thin)["score"])

@@ -171,12 +171,15 @@ def scan_swing(market: str = "US", horizon: str = "short",
             flows = catalyst.options_flow(codes, days=5)
         else:
             cn_flows = cn_signals.fund_flow(codes)
-            boards = cn_signals.board_of(codes)
-            sentiment = cn_signals.limit_sentiment()
-            gaps.append(cn_signals.BOARD_MAPPING_GAP)
-            dates = cn_signals.signal_dates()
-            if not dates["in_sync"]:
-                gaps.append(dates["gap"])
+            # 板块和情绪只有短线档用得上——score_mid 连 board 参数都没有。
+            # 无条件报「缺板块数据」会把一个中线档根本不用的缺口说成问题
+            if horizon in ("short", "both"):
+                boards = cn_signals.board_of(codes)
+                sentiment = cn_signals.limit_sentiment()
+                gaps.append(cn_signals.BOARD_MAPPING_GAP)
+                dates = cn_signals.signal_dates()
+                if not dates["in_sync"]:
+                    gaps.append(dates["gap"])
 
         # ---- 5. 短波段排雷：财报 3 天内的直接剔除 ----
         rows = []

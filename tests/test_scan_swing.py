@@ -36,20 +36,43 @@ def test_sorted_by_score_descending():
     assert scores == sorted(scores, reverse=True)
 
 
-def test_short_horizon_drops_names_with_earnings_in_three_days():
-    out = run(market="US", horizon="short", scope="full")
-    for c in out["candidates"]:
-        days = (c.get("earnings") or {}).get("days_until")
-        assert days is None or days > 3 or days < 0
+def test_short_horizon_really_drops_a_blackout_candidate():
+    """财报排雷要真的被测到。今天恰好没有候选落在 3 天窗口内，
+    所以原来那两条测试把过滤删掉也照样绿——必须造一个出来。"""
+    real = ss.catalyst.earnings_for
+    seen = {}
+
+    def all_reporting_tomorrow(tickers, market):
+        out = {t: {"next_earnings_date": None, "last_earnings_date": None,
+                   "days_until": 1, "market_cap": None} for t in tickers}
+        seen["n"] = len(tickers)
+        return out
+
+    try:
+        ss.catalyst.earnings_for = all_reporting_tomorrow
+        out = run(market="US", horizon="short", scope="full")
+    finally:
+        ss.catalyst.earnings_for = real
+    assert seen["n"] > 0, "一只候选都没有，这条测试证明不了排雷"
+    assert out["candidates"] == [], "所有候选明天都财报，短线档应该一个不留"
 
 
-def test_mid_horizon_keeps_earnings_but_flags_them():
-    out = run(market="US", horizon="mid", scope="full")
-    flagged = [c for c in out["candidates"]
-               if (c.get("earnings") or {}).get("days_until") is not None
-               and 0 <= c["earnings"]["days_until"] <= 3]
-    for c in flagged:
-        assert any("财报" in r for r in c["risks"])
+def test_mid_horizon_keeps_a_blackout_candidate_but_flags_it():
+    """中线档相反：财报保留但要标注——持有两个月本来就会跨过财报。"""
+    real = ss.catalyst.earnings_for
+
+    def all_reporting_tomorrow(tickers, market):
+        return {t: {"next_earnings_date": None, "last_earnings_date": None,
+                    "days_until": 1, "market_cap": None} for t in tickers}
+
+    try:
+        ss.catalyst.earnings_for = all_reporting_tomorrow
+        out = run(market="US", horizon="mid", scope="full")
+    finally:
+        ss.catalyst.earnings_for = real
+    assert out["candidates"], "中线档不该把财报临近的票剔掉"
+    assert all(any("财报" in r for r in c["risks"])
+               for c in out["candidates"])
 
 
 def test_cn_scan_says_what_is_missing():
@@ -74,9 +97,13 @@ def test_bad_horizon_returns_error():
     assert "error" in run(market="US", horizon="forever")
 
 
-def test_both_horizons_labels_each_candidate():
-    out = run(market="US", horizon="both", scope="full")
-    assert all(c["horizon"] in ("short", "mid") for c in out["candidates"])
+def test_both_horizons_produces_both_tiers():
+    """两档都要真的出现。只判 horizon 是这两个值之一的话，
+    把 mid 全标成 short（中线档整个塌掉）也发现不了。"""
+    out = run(market="US", horizon="both", scope="full", limit=30)
+    tiers = {c["horizon"] for c in out["candidates"]}
+    assert tiers <= {"short", "mid"}
+    assert tiers == {"short", "mid"}, f"只出现了 {tiers}，中线档或短线档没跑出来"
 
 
 def test_regime_is_attached_so_claude_can_frame_the_answer():

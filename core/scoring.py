@@ -300,22 +300,39 @@ def score_short_cn(snap: dict, fund_flow: dict | None = None,
     led = _Ledger()
     _score_trend(led, snap, 25)
 
-    # 主力资金：当日净流入 + 5 日净流入，都要为正才算强
+    # 主力资金：不能只看正负。0.06 亿和 2.25 亿都算"流入"，但对一只成交 4 亿
+    # 和一只成交 24 亿的票，意义完全不同。占比才是 A股这边真正有区分度的量，
+    # 相当于美股那边看期权净额的偏向度而不是只看正负。
     if fund_flow is None:
         led.skip("没有主力资金数据")
     else:
         net = _num(fund_flow.get("net_amount")) or 0.0
         net_5d = _num(fund_flow.get("net_5d")) or 0.0
-        if net > 0 and net_5d > 0:
-            led.add(30, 30, f"主力当日净流入 {net / 1e8:.2f} 亿，"
-                            f"5 日累计 {net_5d / 1e8:.2f} 亿")
-        elif net > 0:
-            led.add(18, 30, f"主力当日净流入 {net / 1e8:.2f} 亿，但 5 日仍是净流出")
-        elif net_5d > 0:
-            led.add(12, 30, "5 日主力净流入，当日转为流出")
-        else:
+        amount = _num(fund_flow.get("amount")) or 0.0
+        ratio = net / amount if amount > 0 else None
+
+        if net <= 0:
             led.add(0, 30)
             led.risk(f"主力资金在流出（当日 {net / 1e8:.2f} 亿）")
+        elif ratio is None:
+            led.add(15, 30,
+                    f"主力当日净流入 {net / 1e8:.2f} 亿（缺成交额，算不出占比）")
+        else:
+            if ratio >= 0.05:
+                base, word = 30, "很强"
+            elif ratio >= 0.02:
+                base, word = 24, "较强"
+            elif ratio >= 0.005:
+                base, word = 16, "一般"
+            else:
+                base, word = 8, "偏弱"
+            if net_5d <= 0:
+                # 今天流入但 5 日累计还是流出，说明只是反弹不是持续买入
+                base = round(base * 0.6)
+                led.risk("当日净流入但 5 日累计仍是净流出，持续性存疑")
+            led.add(base, 30,
+                    f"主力净流入 {net / 1e8:.2f} 亿，占成交额 {ratio:.1%}（{word}），"
+                    f"5 日累计 {net_5d / 1e8:.2f} 亿")
 
     # 板块强度。**A股缺个股→行业映射**（cn_universe.industry 和
     # stocks_meta.industry 对 A股全是空的），大多数票这一项拿不到，
@@ -380,6 +397,8 @@ def score_mid(snap: dict, fund: dict | None = None,
     if not fund:
         led.skip("没有基本面数据（A股基本面目前只覆盖 150 只票）")
     else:
+        # 每一项都按幅度分档，不是「大于零就满分」。净利率 0.1% 的公司
+        # 和净利率 25% 的公司不该拿一样的分——那样打出来的 95 分是假的
         got = 0.0
         parts = []
         revenue = _num(fund.get("revenue_growth_yoy"))
@@ -388,24 +407,39 @@ def score_mid(snap: dict, fund: dict | None = None,
         roe = _num(fund.get("roe"))
         target = _num(fund.get("analyst_target_price"))
         close = _num(snap.get("close"))
-        if revenue is not None and revenue > 0:
-            got += 10
-            parts.append(f"营收同比增长 {revenue:.1f}%")
-        elif revenue is not None:
-            led.risk(f"营收同比下滑 {abs(revenue):.1f}%")
+
+        if revenue is not None:
+            if revenue >= 20:
+                got += 10
+            elif revenue >= 10:
+                got += 8
+            elif revenue >= 3:
+                got += 5
+            elif revenue > 0:
+                got += 2
+            else:
+                led.risk(f"营收同比下滑 {abs(revenue):.1f}%")
+            if revenue > 0:
+                parts.append(f"营收同比增长 {revenue:.1f}%")
+
         if earnings is not None and earnings > 0:
-            got += 8
+            got += 8 if earnings >= 20 else (6 if earnings >= 10 else 3)
             parts.append(f"利润同比增长 {earnings:.1f}%")
+
         if margin is not None and margin > 0:
-            got += 7
+            got += 7 if margin >= 20 else (5 if margin >= 10 else
+                                           (3 if margin >= 3 else 1))
             parts.append(f"净利率 {margin:.1f}%")
+
         if roe is not None and roe > 10:
-            got += 5
+            got += 5 if roe >= 20 else 3
             parts.append(f"ROE {roe:.1f}%")
+
         if target and close and target > close:
-            got += 5
-            parts.append(f"分析师目标价 {target:.2f}，比现价高 "
-                         f"{(target - close) / close * 100:.0f}%")
+            upside = (target - close) / close * 100
+            got += 5 if upside >= 20 else (3 if upside >= 10 else 1)
+            parts.append(f"分析师目标价 {target:.2f}，比现价高 {upside:.0f}%")
+
         led.add(got, 35, "、".join(parts) if parts else None)
 
     # 相对强度：离 52 周高点多远
