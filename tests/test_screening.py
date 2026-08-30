@@ -168,6 +168,29 @@ class TestFilters:
         for row in result["candidates"]:
             assert row["gross_margin"] >= 50, row
 
+    def test_min_margin_takes_a_percentage_not_a_ratio(self):
+        """`min_margin=50` 必须是「毛利率 50% 以上」，不能变成「5000% 以上」。
+
+        跟 min_growth 那条同构。库里 `gross_margin` 存小数（0.50 = 50%），
+        入参是百分比，所以进 SQL 前要除以 100。
+
+        这里断言的是「50%~80% 这个正常档位里必须有票」。
+        实测 2026-08-28：全市场 922 只票毛利率 >= 50%，返回的 30 只里有 13 只
+        落在 50~80。而按小数列直接比 50 的话，**全市场一只都没有**
+        （毛利率最大值只有 1.1092），返回的是空列表。
+        """
+        result = screen(min_margin=50, limit=30)
+        rows = result["candidates"]
+        assert rows, (
+            "min_margin=50 一只都没筛出来——门槛很可能被当成 5000% 了"
+            "（库里 gross_margin 存小数，最大值才 1.11）")
+        assert all(r["gross_margin"] >= 50 for r in rows)
+
+        normal = [r for r in rows if 50 <= r["gross_margin"] <= 80]
+        assert normal, (
+            "筛出来的票毛利率全都超过 80%，一只「毛利率 50%~80%」的正常公司"
+            f"都没有。实际返回：{sorted(r['gross_margin'] for r in rows)[:10]}")
+
     def test_filters_combine_with_and(self):
         result = screen(min_market_cap=100, min_rsi=50, above_ma=200, limit=30)
         assert "error" not in result, result
@@ -352,3 +375,95 @@ class TestPerformance:
         worst = max(float(line.split("cost=")[1].split("..")[1].split(" ")[0])
                     for line in lines if "cost=" in line)
         assert worst < 100000, f"计划内最大节点代价 {worst:,.0f}，太高了\n{plan}"
+
+
+# --------------------------------------------------------------------------
+# 长线排序的封顶（修复轮 2）
+# --------------------------------------------------------------------------
+class TestLongtermRankingCap:
+    """长线排序把两个增长项封顶在 GROWTH_SORT_CAP，防止基数效应统治榜单。
+
+    封顶前实测（2026-08-28，min_market_cap=10）前八名是
+    HUT / TWLO / BEP / NLY / ASTS / NTNX / FIS / BMNR，八个全是靠单项极端值
+    排进来的：BEP 营收只增长 1.1%，却因为利润增长 4511%（几乎肯定是从接近零
+    的利润基数恢复）排到第三。
+    """
+
+    #: 返回值是百分点，库里是小数，所以拿封顶值跟返回值比的时候要乘 100
+    CAP_PCT = screening.GROWTH_SORT_CAP * 100
+
+    def _capped_key(self, row: dict) -> float:
+        """按封顶后的公式，用返回值复算一遍排序键（百分点口径）。
+
+        跟 SQL 里那条是同一个公式，只差一个常数因子 100——
+        排序只看大小关系，常数因子不影响谁在前面。
+        """
+        revenue = min(row.get("revenue_growth_yoy") or 0.0, self.CAP_PCT)
+        earnings = min(row.get("earnings_growth_yoy") or 0.0, self.CAP_PCT)
+        margin = row.get("gross_margin") or 0.0
+        return revenue * 0.4 + earnings * 0.3 + margin * 0.3
+
+    def test_returned_order_follows_the_capped_formula(self):
+        """返回顺序必须按「封顶后的排序键」从大到小排。
+
+        这条直接钉住 SQL 里那个 least() 真的在起作用：
+        封顶被删掉的话，数据库是按**没封顶**的键排的，那个顺序放到封顶后的
+        键上看就会到处乱跳。实测封顶后 0 处违反单调，封顶删掉后 13 处违反。
+        """
+        rows = screen(screen_type="longterm", market="US",
+                      min_market_cap=10, limit=30)["candidates"]
+        assert len(rows) >= 20, "样本太少，看不出排序规律"
+
+        keys = [self._capped_key(r) for r in rows]
+        violations = [
+            (rows[i]["ticker"], round(keys[i], 4),
+             rows[i + 1]["ticker"], round(keys[i + 1], 4))
+            for i in range(len(keys) - 1)
+            if keys[i] < keys[i + 1] - 1e-6]
+
+        assert not violations, (
+            f"返回顺序跟封顶后的排序键对不上，{len(violations)} 处逆序："
+            f"{violations[:5]}——说明 SQL 里的 least() 封顶没起作用")
+
+    def test_quality_beats_base_effect(self):
+        """毛利率高、增速正常的公司，要排在「靠极小基数刷出天文增速」的前面。
+
+        挑的两只真实的票（2026-08-28 实测）：
+          - NVDA：营收 +105.9%、利润 +127.8%、毛利率 74.67%，
+            两个增长项都刚过封顶线，靠的是真实的生意质量。
+          - HUT（Hut 8）：利润 +6007%，毛利率 62.33%。那个 6007% 是从接近零
+            的利润基数恢复出来的，不是生意突然好了六十倍。
+
+        封顶前 HUT 排第 1、NVDA 连前 30 都进不去；
+        封顶后 NVDA 第 7、HUT 第 17。
+        """
+        rows = screen(screen_type="longterm", market="US",
+                      min_market_cap=10, limit=30)["candidates"]
+        tickers = [r["ticker"] for r in rows]
+
+        assert "HUT" in tickers, (
+            "HUT 不在结果里，这条测试的前提没了——它是那个「利润 +6007%」的"
+            "极端值样本。如果它退市或市值掉出门槛，需要重新挑一只样本")
+        assert "NVDA" in tickers, (
+            "NVDA 不在前 30 里。封顶没生效时它正是被极端值票挤出去的，"
+            "所以这一条本身就是封顶失效的信号")
+
+        assert tickers.index("NVDA") < tickers.index("HUT"), (
+            f"NVDA 排第 {tickers.index('NVDA') + 1}、"
+            f"HUT 排第 {tickers.index('HUT') + 1}，"
+            "靠基数效应刷出来的票排在了真实高质量成长股前面")
+
+    def test_cap_does_not_filter_anything_out(self):
+        """封顶只影响排序，不影响筛选。
+
+        `min_growth=500`（增速 500% 以上，远超封顶线 100%）必须照样能筛出票来。
+        要是有人把封顶写进了 where 条件而不是 order by，这条会红。
+        """
+        result = screen(market="US", min_growth=500, limit=30)
+        assert "error" not in result, result
+        rows = result["candidates"]
+        assert rows, "min_growth=500 一只都没筛出来，封顶可能被写进了筛选条件"
+        assert all(r["revenue_growth_yoy"] >= 500 for r in rows), (
+            "返回了增速低于 500% 的票")
+        # 确实有票的增速远超封顶线，证明封顶没把它们挡在门外
+        assert max(r["revenue_growth_yoy"] for r in rows) > 1000

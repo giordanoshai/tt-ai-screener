@@ -100,6 +100,26 @@ _PCT_POINT_FIELDS = (
 )
 
 
+#: 长线排序里，两个增长项各自的封顶值。**这是库里的量级，不是返回值的量级。**
+#:
+#: 排序发生在 SQL 里，吃的是 `stock_fundamentals` 的裸列，那几列存的是小数
+#: （HUT 库里存 0.814，意思是营收增长 81.4%）。返回值那边乘 100 换成百分点是
+#: 查询之后在 Python 侧做的（见 _PCT_POINT_FIELDS），排序看不到。所以封顶值
+#: 写 1.0 = 增速 100%；写成 100 的话等于没封，写成 0.01 的话所有票会被压平。
+#:
+#: **为什么要封顶**：三项裸加、不封顶的话，排序会被基数效应统治。
+#: 2026-08-28 实测，`screen_type="longterm"` 前八名全是靠单项极端值排进来的：
+#: BEP 营收只增长 1.1%，却因为利润增长 4511%（几乎肯定是从接近零的利润基数
+#: 恢复）排到第三。一家增速超过 100% 的公司在这个维度上已经顶格了，
+#: 再去区分 6007% 和 4671%，分辨的是**基数噪音，不是生意质量**。
+#:
+#: 封顶**只影响排序，不影响筛选**：`min_growth` 该放行的照样放行。
+#: 用户想专门找超高增速的票，用 `min_growth=500` 去筛——那是筛选该管的事。
+#:
+#: 毛利率不用封顶，它天然就在 0~1 之间。
+GROWTH_SORT_CAP = 1.0
+
+
 # 最新交易日单独查一次。这一句吃 (market, date desc) 索引，
 # 执行计划代价 1.43，比任何一种「在主查询里现算」都便宜。
 LATEST_DAY_SQL = "select max(date) as d from stock_ohlcv_daily where market = %(market)s"
@@ -198,10 +218,10 @@ def build_screen_sql(
         # 做波段先看放量
         order_clause = "o.vol_ratio desc nulls last"
     else:
-        # 长线看成长和赚钱能力
-        order_clause = """(
-            coalesce(f.revenue_growth_yoy, 0) * 0.4
-          + coalesce(f.earnings_growth_yoy, 0) * 0.3
+        # 长线看成长和赚钱能力。两个增长项都封顶，见 GROWTH_SORT_CAP。
+        order_clause = f"""(
+            least(coalesce(f.revenue_growth_yoy, 0), {GROWTH_SORT_CAP}) * 0.4
+          + least(coalesce(f.earnings_growth_yoy, 0), {GROWTH_SORT_CAP}) * 0.3
           + coalesce(f.gross_margin, 0) * 0.3
         ) desc nulls last"""
 
