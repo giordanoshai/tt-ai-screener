@@ -65,6 +65,7 @@ _RUNLOG_SQL = """
 select job, market, status, rows_written, finished_at
 from ingest_runlog
 where started_at >= now() - interval '48 hours'
+  and (market = %s or market is null)
 order by started_at desc
 limit 12
 """
@@ -187,7 +188,7 @@ def freshness(market: str) -> dict:
     """行情新不新鲜，采集有没有出事。陈旧时工具要在返回里加警告。"""
     day = snapshot.latest_trading_day(market)
     days_old = (datetime.date.today() - day).days if day else None
-    jobs = [dict(row) for row in pg.query(_RUNLOG_SQL)]
+    jobs = [dict(row) for row in pg.query(_RUNLOG_SQL, (market.upper(),))]
     failed = [j for j in jobs if j["status"] == "failed"]
     partial = [j for j in jobs if j["status"] == "partial"]
     return {
@@ -197,7 +198,8 @@ def freshness(market: str) -> dict:
         "stale": bool(days_old is not None and days_old > snapshot.STALE_DAYS),
         "recent_jobs": jobs,
         # 分开报：failed 是「什么都没写出来」，partial 是「写了，但某个
-        # 可选数据源没取到」。混在一起会让真正的失败淹没在噪音里
-        "failed_jobs": [f"{j['job']}({j['status']})" for j in failed],
-        "partial_jobs": [f"{j['job']}({j['status']})" for j in partial],
+        # 可选数据源没取到」。混在一起会让真正的失败淹没在噪音里。
+        # 按任务名去重：同一个任务 48 小时内跑两次都 partial，报两遍没有增量信息
+        "failed_jobs": sorted({f"{j['job']}({j['status']})" for j in failed}),
+        "partial_jobs": sorted({f"{j['job']}({j['status']})" for j in partial}),
     }

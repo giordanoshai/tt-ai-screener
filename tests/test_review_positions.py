@@ -104,3 +104,26 @@ def test_returns_error_json_instead_of_raising():
         mod.pg.query = real
     assert "error" in out
     assert "数据库炸了" in out["error"]
+
+
+def test_failed_jobs_are_reported_even_when_data_is_fresh():
+    """采集任务失败要无条件报。挂在「行情陈旧」下面的话，
+    「行情是新的但某个任务挂了」会完全不出声——那恰恰最该说。"""
+    from core import regime as regime_mod
+    from tools import review_positions as mod
+
+    real = regime_mod.freshness
+
+    def fresh_but_broken(market):
+        out = dict(real(market))
+        out["stale"] = False
+        out["failed_jobs"] = ["us_daily(failed)"]
+        out["partial_jobs"] = []
+        return out
+
+    try:
+        mod.regime.freshness = fresh_but_broken
+        out = json.loads(mod.review_positions())
+    finally:
+        mod.regime.freshness = real
+    assert any("采集任务失败" in w and "us_daily" in w for w in out["warnings"])

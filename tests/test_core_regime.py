@@ -83,3 +83,13 @@ def test_freshness_separates_failed_from_partial():
         assert "(failed)" in name
     for name in out["partial_jobs"]:
         assert "(partial)" in name
+
+
+def test_freshness_only_reports_jobs_from_that_market():
+    """按市场过滤要真的生效。不过滤的话，A股任务会顶着「US」的标签报给用户。"""
+    us = regime.freshness("US")
+    cn = regime.freshness("CN")
+    assert not any(name.startswith("cn_") for name
+                   in us["failed_jobs"] + us["partial_jobs"])
+    assert not any(name.startswith("us_") for name
+                   in cn["failed_jobs"] + cn["partial_jobs"])

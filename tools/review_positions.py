@@ -249,8 +249,13 @@ def review_positions(ticker: str | None = None) -> str:
             if fresh["stale"]:
                 warnings.append(
                     f"{market} 行情最新只到 {fresh['latest_trading_day']}，"
-                    f"距今 {fresh['days_since']} 天。"
-                    f"最近失败的采集任务：{fresh['failed_jobs'] or '无'}")
+                    f"距今 {fresh['days_since']} 天")
+            if fresh["failed_jobs"]:
+                # 失败要无条件报，不挂在 stale 下面——原来那样会导致
+                # 「行情是新的但某个采集任务挂了」这种情况完全不出声，
+                # 而那恰恰是最该说的
+                warnings.append(
+                    f"{market} 有采集任务失败：{fresh['failed_jobs']}")
             if fresh["partial_jobs"]:
                 warnings.append(
                     f"{market} 有采集任务只跑了一半（数据写了，某个可选源没取到）："

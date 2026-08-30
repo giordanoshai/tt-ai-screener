@@ -211,6 +211,18 @@ def test_position_stop_gives_a_reachable_forward_stop_when_deeply_underwater():
     assert out["forward_stop"] < 56.0          # 永远在市价下方
 
 
+def test_position_stop_forward_stop_falls_back_to_price_minus_atr():
+    """所有候选都在市价上方时，走 close − 2×ATR 这条兜底。
+
+    上一条测试里 ma_20 在市价下方，直接短路了这条分支——它一次都没被断言碰过，
+    改错符号或倍数整套测试都不会红。
+    """
+    out = scoring.position_stop(100.0, snap(close=90.0, atr_14=4.0, ma_20=95.0))
+    assert out["suggested_stop"] == 95.0      # 两个候选都在 90 上方
+    assert out["forward_stop"] == 82.0        # 90 − 2×4
+    assert out["forward_stop"] < 90.0
+
+
 # ---------------- 补测（评审修 4）：score_mid、缺均线、异常兜底 ----------------
 
 def test_score_mid_uses_fundamentals():
