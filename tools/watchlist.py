@@ -78,7 +78,8 @@ def add_to_watchlist(ticker: str) -> str:
             return json.dumps({"error": "ticker is required"})
 
         known = pg.query_one(
-            "select ticker from stocks_meta where ticker = %s", (ticker,))
+            "select ticker, market from stocks_meta where ticker = %s",
+            (ticker,))
         if not known:
             return json.dumps(
                 {"error": f"{ticker} 不在数据库里。等 tt-data-hub 下次采集后再试。"},
