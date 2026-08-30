@@ -151,17 +151,22 @@ class TestFilters:
             assert row["pe_ratio"] is None or row["pe_ratio"] <= 15, row
 
     def test_min_growth_respected(self):
-        """参数是百分比，库里存的是小数（15 -> 0.15）。"""
+        """入参是百分比（20 就是 20%），返回值也是百分点，所以直接比 20。
+
+        中间那一段「除以 100 再跟库里的小数列比」是实现细节：
+        库里 `revenue_growth_yoy` 存 0.20 表示增长 20%，进 SQL 时要除，
+        出结果时要乘。入参和返回值在同一个量纲上，这条断言才读得通。
+        """
         result = screen(min_growth=20, limit=30)
         assert result["candidates"]
         for row in result["candidates"]:
-            assert row["revenue_growth_yoy"] >= 0.20, row
+            assert row["revenue_growth_yoy"] >= 20, row
 
     def test_min_margin_respected(self):
         result = screen(min_margin=50, limit=30)
         assert result["candidates"]
         for row in result["candidates"]:
-            assert row["gross_margin"] >= 0.50, row
+            assert row["gross_margin"] >= 50, row
 
     def test_filters_combine_with_and(self):
         result = screen(min_market_cap=100, min_rsi=50, above_ma=200, limit=30)

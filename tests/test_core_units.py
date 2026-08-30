@@ -16,12 +16,15 @@
 把 `core/snapshot._pct_points` 换回 `_f`、把 `core/fundamental._shape`
 里的换算删掉，这一行会不会红？会红才留。
 """
+import json
 import statistics
 
 import pytest
 
 from core import fundamental, scoring, snapshot
 from db import pg
+from tools import screening
+from tools.analyze_ticker import analyze_ticker
 
 #: 复算和库里的值之间允许的误差。库里存了十几位小数，交出去 round 到 2 位，
 #: 所以 0.02 是纯粹的四舍五入余量，不是给单位错误留的口子——
@@ -309,3 +312,98 @@ def test_score_mid_reasons_print_growth_at_the_right_magnitude():
     # NVDA 真实营收增速是三位数；印成 1.1 就是把小数当百分点了
     assert printed > 10, f"印出来的营收增速是 {printed}%，量级不对"
     assert printed == pytest.approx(fund["revenue_growth_yoy"], abs=0.05)
+
+
+# --------------------------- 对外工具之间不许再分叉
+
+
+def _screen_megacaps(**kwargs) -> list[dict]:
+    """筛一批巨头出来。市值 2000 亿以上，一定天天有行情、不会停牌，
+    所以「筛出来的那天」和「体检看到的那天」必然是同一天。"""
+    out = json.loads(screening.screen_stocks(
+        market="US", min_market_cap=200, limit=30, **kwargs))
+    assert "error" not in out, out
+    return out["candidates"]
+
+
+def test_screen_stocks_and_analyze_ticker_agree_on_the_same_field():
+    """两个对外 MCP 工具返回的同名字段，必须是同一个量纲。
+
+    这条是这轮唯一能防止单位再次分叉的东西。修复前的局面是：
+        screen_stocks   dist_ma20_pct = 0.0318
+        analyze_ticker  dist_ma20_pct = 3.18
+    Claude 在一次对话里先筛股、再对命中的票做体检，横向一比就必然算错。
+
+    不写死票代码：从筛选结果里拿票，再拿同一只票去体检，
+    所以无论哪天跑、筛到谁，比的都是同一只票的同一个字段。
+    """
+    candidates = [c for c in _screen_megacaps()
+                  if c.get("dist_ma20_pct") is not None
+                  and c.get("atr_pct") is not None]
+    assert len(candidates) >= 3, "筛出来的巨头太少，这条测试证明不了什么"
+
+    checked = 0
+    for cand in candidates[:5]:
+        detail = json.loads(analyze_ticker(cand["ticker"], horizon="short"))
+        if detail.get("error"):
+            continue
+        trend = detail["trend"]
+        assert cand["dist_ma20_pct"] == pytest.approx(
+            trend["dist_ma20_pct"], abs=0.02), (
+            f"{cand['ticker']}：screen_stocks 给 {cand['dist_ma20_pct']}，"
+            f"analyze_ticker 给 {trend['dist_ma20_pct']}，两个工具单位分叉了")
+        assert cand["atr_pct"] == pytest.approx(trend["atr_pct"], abs=0.02), (
+            f"{cand['ticker']} 的 atr_pct 在两个工具里对不上")
+        checked += 1
+
+    assert checked >= 3, f"只比对上 {checked} 只票，样本不够"
+
+
+def test_screen_stocks_and_fundamental_agree_on_growth_and_margin():
+    """基本面那几列也不许分叉。`core/fundamental` 和 `screen_stocks`
+    查的是同一张表的同一行，交出来的必须是同一个量纲。"""
+    candidates = [c for c in _screen_megacaps()
+                  if c.get("revenue_growth_yoy") is not None][:5]
+    assert len(candidates) >= 3
+
+    tickers = [c["ticker"] for c in candidates]
+    funds = fundamental.get(tickers, "US")
+
+    checked = 0
+    for cand in candidates:
+        fund = funds.get(cand["ticker"])
+        if not fund or fund.get("revenue_growth_yoy") is None:
+            continue
+        assert cand["revenue_growth_yoy"] == pytest.approx(
+            fund["revenue_growth_yoy"], abs=0.02), (
+            f"{cand['ticker']}：screen_stocks 给 "
+            f"{cand['revenue_growth_yoy']}，core/fundamental 给 "
+            f"{fund['revenue_growth_yoy']}")
+        checked += 1
+
+    assert checked >= 3, f"只比对上 {checked} 只票，样本不够"
+
+
+def test_screen_stocks_min_growth_takes_a_percentage_not_a_ratio():
+    """`min_growth=15` 必须是「增速 15% 以上」，不能变成「1500% 以上」。
+
+    库里 `revenue_growth_yoy` 存小数，所以入参要除以 100 再进 SQL。
+    这个除法一旦被当成多余删掉，门槛就变成 1500%——**它不会报错**，
+    而是筛出一批从接近零的基数起步的极端值，返回一份格式完全正常的垃圾。
+    所以断言不能只写「都 >= 15」（1500% 那批也满足），
+    必须要求「15%~100% 这个正常档位里有票」——那一档在错误实现下是空的。
+    """
+    out = json.loads(screening.screen_stocks(
+        market="US", min_growth=15, limit=30))
+    assert "error" not in out, out
+    rows = out["candidates"]
+    assert rows, "min_growth=15 一只都没筛出来"
+
+    assert all(r["revenue_growth_yoy"] >= 15 for r in rows), (
+        "有票的营收增速低于门槛")
+
+    normal = [r for r in rows if 15 <= r["revenue_growth_yoy"] <= 100]
+    assert normal, (
+        "筛出来的票营收增速全都超过 100%，一只「增速 15%~100%」的正常公司都没有"
+        "——门槛被当成 1500% 了。实际返回："
+        f"{sorted(r['revenue_growth_yoy'] for r in rows)[:10]}")

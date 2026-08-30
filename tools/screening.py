@@ -26,6 +26,18 @@
 
 输出必须是**轻量摘要**：条件是强制的，条数封顶 30，空的伽马墙字段直接不输出。
 这是整个项目的核心约束，别为了「顺手多带点」把它弄丢。
+
+## 单位：两个方向，别弄混
+
+这个模块两头都要跟单位打交道，方向是相反的：
+
+- **入参 → SQL**：`min_growth` / `min_margin` 收的是百分比（15 就是 15%），
+  库里那两列存的是小数，所以进 SQL 之前除以 100。
+- **库 → 返回值**：`revenue_growth_yoy` 这些列查出来是小数，
+  交给使用者之前乘 100 换成百分点，跟 `analyze_ticker` 对齐。
+  名单见 `_PCT_POINT_FIELDS`。
+
+`pct_chg` 两边都不碰——库里存的它本来就是百分点。
 """
 import json
 import re
@@ -65,6 +77,27 @@ _GEX_FIELDS = ("gex_call_wall", "gex_put_wall", "gex_gamma_flip", "gex_gamma_mag
 
 # 内部字段，拼完摘要就从每行里删掉，不发给上层。
 _INTERNAL_FIELDS = ("_sector_from_meta",)
+
+#: 库里存小数（0.164 = 16.4%），交给使用者之前一律换成百分点。
+#:
+#: **为什么这里要换**：`screen_stocks` 和 `analyze_ticker` 是同一批对外的 MCP
+#: 工具，会在同一次对话里先后出现（先筛股、再对命中的票做体检）。
+#: 换算之前，同一只票在两个工具里长这样：
+#:
+#:     screen_stocks   dist_ma20_pct = 0.0318
+#:     analyze_ticker  dist_ma20_pct = 3.18
+#:
+#: 同名字段差 100 倍，横向一比就必然算错。所以这里对齐到
+#: `core/snapshot.py` / `core/fundamental.py` 定下的那条约定：
+#: **交到使用者手上的 `_pct` 和增长率/利润率，一律是百分点。**
+#:
+#: 注意 `pct_chg` 不在这张表里——库里存的它已经是百分点了，再乘一次
+#: 会把「当日跌 4.57%」变成「跌 457%」。同一张日线表混了两套单位，
+#: 这是上游 tt-data-hub 的既成事实，见 core/snapshot.py 的模块说明。
+_PCT_POINT_FIELDS = (
+    "dist_ma20_pct", "dist_ma200_pct", "atr_pct",
+    "revenue_growth_yoy", "earnings_growth_yoy", "gross_margin",
+)
 
 
 # 最新交易日单独查一次。这一句吃 (market, date desc) 索引，
@@ -136,10 +169,17 @@ def build_screen_sql(
         where.append("(f.pe_ratio <= %(max_pe)s or f.pe_ratio is null)")
         params["max_pe"] = max_pe
     if min_growth is not None:
-        # 入参是百分比，库里存的是小数
+        # **入参是百分比（15 就是 15%），库里那一列存的是小数（0.15），
+        # 所以这里必须除以 100 再比。** 别看着「15 变成 0.15」觉得多余就删掉：
+        # 删了之后 min_growth=15 会变成「营收增速 1500% 以上」，
+        # 筛出来的全是从接近零的基数起步的极端值，而且不报错，
+        # 返回的还是一份格式完全正常的结果，非常难发现。
+        # 注意这跟返回值那边的换算是**两个方向**：入参百分比→小数进 SQL，
+        # 库里小数→百分点出结果（见 _PCT_POINT_FIELDS）。
         where.append("f.revenue_growth_yoy >= %(min_growth)s")
         params["min_growth"] = min_growth / 100.0
     if min_margin is not None:
+        # 同上，入参是百分比，gross_margin 库里存小数
         where.append("f.gross_margin >= %(min_margin)s")
         params["min_margin"] = min_margin / 100.0
     if min_rsi is not None:
@@ -243,6 +283,11 @@ def screen_stocks(
     min_rsi/max_rsi: 相对强弱指标 RSI-14 的上下限（0-100，50 是多空均衡）
     above_ma:        股价必须站上哪条均线（20 / 50 / 200）
     limit:           最多返回几只，默认 20，上限 30
+
+    **返回值的单位**：`dist_ma20_pct`、`dist_ma200_pct`、`atr_pct`、
+    `revenue_growth_yoy`、`earnings_growth_yoy`、`gross_margin` 都是**百分点**
+    （3.18 就是 3.18%），跟 `analyze_ticker` 返回的同名字段是一个量纲，
+    可以直接横向比。`pct_chg` 也是百分点。
     """
     market = (market or "US").upper().strip()
 
@@ -302,6 +347,16 @@ def screen_stocks(
     for row in rows:
         for key in _INTERNAL_FIELDS:
             row.pop(key, None)
+        # 比率列换成百分点再交出去，跟 analyze_ticker 对齐（见 _PCT_POINT_FIELDS）。
+        # 换算放在这里、不放进 SQL，是因为排序表达式
+        # （revenue_growth_yoy*0.4 + earnings_growth_yoy*0.3 + gross_margin*0.3）
+        # 直接吃的是库里那几列。在 Python 侧、查完之后再换，排序结果一个字都不变；
+        # 在 SQL 的 select 列表里乘 100 也不影响排序，但下一个人很容易顺手把
+        # order by 也改了，那就把命中顺序改掉了。
+        for key in _PCT_POINT_FIELDS:
+            value = row.get(key)
+            if value is not None:
+                row[key] = round(float(value) * 100, 2)
         # 伽马墙整组为空就整组删掉，省 token
         if all(row.get(k) is None for k in _GEX_FIELDS):
             for key in _GEX_FIELDS:
