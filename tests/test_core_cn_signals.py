@@ -64,6 +64,24 @@ def test_board_ranking_ranks_are_distinct_and_complete():
         range(1, out["total_boards"] + 1))
 
 
+def test_board_ranking_top_and_bottom_match_the_extremes():
+    """rank 是按行序编的，所以只判 rank 挡不住排序方向反了——
+    把 _BOARD_SQL 的 desc 改成 asc，「最强」和「最弱」整个对调，
+    而 top[0]["rank"] == 1、bottom[0]["rank"] == N 照样成立。
+    所以必须跟表里的 max/min 实比。
+    """
+    row = pg.query_one(
+        "select max(net_amount) as strongest, min(net_amount) as weakest "
+        "from cn_board_flow_daily "
+        "where board_type = 'industry' "
+        "  and snapshot_date = (select max(snapshot_date) "
+        "                       from cn_board_flow_daily "
+        "                       where board_type = 'industry')")
+    out = cn_signals.board_ranking()
+    assert out["top"][0]["net_amount"] == float(row["strongest"])
+    assert out["bottom"][0]["net_amount"] == float(row["weakest"])
+
+
 def test_board_ranking_rejects_bad_type():
     with pytest.raises(ValueError):
         cn_signals.board_ranking("sector")
