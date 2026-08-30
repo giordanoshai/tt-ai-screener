@@ -199,3 +199,44 @@ def test_position_stop_takes_the_higher_of_cost_atr_and_ma20():
 def test_position_stop_flags_breach():
     out = scoring.position_stop(100.0, snap(close=90.0, atr_14=4.0, ma_20=95.0))
     assert out["breached"] is True
+
+
+# ---------------- 补测（评审修 4）：score_mid、缺均线、异常兜底 ----------------
+
+def test_score_mid_uses_fundamentals():
+    fund = {"revenue_growth_yoy": 12.0, "earnings_growth_yoy": 8.0,
+            "profit_margin": 15.0, "roe": 18.0,
+            "analyst_target_price": 120.0, "week_52_high": 103.0}
+    out = scoring.score_mid(snap(), fund=fund,
+                            news={"sentiment_label": "Positive",
+                                  "significant": "Medium"})
+    assert out["score"] >= 70
+    assert out["gaps"] == []
+    assert any("营收" in r for r in out["reasons"])
+
+
+def test_score_mid_without_fundamentals_renormalizes():
+    """没有基本面时，那 35 分和 52 周高点那 20 分都要退出分母并写进 gaps。"""
+    out = scoring.score_mid(snap(), fund=None)
+    assert any("基本面" in g for g in out["gaps"])
+    assert any("52 周" in g for g in out["gaps"])
+    assert 0 <= out["score"] <= 100
+
+
+def test_missing_moving_averages_is_a_gap_not_a_downtrend():
+    """全空的快照没有任何证据说趋势向下，不能编一条「均线全在头顶」出来。"""
+    out = scoring.score_short({})
+    assert any("均线" in g for g in out["gaps"])
+    assert not any("趋势是向下" in r for r in out["risks"])
+
+
+def test_empty_snapshot_never_raises():
+    assert 0 <= scoring.score_short({})["score"] <= 100
+    assert 0 <= scoring.score_short_cn({})["score"] <= 100
+    assert 0 <= scoring.score_mid({})["score"] <= 100
+
+
+def test_plan_trade_with_zero_price_does_not_raise():
+    """停牌或坏数据可能给出 close=0，不能崩。"""
+    plan = scoring.plan_trade(snap(close=0.0), "breakout")
+    assert plan["stop_pct"] is None

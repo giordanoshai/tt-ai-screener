@@ -10,8 +10,8 @@
 
 ## 归一化：缺数据不等于扣分
 
-某一路数据缺了（A股没期权、某票没新闻），把那一项从分母里去掉再算百分比，
-并把缺的写进 `gaps`。60 分永远表示「拿到的依据里有六成是好的」。
+某一路数据缺了（A股没有期权数据、停牌票拿不到均线），把那一项从分母里去掉再算
+百分比，并把缺的写进 `gaps`。60 分永远表示「拿到的依据里有六成是好的」。
 要是缺一项就白扣 25 分，一只好票会因为「我们没查到它的期权数据」
 而被排到烂票后面——那是拿系统的无知去惩罚股票。
 """
@@ -177,6 +177,14 @@ class _Ledger:
 
 def _score_trend(led: _Ledger, snap: dict, weight: float):
     """趋势：站在哪几条均线上方、排列顺不顺。"""
+    ma_20, ma_50 = _num(snap.get("ma_20")), _num(snap.get("ma_50"))
+    ma_200 = _num(snap.get("ma_200"))
+    if ma_20 is None and ma_50 is None and ma_200 is None:
+        # 三条均线全缺 = 不知道趋势，不是趋势向下。硬给一条「均线全在头顶」
+        # 是在编造证据，比不给结论危险得多。
+        led.skip("没有均线数据，趋势这一项算不了")
+        return
+
     got = 0.0
     parts = []
     if snap.get("above_ma20"):
@@ -185,7 +193,6 @@ def _score_trend(led: _Ledger, snap: dict, weight: float):
     if snap.get("above_ma50"):
         got += 0.33
         parts.append("站上 50 日均线")
-    ma_20, ma_50 = _num(snap.get("ma_20")), _num(snap.get("ma_50"))
     if ma_20 and ma_50 and ma_20 > ma_50:
         got += 0.16
         parts.append("均线多头排列")
@@ -240,7 +247,12 @@ def _score_flow(led: _Ledger, flow: dict | None, weight: float):
 
 
 def _score_news(led: _Ledger, news: dict | None, weight: float):
-    """消息面：有没有雷，有没有催化。"""
+    """消息面：有没有雷，有没有催化。
+
+    news 是 None **不**当缺数据处理。新闻表一直查得到，空结果就是「近期没有
+    够级别的消息」——这本身是个信号（没有雷），跟「期权接口没取到」不是一回事。
+    所以给中性偏正的分，不 skip。
+    """
     if not news:
         led.add(weight * 0.6, weight, "近期无重大消息")
         return
@@ -468,7 +480,7 @@ def plan_trade(snap: dict, setup: str) -> dict:
     return {
         "entry_zone": [round(zone[0], 2), round(zone[1], 2)],
         "stop": round(stop, 2),
-        "stop_pct": round(risk / entry * 100, 2),
+        "stop_pct": round(risk / entry * 100, 2) if entry else None,
         "targets": targets,
         "rr_ratio": TARGET_R_MULTIPLES[0],
         "gaps": gaps,
