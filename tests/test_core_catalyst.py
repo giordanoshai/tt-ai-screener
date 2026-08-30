@@ -84,9 +84,10 @@ def test_insider_only_counts_open_market_trades():
 
 
 def test_congress_returns_buy_sell_records():
-    """设计文档第四节工具 3 要国会议员交易。GOOGL 8/24 有一条真实记录。"""
+    """设计文档第四节工具 3 要国会议员交易。这三只大盘股一年内必有记录。"""
     out = catalyst.congress_for(POSITIONS, days=365)
     assert set(out) == set(POSITIONS)
+    assert any(out.values()), "三只票一年内一条国会议员交易都没有，多半是查询坏了"
     for records in out.values():
         for r in records:
             assert {"transaction_date", "member", "txn_type", "amounts"} <= set(r)
@@ -96,3 +97,24 @@ def test_gamma_walls_covers_few_tickers_and_says_so():
     """uw_gex_daily 只有 41 只票，没覆盖的要返回 None 而不是编一个。"""
     out = catalyst.gamma_walls(["NVDA", "NOSUCHTICKERXYZ"])
     assert out["NOSUCHTICKERXYZ"] is None
+
+
+def test_options_flow_live_shape_matches_db_shape():
+    """实时和库里两条路必须是同一个字典形状，调用方才敢统一读。"""
+    live = catalyst.options_flow_live(["NVDA"])["NVDA"]
+    db = catalyst.options_flow(["NVDA"])["NVDA"]
+    assert set(live) == set(db)
+
+
+def test_options_flow_live_distinguishes_no_data_from_no_flow():
+    """实时返回空数组 = 「查过了，这只票没异动」，不能拿库里的旧数据顶掉
+    再标成 db——那是在告诉用户「这是缓存」，而其实刚刚实时查过。"""
+    import core.uw as uw_mod
+    real = uw_mod.flow_alerts_many
+    try:
+        uw_mod.flow_alerts_many = lambda tickers, limit=50: {t: [] for t in tickers}
+        out = catalyst.options_flow_live(["NVDA"])["NVDA"]
+        assert out["source"] == "uw_live"
+        assert out["alert_count"] == 0
+    finally:
+        uw_mod.flow_alerts_many = real

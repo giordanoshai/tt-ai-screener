@@ -109,7 +109,7 @@ from uw_congress
 where ticker = any(%s)
   and transaction_date >= %s
 order by transaction_date desc
-limit 40
+limit %s
 """
 
 _GEX_SQL = """
@@ -250,7 +250,15 @@ def options_flow_live(tickers: list[str]) -> dict[str, dict]:
     out = {}
     for ticker in tickers:
         rows = live.get(ticker)
-        out[ticker] = uw.summarize_flow(rows) if rows else fallback[ticker]
+        if rows is None:
+            # 实时接口没取到（超时、报错、没配密钥），退回库里的
+            out[ticker] = fallback[ticker]
+        else:
+            # 实时取到了。空数组也算取到——「实时查过，这只票近期没有异动」
+            # 是个结论，不是缺数据，不能拿旧数据顶掉再说成缓存
+            summary = uw.summarize_flow(rows)
+            summary["last_day"] = None   # 实时数据没有「库里最后一天」这回事
+            out[ticker] = summary
     return out
 
 
@@ -285,7 +293,10 @@ def congress_for(tickers: list[str],
         return {}
     since = datetime.date.today() - datetime.timedelta(days=days)
     out: dict[str, list[dict]] = {t: [] for t in tickers}
-    for row in pg.query(_CONGRESS_SQL, (tickers, since)):
+    # 上限跟票数挂钩。写死一个数的话，票一多就会有票被挤掉，
+    # 而调用方收到空列表分不清是真没有还是被截断了。
+    limit = max(40, len(tickers) * 10)
+    for row in pg.query(_CONGRESS_SQL, (tickers, since, limit)):
         out.setdefault(row["ticker"], []).append({
             "transaction_date": row["transaction_date"],
             "filed_at_date": row.get("filed_at_date"),
