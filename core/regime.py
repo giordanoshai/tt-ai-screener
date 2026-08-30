@@ -85,6 +85,27 @@ def _f(value):
     return None if value is None else float(value)
 
 
+def _empty(market: str, reason: str, source: str) -> dict:
+    """没数据时的兜底。**每个契约字段都要在**，只是值为 None。
+
+    调用方拿到的字典形状必须跟正常路径一致——不然它在「缺数据」这个
+    最该稳的场景下反而会 KeyError，正好跟降级的目的相反。
+    """
+    out = {
+        "market": market, "date": None,
+        "advances": None, "declines": None, "ad_ratio": None,
+        "pct_above_ma20": None, "pct_above_ma50": None, "pct_above_ma200": None,
+        "new_highs_20": None, "new_lows_20": None,
+        "level": "UNKNOWN", "source": source, "note": reason,
+        "gaps": [reason],
+    }
+    if market == "CN":
+        out.update({"total": None, "limit_up_count": None,
+                    "broken_count": None, "broken_rate": None,
+                    "max_limit_streak": None})
+    return out
+
+
 def get(market: str) -> dict:
     """当前市场环境。美股读宽度表，A股当场算。"""
     market = (market or "").upper()
@@ -94,9 +115,7 @@ def get(market: str) -> dict:
     if market == "US":
         row = pg.query_one(_US_BREADTH_SQL)
         if not row:
-            return {"market": "US", "date": None, "level": "UNKNOWN",
-                    "source": "market_breadth_daily", "note": "",
-                    "gaps": ["没有市场宽度数据"]}
+            return _empty("US", "没有市场宽度数据", "market_breadth_daily")
         return {
             "market": "US",
             "date": row["date"],
@@ -117,9 +136,7 @@ def get(market: str) -> dict:
 
     day = snapshot.latest_trading_day("CN")
     if day is None:
-        return {"market": "CN", "date": None, "level": "UNKNOWN",
-                "source": "stock_ohlcv_daily", "note": "",
-                "gaps": ["没有 A股行情"]}
+        return _empty("CN", "没有 A股行情", "stock_ohlcv_daily")
 
     row = pg.query_one(_CN_BREADTH_SQL, (day,)) or {}
     advances = row.get("advances") or 0
@@ -128,11 +145,20 @@ def get(market: str) -> dict:
 
     gaps = []
     limit_row = pg.query_one(_CN_LIMIT_SQL) or {}
-    limit_up = limit_row.get("limit_up_count")
-    if not limit_up:
+    limit_date = limit_row.get("date")
+    limit_up = broken = broken_rate = None
+    if limit_date is None:
+        # 表里一行都没有。注意不能用 `not limit_up` 判断——count(*) 在
+        # 匹配不到行时返回的是 0 不是 None，会把「真的零涨停」也吞进来
         gaps.append("没有涨停板数据")
-    broken = limit_row.get("broken_count") or 0
-    broken_rate = round(broken / limit_up, 3) if limit_up else None
+    else:
+        limit_up = limit_row.get("limit_up_count") or 0
+        broken = limit_row.get("broken_count") or 0
+        broken_rate = round(broken / limit_up, 3) if limit_up else None
+        if limit_date != day:
+            # 涨停采集落后于日线采集。不说破的话，两天的数据会被贴上
+            # 同一个日期标签摆在一起
+            gaps.append(f"涨停数据停留在 {limit_date}，比行情日 {day} 旧")
 
     return {
         "market": "CN",
@@ -162,12 +188,16 @@ def freshness(market: str) -> dict:
     day = snapshot.latest_trading_day(market)
     days_old = (datetime.date.today() - day).days if day else None
     jobs = [dict(row) for row in pg.query(_RUNLOG_SQL)]
-    failed = [j for j in jobs if j["status"] in ("failed", "partial")]
+    failed = [j for j in jobs if j["status"] == "failed"]
+    partial = [j for j in jobs if j["status"] == "partial"]
     return {
         "market": market.upper(),
         "latest_trading_day": day,
         "days_since": days_old,
         "stale": bool(days_old is not None and days_old > snapshot.STALE_DAYS),
         "recent_jobs": jobs,
+        # 分开报：failed 是「什么都没写出来」，partial 是「写了，但某个
+        # 可选数据源没取到」。混在一起会让真正的失败淹没在噪音里
         "failed_jobs": [f"{j['job']}({j['status']})" for j in failed],
+        "partial_jobs": [f"{j['job']}({j['status']})" for j in partial],
     }

@@ -21,16 +21,36 @@ def test_us_regime_says_it_is_sp500_only():
     assert "标普" in out["note"] or "500" in out["note"]
 
 
-def test_cn_regime_is_computed_from_daily_bars():
+def test_cn_regime_counts_only_cn_tickers():
+    """市场过滤写错时必须红。
+
+    只断言「涨跌家数 > 100」是拦不住的——美股口径、混合口径也都远超 100，
+    而那正是规矩 2 要防的那类事故。所以直接跟库里 A股当日的真实票数比。
+    """
+    from db import pg
+
+    from core import snapshot as snap_mod
+
+    day = snap_mod.latest_trading_day("CN")
+    expected = pg.query_one(
+        "select count(*) as n from stock_ohlcv_daily "
+        "where market = 'CN' and date = %s", (day,))
     out = regime.get("CN")
-    assert out["market"] == "CN"
     assert out["source"] == "stock_ohlcv_daily"
-    assert out["advances"] + out["declines"] > 100
+    assert out["date"] == day
+    assert out["total"] == expected["n"]
+    assert out["advances"] + out["declines"] <= out["total"]
 
 
-def test_cn_regime_includes_limit_up_sentiment():
+def test_cn_regime_limit_up_count_matches_the_table():
+    """涨停家数要跟涨停表对得上，不能只判键在不在。"""
+    from db import pg
+
+    row = pg.query_one(
+        "select count(*) as n from cn_limit_pool_daily "
+        "where snapshot_date = (select max(snapshot_date) from cn_limit_pool_daily)")
     out = regime.get("CN")
-    assert "limit_up_count" in out
+    assert out["limit_up_count"] == row["n"]
 
 
 def test_regime_bad_market_raises():
@@ -38,8 +58,28 @@ def test_regime_bad_market_raises():
         regime.get("HK")
 
 
-def test_freshness_reports_days_and_last_ingest():
+def test_freshness_days_since_matches_the_calendar():
+    """陈旧判断要真的算过，不能只判它返回了个 bool。"""
+    import datetime
+
+    from core import snapshot as snap_mod
+
     out = regime.freshness("US")
-    assert out["latest_trading_day"] is not None
-    assert isinstance(out["stale"], bool)
-    assert isinstance(out["recent_jobs"], list)
+    day = snap_mod.latest_trading_day("US")
+    assert out["market"] == "US"
+    assert out["latest_trading_day"] == day
+    assert out["days_since"] == (datetime.date.today() - day).days
+    assert out["stale"] == (out["days_since"] > snap_mod.STALE_DAYS)
+    assert isinstance(out["failed_jobs"], list)
+    assert isinstance(out["partial_jobs"], list)
+
+
+def test_freshness_separates_failed_from_partial():
+    """partial 是「跑完了但某个可选源没取到」，不是失败。混在一起报警，
+    用户会学会无视这个警报，然后真出事那次也一起无视。"""
+    out = regime.freshness("US")
+    assert not (set(out["failed_jobs"]) & set(out["partial_jobs"]))
+    for name in out["failed_jobs"]:
+        assert "(failed)" in name
+    for name in out["partial_jobs"]:
+        assert "(partial)" in name
