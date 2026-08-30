@@ -19,7 +19,18 @@ PG_WRITE_URL = os.getenv("PG_WRITE_URL") or os.getenv("WRITE", "")
 WATCHLIST_USER_ID = os.getenv(
     "WATCHLIST_USER_ID", "29795d82-c53b-43e5-985b-cb67b565d7bd")
 
-UW_API_TOKEN = os.getenv("UW_API_TOKEN", "")
+# Unusual Whales 实时接口。走 ai-tool.indevs.in 的代理，不直连官方域名。
+#
+# .env 里这两个键的名字是历史遗留的 UW_T_ENDPOINT / UW_T_KEY，
+# 而 CLAUDE.md 写的是 UW_API_TOKEN——两边对不上，导致 config 一直读到空字符串。
+# 这里两个名字都认，新名字优先，谁都不用改 .env。
+UW_API_BASE = (os.getenv("UW_API_BASE") or os.getenv("UW_T_ENDPOINT")
+               or "https://ai-tool.indevs.in/unusualwhales").rstrip("/")
+UW_API_TOKEN = os.getenv("UW_API_TOKEN") or os.getenv("UW_T_KEY", "")
+
+# 单次请求的超时（秒）。实测单票期权流 3.6 秒、实时警报 12~14 秒，
+# 给到 20 秒是留给网络抖动的余量；超了就当这一路没有，走降级。
+UW_TIMEOUT = float(os.getenv("UW_TIMEOUT", "20"))
 
 # AI 模型的正式配置在 config/models.json（原来是 DuckDB 的 ai_models 表，
 # 迁库时漏了，线上没有）。**密钥不在那个 JSON 里**：每个模型只写一个
