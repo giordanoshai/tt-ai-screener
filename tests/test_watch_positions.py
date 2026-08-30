@@ -1510,3 +1510,62 @@ def test_market_wide_article_does_not_starve_a_ticker_of_its_own_news(
     assert any("个股专属消息排第二条" in a["what_happened"] for a in matched), (
         "大盘综述占了第一名额，第二条个股专属消息不该被丢掉")
     assert not any("大盘综述排第一条" in a["what_happened"] for a in matched)
+
+
+def test_option_flow_total_counts_rows_whose_direction_is_unknown(monkeypatch):
+    """算「这批期权交易一共多大」时，方向判不出来的那些笔也得算进去。
+
+    库里有大量 sentiment 既不是 bullish 也不是 bearish 的行——近 30 天
+    1658 笔，最大一笔 3.68 亿美元，持仓票里 AMZN 就出现过一笔 54 万美元。
+    早期写法是 `total_sum = bullish_sum + bearish_sum`，把这些行漏掉了，
+    于是一笔已经超过 50 万硬门槛的交易会被判成「量级不算大，谈不上大资金
+    押注」。方向跟评审 I4 相反：I4 是把小的说大，这条是把大的说小。
+
+    构造：看涨 20 万 + 看跌 10 万 + 方向未知 40 万。只加前两桶是 30 万，
+    不到 50 万门槛；全部加起来 70 万，过门槛。所以漏算那一桶会让这条
+    告警从「大额」掉到「量级不算大」。
+    """
+    from db import pg
+
+    held = pg.query("select ticker from user_positions where market = 'US'")
+    if not held:
+        pytest.skip("没有美股持仓，这条测不了")
+    target = held[0]["ticker"]
+
+    rows = [
+        {"ticker": target, "opt_type": "CALL", "total_premium": 200_000.0,
+         "score": 90.0, "sentiment": "bullish", "day": "2026-08-30",
+         "strike": 100.0, "expiry": "2026-09-18"},
+        {"ticker": target, "opt_type": "PUT", "total_premium": 100_000.0,
+         "score": 90.0, "sentiment": "bearish", "day": "2026-08-30",
+         "strike": 90.0, "expiry": "2026-09-18"},
+        {"ticker": target, "opt_type": "CALL", "total_premium": 400_000.0,
+         "score": 90.0, "sentiment": "neutral", "day": "2026-08-30",
+         "strike": 110.0, "expiry": "2026-09-18"},
+    ]
+    original_query = wp.pg.query
+
+    def fake_query(sql, params=None):
+        if "percentile_cont" in sql and "flow_alerts_archive" in sql:
+            return [{"ticker": target, "p90": 0.0}]   # 让三行都算「过线」
+        if "from flow_alerts_archive" in sql or "unnest" in sql:
+            return rows
+        return original_query(sql, params)
+
+    monkeypatch.setattr(wp.pg, "query", fake_query)
+    monkeypatch.setattr(wp.uw, "available", lambda: False)  # 隔离掉打架合并
+
+    out = run()
+    matched = [a for a in out["alerts"] if a["ticker"] == target
+               and a["source"] == "options_flow_archive"]
+    assert len(matched) == 1, f"应当只有一条期权异动告警，实际 {len(matched)} 条"
+    alert = matched[0]
+
+    assert "大额期权交易" in alert["what_happened"], (
+        f"三笔合计 70 万美元已过 50 万门槛，不该被说成量级不大："
+        f"{alert['what_happened']}")
+    assert alert["severity"] == wp.SEVERITY[alert["kind"]], (
+        "过了硬门槛就该拿正常严重度，不是小额那一档")
+    assert "方向判不出来的 1 笔" in alert["what_happened"], (
+        f"有方向未知的笔数就要说出来，否则「共 3 笔：看涨 1 笔、看跌 1 笔」"
+        f"会让人找不到剩下那笔：{alert['what_happened']}")

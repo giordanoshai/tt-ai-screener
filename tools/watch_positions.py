@@ -839,11 +839,20 @@ def watch_positions(hours: int = 24) -> str:
                 for ticker, big_rows in big_by_ticker.items():
                     bullish = [r for r in big_rows if r["sentiment"] == "bullish"]
                     bearish = [r for r in big_rows if r["sentiment"] == "bearish"]
+                    neutral = [r for r in big_rows
+                               if r["sentiment"] not in ("bullish", "bearish")]
                     bullish_sum = sum(float(r["total_premium"] or 0)
                                       for r in bullish)
                     bearish_sum = sum(float(r["total_premium"] or 0)
                                       for r in bearish)
-                    total_sum = bullish_sum + bearish_sum
+                    # 对**全部**过线的行求和，不是只加看涨和看跌两桶。
+                    # 库里有大量 sentiment 既非 bullish 也非 bearish 的行
+                    # （近 30 天 1658 笔，最大一笔 3.68 亿美元；持仓票里
+                    # AMZN 出现过一笔 54 万美元）。漏掉它们会让一笔已经
+                    # 超过 50 万硬门槛的交易被判成「量级不算大」——
+                    # 方向跟评审 I4 相反，是低报。
+                    total_sum = sum(float(r["total_premium"] or 0)
+                                    for r in big_rows)
                     biggest = max(big_rows,
                                  key=lambda r: float(r["total_premium"] or 0))
                     net_bearish = bearish_sum > bullish_sum
@@ -857,11 +866,18 @@ def watch_positions(hours: int = 24) -> str:
                     scale_phrase = ("大额期权交易" if is_large else
                                     "期权交易（进了这只票近期活跃度前 10%，"
                                     "但合计金额不算大）")
+                    # 有方向判不出来的行时必须把它们说出来，否则
+                    # 「有 5 笔：看涨 2 笔、看跌 1 笔」会让人找不到另外 2 笔
+                    neutral_phrase = (
+                        f"、方向判不出来的 {len(neutral)} 笔合计 "
+                        f"{sum(float(r['total_premium'] or 0) for r in neutral) / 1e4:.0f}"
+                        f" 万美元" if neutral else "")
                     what_happened = (
                         f"近 {calendar_days_covered} 天有 {len(big_rows)} 笔"
                         f"{scale_phrase}：看涨 {len(bullish)} 笔合计 "
                         f"{bullish_sum / 1e4:.0f} 万美元、看跌 {len(bearish)} "
-                        f"笔合计 {bearish_sum / 1e4:.0f} 万美元，最大一笔 "
+                        f"笔合计 {bearish_sum / 1e4:.0f} 万美元"
+                        f"{neutral_phrase}，最大一笔 "
                         f"{float(biggest['total_premium']) / 1e4:.0f} 万美元，"
                         f"情绪判定为{biggest_dir}（{biggest['opt_type']} 合约，"
                         f"行权价 {biggest['strike']}，到期 {biggest['expiry']}）")
