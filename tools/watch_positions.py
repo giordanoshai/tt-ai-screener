@@ -26,6 +26,19 @@
 UW 实时警报（`/api/alerts`）同理：同一只票在 100 条里触发好几条自定义规则
 时，也合并成一条，把命中的规则名都列出来，不按规则条数扇出。
 
+## 每笔取数是按票取的，不是全局截断（评审 I3）
+
+`flow_alerts_archive` 查询早期写法是「全局按溢价倒排取前 200 行」，2026-08-31
+评审实测：6 只持仓近 2 天有 251 行、近 8 天有 719 行（AMZN 一只就占 239 行），
+8 天窗口下 519 行被截断丢掉，而且截断是按金额排的——**小额但确实过线的行会
+被挤掉，导致「N 笔合计多少」这些汇总数字不是真实总量**，持仓越多、活跃度
+越高，丢得越狠，而且没有任何字段告诉用户丢了多少。
+
+现在改成按票查（`unnest` + `lateral`，跟 `core/snapshot.py` 批量取快照是
+同一个模式）：每只票各自最多取 1000 行自己的数据，不会因为别的票交易活跃
+就把这只票的行情挤掉。1000 这个数字纯粹是防止极端情况的安全网（实测过的
+最活跃单票 8 天也就 239 行），不是预期会用到的截断点。
+
 ## 每条告警说清三件事，还要说清是哪一路测出来的
 
 发生了什么、对我的仓位意味着什么、建议怎么处理。只说「NVDA 出现大额看跌期权」
@@ -38,6 +51,36 @@ UW 实时警报（`/api/alerts`）同理：同一只票在 100 条里触发好�
 两种独立的测量，同一只票上完全可能给出相反的方向结论，`source` 字段
 让用户一眼看出这两条不是同一件事的重复播报（详见下面「两路期权信号
 可能打架」一节）。
+
+## 期权异动一句话里不能混两个口径（评审 I2）
+
+早期写法「看涨 N 笔 / 看跌 N 笔」数的是 `sentiment` 字段（按在卖价/买价
+成交推出来的方向），但「最大一笔（CALL/PUT…）」印的却是 `opt_type`
+（合约本身是看涨还是看跌期权）——这是两个不同的口径，混在一句话里会让人
+以为算错了。2026-08-31 评审实测：近 2 天 200 行里有 88 行两者不一致；
+真实输出出现过「看涨 26 笔…最大一笔 362 万美元（**PUT**，行权价 270）」
+这种读起来自相矛盾的句子。
+
+现在统一：「看涨/看跌」这两个计数和「情绪判定为看涨/看跌」这句话，
+一律用 `sentiment`；合约本身是 CALL 还是 PUT 单独标成「XX 合约」，
+不再跟方向词混在一起说。
+
+## 期权异动的措辞和严重度要配得上它的量级（评审 I4）
+
+`is_big_flow()` 的门槛是「单笔溢价 ≥ 50 万美元，或者 score 进这只票近
+30 天前 10%」——这条判据是 brief 给的，没有改。但**这两条门槛不是同一
+量级**：前者是绝对金额，后者是相对分位数，而分位数这条按定义每只票永远
+有约 10% 的行满足，等于保证每天都有货，直接跟「没事就说没事」这条设计
+原则冲突。2026-08-31 评审抓到一个真实案例：RKLB 一笔 **18.98 万美元**
+的交易，只是因为 `score` 排进了这只票的 90 分位就被判成「大额」，措辞
+写成「有大资金在这个方向上集中押注」、严重度给到 70（比跌破 20 日均线
+还高）——一笔 19 万美元不该跟一笔 362 万美元用同一种说法。
+
+判据没有改：is_big_flow() 的门槛值和函数本身一字未动。改的是**汇总后
+的措辞和严重度**：一只票汇总的总金额（看涨看跌合计）如果连 50 万美元
+这条硬门槛都没到（说明它是单靠分位数这条软门槛过线的），就不再说「大
+资金押注」，改成如实的「量级不算大，只是排进了近期活跃度前 10%」，
+严重度也大幅降档（见 `OPTIONS_FLOW_SMALL_*_SEVERITY`）。
 
 ## UW 实时警报的坑
 
@@ -79,9 +122,8 @@ UW 实时警报（`/api/alerts`）同理：同一只票在 100 条里触发好�
 口径，本来就可能各说各话。但如果原样把两条方向相反的结论并列摆出来
 （2026-08-30/31 实测：AMZN、GOOGL 都命中过这个场景——整体权利金流向偏多，
 但 UW 扫描器抓到的单笔大单偏空），交易者要么无所适从、要么只信先读到的
-那条；而且两个 kind 各自的默认严重度（`big_bearish_flow` 70、
-`big_bullish_flow` 45）纯粹是历史遗留的分档，**不代表哪一路更权威**，把
-它们并列摆出来还会让人误读成「看空那条更重要」。
+那条；而且两个 kind 各自的默认严重度纯粹是历史遗留的分档，**不代表哪一路
+更权威**，把它们并列摆出来还会让人误读成「看空那条更重要」。
 
 所以两路信号方向不一致时，**合成一条 `options_signal_conflict`**，把双方
 原始结论都摆出来，并且明说「这是两种独立测量，谁也不比谁权威，分歧本身
@@ -96,16 +138,19 @@ UW 实时警报（`/api/alerts`）同理：同一只票在 100 条里触发好�
 `checked_sources` 里少一项，其余照常给——**每一路各自 try/except**，
 出错写进 `data_gaps`，不会因为一路挂了把另一路已经拿到的结果一起丢掉
 （同目录 `review_positions.py` / `detect_catalysts.py` / `scan_swing.py`
-都是这个约定）。
+都是这个约定）。**`checked_sources` 只在这一路真正跑完（查询和处理都没
+报错）之后才追加**——早期写法把 `sources.append(...)` 放在查询之前就
+执行，查询哪怕挂了、`checked_sources` 里照样有这一项，会跟 `warnings`
+里同时报的失败信息自相矛盾（评审 M8）。
 
 行情新不新鲜、采集任务有没有失败或者只跑一半，也在这里查一次并写进
 `warnings`——跟前面几个工具的约定一致，「行情是新的但某个采集任务挂了」
 这种情况必须无条件报出来，不能挂在「行情陈旧」判断下面变成潜台词。
 
-## 止损告警：浮盈还是浮亏、跌破多深，都要说清楚
+## 止损告警：浮盈还是浮亏、跌破多深、破了多久，都要说清楚
 
 `position_stop()` 的止损位是「成本-2×ATR」和「20 日均线」取高的那个——均线
-在成本上方时说明有浮盈，止损会抬到均线护住。这带来两个坑，都是拿真实持仓
+在成本上方时说明有浮盈，止损会抬到均线护住。这带来三个坑，都是拿真实持仓
 （AMZN/GOOGL/MP/NVO/ORCL/RKLB）实测跑出来才发现的（2026-08-30/31）：
 
 **坑一：浮盈还是浮亏，文案要跟真实盈亏方向一致。** 早期写法不分青红皂白
@@ -114,46 +159,74 @@ UW 实时警报（`/api/alerts`）同理：同一只票在 100 条里触发好�
 正负分别措辞，数字一律取绝对值（不再出现「浮亏 -184」这种双重负号）。
 
 **坑二：「止损位是均线、仓位还在浮盈」跟「止损是成本减 ATR、仓位已经亏钱」
-是两件性质完全不同的事，不能用同一个严重度。** 6 只真实持仓里：
+是两件性质完全不同的事，不能用同一个严重度。** 拆成 `stop_breached`（真
+击穿，仓位已经浮亏）和 `trailing_stop_touched`（还在浮盈，只是碰到了护
+利润的移动止损线），严重度按跌破幅度分档，界值用真实数据的分布定的
+（见 `STOP_BREACH_DEEP_PCT`/`TRAILING_TOUCH_DEEP_PCT`）。
 
-```
-        跌破幅度   盈亏      止损依据
-AMZN    0.17%     浮盈 8.3%   ma_20
-NVO     1.69%     浮盈 3.7%   ma_20
-GOOGL   1.06%     浮亏 5.0%   ma_20
-MP     10.86%    浮亏 19.0%   成本 - 2×ATR
-ORCL   13.80%    浮亏 19.8%   成本 - 2×ATR
-RKLB   13.11%    浮亏 23.3%   成本 - 2×ATR
-```
+**坑三（评审 C1，最严重）：破位「什么时候发生的」这个维度，之前完全没有。**
+2026-08-31 评审用真实数据独立算出：MP 已经连续 **58 个交易日**在止损位
+下方（上次站上是 2026-06-04），ORCL 连续 **56 个交易日**（上次站上是
+2026-06-08）——但两个月前的这件旧事，这个工具**每天**都拿 `stop["breached"]`
+这一个布尔值去判断，报成「现价跌破了建议止损位…按纪律该减仓或清掉」，
+严重度给到最高档 95，跟「今天刚破位」的票（比如 RKLB，7 个交易日）完全
+同一个待遇。这个工具叫「有没有要**立刻**处理的信号」——把两个月前的旧闻
+每天当成最高优先级重播，后果是两种，都很糟：用户要么被催着在底部割肉，
+要么看几天就麻木，把真正「今天刚破」的那条一起忽略掉，正撞上这个工具
+第一条设计原则要避免的事。
 
-AMZN 只是轻触均线、账面还赚 8.3%，跟 MP 那种已经深跌穿成本止损 10.86%、
-浮亏近两成的仓位，读起来不该是同一个「马上处理」。所以现在拆成两个 kind：
+而 `core/scoring.py` 的 `position_stop()` 自己的注释早就说清楚了：仓位深度
+浮亏时，「成本-2×ATR」这一档止损位会落在市价上方——**「那个止损几周前
+就破了，是历史事实，不是今天能用的价位」**，所以它专门给了一个 `forward_stop`
+字段（「要继续拿的话，止损该放哪」，永远在市价下方，今天真能用）。早期
+实现从没读过这个字段。
 
-- `stop_breached`：**仓位已经浮亏**时触发。这才是真正意义上的「止损被
-  击穿」——这笔交易已经错了，按纪律该走。严重度按跌破幅度分两档（深/浅），
-  界值是按上面这批真实数据的分布定的：跌破 ≥8% 判「深度击穿」（MP/ORCL/
-  RKLB 都在 10.86%~13.80%，明显该是最高档）；跌破 <8% 判「浅破但仍是
-  真亏损」（GOOGL 只跌破 1.06%，但已经是浮亏，不该跟浮盈的那两只同档，
-  又不该跟深度击穿的那三只同档）。
-- `trailing_stop_touched`：**仓位还在浮盈**、只是碰到了用来护盈利的移动
-  止损线，这是「该考虑落袋一部分利润了」，不是「这笔错了」。同样按跌破
-  幅度分两档，但整体严重度远低于 `stop_breached`（AMZN/NVO 分别是
-  0.17%/1.69%，都落在低档）。
+所以这里补上「破了多久」这个维度（`_consecutive_breach_days()`）：每天
+用**那一天自己的** ma_20/ATR 重新算一遍止损位（不是拿今天的止损位去套
+过去的价格——过去每天的均线和 ATR 本来就不一样），从最近一天往前数，
+数出连续多少个交易日都是「破位」状态，直到遇到第一个「没破」的日子为止。
 
-跟 `review_positions.py` 用的是同一套词汇习惯——那个工具已经区分了
-`stop_breached`（真击穿，严重度最高）和 `stop_breached_recovering`
-（已经站回均线，严重度降档）两档；这里的 `trailing_stop_touched` 是同一个
-「破位不等于都一样紧急」的思路在持仓盯盘这个场景下的对应物（触发条件不
-完全一样——那边看的是「有没有站回均线」，这边看的是「止损依据是不是均线
-且账面还在赚钱」——两个工具面对的判断条件本来就不同，不能照抄同一个
-kind 名，但严重度该拉开档位、破位不该无脑扣最高分，这个原则是一致的）。
+- **连续天数 ≤ `STOP_BREACH_RECENT_DAYS`**（15 个交易日，约 3 周）：
+  这是「最近发生」的信号，维持原来的分档和措辞（`stop_breached`，按跌破
+  幅度分 95/75）。
+- **连续天数 > `STOP_BREACH_RECENT_DAYS`**：改成新 kind
+  `stop_breached_longstanding`——严重度大幅降档（`SEVERITY[
+  "stop_breached_longstanding"]`），措辞从「按纪律该减仓或清掉」改成
+  如实反映情况（「这个状态已经持续了 N 个交易日，不是今天刚发生的，
+  不该每天都当成新的紧急信号」），并且**不再报那个已经是历史价位的
+  `suggested_stop`**，改用 `forward_stop`（今天真能用的价位）告诉用户
+  「如果决定继续持有，参考止损该放哪」。
 
-**坑三：止损依据就是 20 日均线时，不要再单独发一条「跌破 20 日均线」的
-告警**——那是同一件事。`position_stop()` 的 `basis` 只有两种取值：`ma_20`
-或 `成本 - 2×ATR`（没有 `ma_50` 这个选项），所以这个去重只会跟
-`below_ma20` 冲突，不会影响 `below_ma50`（那是独立的中期趋势信号）。
+`STOP_BREACH_RECENT_DAYS = 15` 这个界值用今天六只真实持仓的分布定的：
+NVO/AMZN/RKLB 在 2~7 个交易日之间，GOOGL 14 个交易日，ORCL/MP 在
+56~58 个交易日——**15~55 个交易日这段区间里，今天没有任何一只票落在
+这里**，阈值放在这个空档里的任何一点效果都一样，选 15（约 3 周）是因为
+它是个好记的整数，不是卡着某一只票的边界拍出来的。
 
-## 突发消息：中性情绪不算「正面」，大盘综述不算个股专属
+跟 `review_positions.py` 用的是同一套「破位不等于都一样紧急」的思路——
+那个工具在 `_flags_and_urgency()` 里已经区分了 `stop_breached`（真击穿，
+严重度最高）和 `stop_breached_recovering`（已经站回 20 日均线，降档），
+注释写着「跟『今天刚破位』按同一个最高档报警，会把真正紧急的那几只淹
+掉」——这跟这里要解决的问题是同一件事。但两边判断「该不该降档」用的
+信号不一样：那边看「有没有站回均线」（一个二元的当前状态），这里看「连续
+破了多少个交易日」（一个真正的时间维度）——两个工具面对的判断条件不完全
+一样，所以 kind 名字不照抄，但「破位不该无脑给最高分」这个原则、以及
+「降档要用不同的 kind、不同的措辞跟用户说清楚」这个做法，是照着
+`review_positions.py` 的先例来的。
+
+`trailing_stop_touched`（浮盈中触发）不做这个降档区分——它的止损依据只有
+`ma_20`（均线每天用最新数据重新算，天然不会变成「历史价位」），本身就不
+存在「suggested_stop 是几个月前的旧价位」这个问题，严重度也已经在整个
+量表的最低档，没有必要再拆一层。但文案里还是会带一句「已经连续 N 个交易
+日在这条线下方」，让用户看得出这不是当天新发生的（信息透明，不影响严重
+度判断）。
+
+**坑四（评审 C1 顺带）：止损依据就是 20 日均线时，不要再单独发一条「跌破
+20 日均线」的告警**——那是同一件事。`position_stop()` 的 `basis` 只有两种
+取值：`ma_20` 或 `成本 - 2×ATR`（没有 `ma_50` 这个选项），所以这个去重
+只会跟 `below_ma20` 冲突，不会影响 `below_ma50`（那是独立的中期趋势信号）。
+
+## 突发消息：中性情绪不算「正面」，大盘综述不算个股专属，每票上限不能在过滤前生效
 
 **中性情绪不该被硬塞进「正面」。** 早期写法是「负面否则正面」的二分法，
 2026-08-30 实测抓到一个真实反例：一条 `sentiment_label=Neutral`、同时挂了
@@ -165,11 +238,16 @@ AMZN、GOOGL 的「重大正面消息」。现在补上 `neutral_news` 这一档
 `tools/detect_catalysts.py` 已经用真实分布定过这条线：实测近 7 天 759 条
 新闻，95.1% 挂在 6 只票以内，挂 7 只以上的抽查全是「大盘/行业综述」而非
 个股专属消息（`MARKET_WIDE_TICKER_COUNT = 7`）。这里直接复用同一个数字和
-同一条实测依据，不凭空另定一个阈值——上面那条 8 只票的综述，用这条线一过，
-自然就被过滤掉了，不需要额外再判断情绪。跟 `detect_catalysts.py` 不同的
-是：那个工具的定位是「出了什么事」，大盘综述本身有信息量，标出来但保留；
-这个工具的定位是「我这只仓位现在要不要处理」，一条泛大盘的宏观新闻不构成
-针对某一个具体仓位的处理理由，所以这里选择直接不发，而不是发出来再标注。
+同一条实测依据，不凭空另定一个阈值。
+
+**每票只发一条的上限，必须在「过滤掉大盘综述」之后生效，不能在之前
+（评审 M9）。** 早期实现从数据库只拉每票最新 1 条（`per_ticker=1`），
+再判断是不是大盘综述——如果那唯一的一条恰好是大盘综述，这只票当天就
+一条新闻告警都没有，哪怕它下面紧跟着一条真正的个股专属消息也进不来。
+现在改成每票拉 3 条候选，按顺序找第一条「不是大盘综述」的发出来，跟
+`detect_catalysts.py` 的一条新闻只算一个事件是不同的问题（那边关心的是
+「同一条新闻别按票扇出」，这里是「过滤和限量的先后顺序」），但都是同一类
+「悄悄丢掉不该丢的东西」。
 
 新闻三档的严重度（`bad_news`/`good_news`/`neutral_news`）都在 `SEVERITY`
 里给了显式值，不再走 `.get(kind, 30)` 的默认档——依据见 `SEVERITY` 定义处
@@ -182,6 +260,17 @@ AMZN、GOOGL 的「重大正面消息」。现在补上 `neutral_news` 这一档
 现在把 SQL 改成真正的「最近 20 根日线」（用 `row_number()` 按票分组取最近
 20 行，不是拍一个自然日窗口去近似），文字也相应写成「创 20 个交易日新
 低」，跟 `core/snapshot.py` 里 `high_20`（20 个交易日高点）的口径保持一致。
+
+## 期权异动的时间窗口标签要跟实际查询范围对上（评审 I5）
+
+早期写法：`days = max(1, hours // 24 + 1)`，SQL 用 `day >= current_date -
+days`，但文案里直接印 `days` 这个数当成「近 N 天」。`hours=24` 时
+`days=2`，SQL 实际覆盖 `current_date-2` 到 `current_date` 共 **3 个自然
+日**（`day` 是自然日列，不是时间戳，`hours=24` 跟自然日之间天然有粒度
+差——现在如果是上午，「过去 24 小时」有一部分落在昨天，所以往回多留
+一天缓冲；这个缓冲逻辑本身没问题），但文案却写「近 2 天」，少算了一天。
+现在文案直接用 `days + 1`（SQL 查询范围实际覆盖的自然日数）来说，两处
+不再各自算一遍、对不上。
 
 ## 返回体大小有上限
 
@@ -212,6 +301,14 @@ BIG_PREMIUM = 500_000
 #: 多头仓位的人来说信息量有限，不构成任何需要现在处理的理由，定得比看多
 #: 的期权信号（45）还低；`neutral_news` 连方向都判断不出来，对「要不要
 #: 处理」这个问题贡献最小，垫底。
+#: `stop_breached_longstanding`（评审 C1 新增）：仓位仍在浮亏，但破位已经
+#: 不是新信号，是持仓状态——不该跟「今天刚破位」同一档，也不该低到让人
+#: 以为没事了（毕竟真的还在亏钱），定在中等档，比 `cn_outflow`/`below_ma20`
+#: 略低，反映「知道就好，不用今天动」的紧要程度。
+#: `uw_alert_direction_unknown`（评审 M7）：一条用户自己配置的规则确实
+#: 触发了，但方向解不出来——比什么都没有的默认值（30）该更显眼一些，
+#: 但明显不如已经解出方向的信号（45/70），定在 `trailing_stop_touched`
+#: 浅档同一个位置（40）。
 SEVERITY = {
     "below_ma50": 80,
     "earnings_soon": 75,
@@ -221,8 +318,10 @@ SEVERITY = {
     "new_low": 60,
     "options_signal_conflict": 55,
     "bad_news": 55,
+    "stop_breached_longstanding": 50,
     "lhb": 50,
     "big_bullish_flow": 45,
+    "uw_alert_direction_unknown": 40,
     "good_news": 35,
     "neutral_news": 20,
 }
@@ -238,12 +337,35 @@ MAX_ALERTS = 50
 #: ——同一批新闻数据，同一天，同一个用户会同时用到两个工具，判据没道理不同。
 MARKET_WIDE_TICKER_COUNT = 7
 
+#: 每票候选新闻拉几条，再从里面找第一条不是大盘综述的（评审 M9：
+#: 拉 1 条再判断的话，那 1 条恰好是综述就会让这只票整天没有新闻告警）。
+NEWS_CANDIDATES_PER_TICKER = 3
+
 #: 止损告警严重度分档的跌破幅度界值。2026-08-30/31 用真实 6 只持仓的分布定的
 #: （见模块 docstring「止损告警」一节的表格）：MP/ORCL/RKLB 跌破 10.86%~
 #: 13.80%（且都是浮亏），明显该是最高档；GOOGL 只跌破 1.06%但也是浮亏；
 #: AMZN/NVO 跌破 0.17%/1.69%但还在浮盈。
 STOP_BREACH_DEEP_PCT = 8.0
 TRAILING_TOUCH_DEEP_PCT = 3.0
+
+#: 止损被击穿后，连续多少个交易日算「最近发生」——超过这个数就该降级成
+#: 「持仓状态」，不再当「立刻处理」的信号。依据和真实分布见模块 docstring
+#: 「止损告警」一节「坑三」。
+STOP_BREACH_RECENT_DAYS = 15
+
+#: 算「连续破了多久」时，往回查几根日线。120 个交易日约半年，MP 那笔
+#: 实测 58 个交易日的连续破位在这个窗口里能完整数完，留了一倍以上余量。
+STOP_HISTORY_LOOKBACK_DAYS = 120
+
+#: 期权异动汇总后，总金额没到这条硬门槛（哪怕是靠 score 分位数这条软门槛
+#: 过线的），就不该说「大资金押注」，严重度也该明显更低——分位数门槛
+#: 按定义每只票永远有约 10% 的行满足，等于保证每天都有货，评审 I4 抓到
+#: 的真实案例：RKLB 一笔 18.98 万美元的交易被叫成「大资金集中押注」，
+#: 严重度给到 70，比跌破 20 日均线还高。看跌方向定得比看涨略高
+#: （现有 `big_bearish_flow`/`big_bullish_flow` 也是 70 对 45 的相对关系），
+#: 但两者都远低于「真大额」的档位。
+OPTIONS_FLOW_SMALL_BEARISH_SEVERITY = 30
+OPTIONS_FLOW_SMALL_BULLISH_SEVERITY = 25
 
 _POSITIONS_SQL = """
 select ticker, market, avg_cost, shares,
@@ -253,14 +375,21 @@ from user_positions
 order by ticker
 """
 
+# 按票取（unnest + lateral），不是全局按溢价倒排截断——见模块 docstring
+# 「每笔取数是按票取的」一节。1000 是防极端情况的安全网，不是预期截断点。
 _FLOW_RECENT_SQL = """
-select ticker, opt_type, total_premium, score, sentiment, day,
-       strike, expiry
-from flow_alerts_archive
-where ticker = any(%s)
-  and day >= current_date - %s
-order by total_premium desc
-limit 200
+select t.ticker, f.opt_type, f.total_premium, f.score, f.sentiment, f.day,
+       f.strike, f.expiry
+from unnest(%s::text[]) as t(ticker)
+left join lateral (
+    select opt_type, total_premium, score, sentiment, day, strike, expiry
+    from flow_alerts_archive
+    where ticker = t.ticker
+      and day >= current_date - %s
+    order by total_premium desc
+    limit 1000
+) f on true
+where f.total_premium is not null
 """
 
 _FLOW_P90_SQL = """
@@ -287,6 +416,28 @@ where rn <= 20
 group by ticker
 """
 
+# 止损「破了多久」要靠这批历史行情重新按天算，见 `_consecutive_breach_days()`。
+_STOP_HISTORY_SQL = """
+select t.ticker, o.date, o.close, o.ma_20, o.atr_14
+from unnest(%s::text[]) as t(ticker)
+left join lateral (
+    select date, close, ma_20, atr_14
+    from stock_ohlcv_daily
+    where ticker = t.ticker
+      and market = %s
+    order by date desc
+    limit %s
+) o on true
+order by t.ticker, o.date desc
+"""
+
+
+def _round2(value):
+    """价格类数字只保留 2 位小数交出去。行情快照里的浮点数原样透传的话，
+    十几位小数（比如 56.1300010681152）直接糊到用户脸上，没有必要
+    （评审 M6；同 `tools/detect_catalysts.py` 的 `_round2()`）。"""
+    return None if value is None else round(value, 2)
+
 
 def is_big_flow(row: dict, p90: float | None) -> bool:
     """这笔期权异动够不够大，值不值得报。"""
@@ -304,13 +455,43 @@ def _stop_alert_severity(kind: str, breach_depth_pct: float) -> int:
     （已经在浮亏）整体比「移动止损被触及」（还在浮盈）更严重。
 
     界值和分档依据见模块 docstring「止损告警」一节——用 2026-08-30/31
-    六只真实持仓的分布定的，不是拍脑袋。
+    六只真实持仓的分布定的，不是拍脑袋。只用于「最近发生」的破位；
+    「持续很久」的破位走 `SEVERITY["stop_breached_longstanding"]`，
+    不再按深浅分档（模块 docstring「坑三」）。
     """
     depth = abs(breach_depth_pct)
     if kind == "stop_breached":
         return 95 if depth >= STOP_BREACH_DEEP_PCT else 75
     # trailing_stop_touched
     return 55 if depth >= TRAILING_TOUCH_DEEP_PCT else 40
+
+
+def _consecutive_breach_days(avg_cost: float,
+                             daily_rows: list[dict]) -> tuple[int, object]:
+    """这只票连续多少个交易日「现价低于当天算出来的止损位」，以及上次
+    站上止损位是哪一天。
+
+    `daily_rows` 已经按日期倒序（最新的在前）。**每一天都用那一天自己的
+    ma_20/ATR 重新算一遍止损位**——不是拿今天的止损位去套过去的价格，
+    过去每天的均线和 ATR 本来就不一样。从最新一天开始往前数，遇到第一个
+    「没破位」的日子就停（评审 C1）。
+
+    数据不够（比如某天缺 ATR 又缺均线，`position_stop()` 算不出
+    `breached`）时也当成「停在这里」处理，不会把 None 当成「破位」继续
+    往前数——宁可低估连续天数，不猜。
+    """
+    count = 0
+    last_above = None
+    for row in daily_rows:
+        snap = {"close": row.get("close"), "atr_14": row.get("atr_14"),
+                "ma_20": row.get("ma_20")}
+        stop = scoring.position_stop(avg_cost, snap)
+        if stop.get("breached") is True:
+            count += 1
+        else:
+            last_above = row.get("date")
+            break
+    return count, last_above
 
 
 def _uw_live_direction(item: dict) -> str | None:
@@ -429,11 +610,15 @@ def watch_positions(hours: int = 24) -> str:
     （数据库聚合）和 UW 实时警报（单笔扫描命中）方向不一致时也不会原样
     并列摆出来，会合成一条说清楚分歧（`options_signal_conflict`）。
 
-    止损相关的告警分两种、严重度按跌破幅度分档，不是固定分：`stop_breached`
-    是仓位已经浮亏时的真实破位（跌破越深分越高）；`trailing_stop_touched`
-    是仓位还在浮盈、只是碰到了用来护盈利的移动止损线（整体严重度远低于
-    前者）。止损依据本来就是 20 日均线时，不会重复再发一条「跌破 20 日
-    均线」。详见模块 docstring「止损告警」一节。
+    止损相关的告警分三种、严重度按跌破幅度和「破了多久」分档，不是固定分：
+    `stop_breached` 是仓位已经浮亏、且最近才破位的真实信号（跌破越深分越
+    高）；`stop_breached_longstanding` 是仓位已经浮亏、但破位已经持续超过
+    `STOP_BREACH_RECENT_DAYS` 个交易日——不再是新信号，是持仓状态，严重度
+    大幅降档，且给的是今天真能用的 `forward_stop` 而不是早就是历史价位的
+    原止损位；`trailing_stop_touched` 是仓位还在浮盈、只是碰到了用来护
+    盈利的移动止损线（整体严重度远低于前两者）。止损依据本来就是 20 日
+    均线时，不会重复再发一条「跌破 20 日均线」。详见模块 docstring
+    「止损告警」一节。
 
     价格触发和财报临近不依赖任何外部接口，UW 那两路（期权异动、实时警报）
     挂了不连累其它路，会在 `checked_sources` 里少一项、在 `data_gaps`
@@ -464,11 +649,13 @@ def watch_positions(hours: int = 24) -> str:
         snaps: dict[str, dict | None] = {}
         earnings: dict[str, dict | None] = {}
         lows: dict[str, float] = {}
+        stop_history: dict[str, list[dict]] = {}
         gaps: list[str] = []
         warnings: list[str] = []
 
-        # ---- 每个涉及到的市场：行情快照、财报日、阶段新低、新鲜度。
-        # 一个市场里某一项挂了，不连累这个市场的其它项，也不连累另一个市场 ----
+        # ---- 每个涉及到的市场：行情快照、财报日、阶段新低、止损历史、
+        # 新鲜度。一个市场里某一项挂了，不连累这个市场的其它项，也不连累
+        # 另一个市场 ----
         for market, tickers in by_market.items():
             try:
                 snaps.update(snapshot.get(tickers, market))
@@ -485,6 +672,16 @@ def watch_positions(hours: int = 24) -> str:
                     lows[low_row["ticker"]] = float(low_row["low_20"])
             except Exception as exc:
                 gaps.append(f"{market} 阶段新低查询失败：{exc}")
+
+            try:
+                for hist_row in pg.query(
+                        _STOP_HISTORY_SQL,
+                        (tickers, market, STOP_HISTORY_LOOKBACK_DAYS)):
+                    if hist_row.get("date") is not None:
+                        stop_history.setdefault(
+                            hist_row["ticker"], []).append(hist_row)
+            except Exception as exc:
+                gaps.append(f"{market} 止损历史查询失败：{exc}")
 
             try:
                 fresh = regime.freshness(market)
@@ -505,47 +702,93 @@ def watch_positions(hours: int = 24) -> str:
             currency = currency_of[ticker]
             stop = scoring.position_stop(cost_of[ticker], snap)
             # 止损依据就是 20 日均线、且这条已经发过告警时，跌破 20 日均线
-            # 是同一件事，不再单独重复一条（模块 docstring「坑三」）
+            # 是同一件事，不再单独重复一条（模块 docstring「坑四」）
             suppress_below_ma20 = False
             if stop.get("breached"):
                 pnl = (close - cost_of[ticker]) * shares_of[ticker]
                 depth = abs(stop.get("distance_pct") or 0.0)
-                # 均线在成本上方时止损本来就抬到了均线上（护浮盈），这时候
-                # 破位是「浮盈还在，但保护线没了」，不是「亏钱了」——两者
-                # 对交易者的含义完全不同，必须用不同的 kind、不同的措辞和
-                # 不同的严重度区分开（模块 docstring「止损告警」一节）
+                consecutive_days, last_above = _consecutive_breach_days(
+                    cost_of[ticker], stop_history.get(ticker, []))
+                recent = consecutive_days <= STOP_BREACH_RECENT_DAYS
+                streak_note = (f"，已经连续 {consecutive_days} 个交易日了"
+                               if consecutive_days > 1 else "")
+
                 if pnl >= 0:
+                    # 均线在成本上方时止损本来就抬到了均线上（护浮盈），
+                    # 这时候破位是「浮盈还在，但保护线没了」，不是「亏钱
+                    # 了」。ma_20 每天用最新数据重算，不存在「历史价位」
+                    # 的问题，所以不做「破了多久」的降档，只在文案里
+                    # 提一句透明度（模块 docstring「止损告警」一节）
                     kind = "trailing_stop_touched"
-                    pnl_text = (f"这笔仓位现在还是浮盈 {pnl:.0f} {currency}，"
-                               "但价格已经跌破了用来锁定利润的止损线")
-                    action = ("考虑先落袋一部分利润，或者把止损重新定在一个"
-                              "你能接受的位置；这不是「这笔交易错了」，"
-                              "不必马上清仓")
-                else:
+                    alerts.append(_alert(
+                        ticker, kind,
+                        f"现价 {_round2(close)} 跌破了建议止损位 "
+                        f"{stop['suggested_stop']}（依据：{stop['basis']}，"
+                        f"跌破幅度 {depth:.2f}%）",
+                        f"这笔仓位现在还是浮盈 {pnl:.0f} {currency}，"
+                        f"但价格已经跌破了用来锁定利润的止损线{streak_note}",
+                        "考虑先落袋一部分利润，或者把止损重新定在一个"
+                        "你能接受的位置；这不是「这笔交易错了」，"
+                        "不必马上清仓",
+                        source="price",
+                        severity=_stop_alert_severity(kind, depth)))
+                elif recent:
+                    # 最近才破位：真实、紧急的信号，维持原来的分档
                     kind = "stop_breached"
-                    pnl_text = (f"这笔仓位当前浮亏 {abs(pnl):.0f} {currency}，"
-                               "已经跌出了当初设的容错范围")
-                    action = ("按纪律该减仓或清掉。要留就得说清楚新的止损"
-                              "放哪、为什么这次不一样")
-                alerts.append(_alert(
-                    ticker, kind,
-                    f"现价 {close} 跌破了建议止损位 {stop['suggested_stop']}"
-                    f"（依据：{stop['basis']}，跌破幅度 {depth:.2f}%）",
-                    pnl_text, action, source="price",
-                    severity=_stop_alert_severity(kind, depth)))
+                    alerts.append(_alert(
+                        ticker, kind,
+                        f"现价 {_round2(close)} 跌破了建议止损位 "
+                        f"{stop['suggested_stop']}（依据：{stop['basis']}，"
+                        f"跌破幅度 {depth:.2f}%）{streak_note}",
+                        f"这笔仓位当前浮亏 {abs(pnl):.0f} {currency}，"
+                        "已经跌出了当初设的容错范围",
+                        "按纪律该减仓或清掉。要留就得说清楚新的止损"
+                        "放哪、为什么这次不一样",
+                        source="price",
+                        severity=_stop_alert_severity(kind, depth)))
+                else:
+                    # 破位已经持续很久：不是新信号，是持仓状态。原止损位
+                    # 是历史价位，今天用不上了，改用 forward_stop（模块
+                    # docstring「坑三」，评审 C1）
+                    kind = "stop_breached_longstanding"
+                    forward = stop.get("forward_stop")
+                    last_above_text = (f"（上次站上止损位是 {last_above}）"
+                                       if last_above else "")
+                    if forward is not None:
+                        action = (
+                            f"如果决定继续持有，参考止损可以放在 "
+                            f"{forward}（在现价下方，是今天真能用的价位，"
+                            "原止损位已经是历史价位）；如果已经不认同这笔"
+                            "交易的逻辑了，该走的话早晚要走，拖时间不会让"
+                            "决定变容易")
+                    else:
+                        action = ("按纪律该减仓或清掉。要留就得说清楚新的"
+                                  "止损放哪、为什么这次不一样")
+                    alerts.append(_alert(
+                        ticker, kind,
+                        f"已经连续 {consecutive_days} 个交易日在止损位"
+                        f"下方{last_above_text}——原止损位 "
+                        f"{stop['suggested_stop']}（依据：{stop['basis']}）"
+                        "已经是历史价位，今天已经用不上了",
+                        f"这笔仓位当前浮亏 {abs(pnl):.0f} {currency}，"
+                        f"而且这个状态已经持续了 {consecutive_days} 个"
+                        "交易日，不是今天刚发生的——不该每天都当成新的"
+                        "紧急信号来看",
+                        action, source="price",
+                        severity=SEVERITY["stop_breached_longstanding"]))
                 if stop.get("basis") == "ma_20":
                     suppress_below_ma20 = True
             if snap.get("above_ma50") is False:
                 alerts.append(_alert(
                     ticker, "below_ma50",
-                    f"跌破 50 日均线（{snap['ma_50']}）",
+                    f"跌破 50 日均线（{_round2(snap['ma_50'])}）",
                     "中期趋势转弱了，波段的多头依据没了",
                     "波段仓位考虑离场；要留就当成中线仓，重新定止损",
                     source="price"))
             elif snap.get("above_ma20") is False and not suppress_below_ma20:
                 alerts.append(_alert(
                     ticker, "below_ma20",
-                    f"跌破 20 日均线（{snap['ma_20']}）",
+                    f"跌破 20 日均线（{_round2(snap['ma_20'])}）",
                     "短期动能转弱，但中期趋势还在",
                     "先减一部分观察，等站回均线再补",
                     source="price"))
@@ -553,7 +796,7 @@ def watch_positions(hours: int = 24) -> str:
             if low_20 is not None and close is not None and close <= low_20:
                 alerts.append(_alert(
                     ticker, "new_low",
-                    f"创 20 个交易日新低（{close}）",
+                    f"创 20 个交易日新低（{_round2(close)}）",
                     "没有买盘接，下跌还在延续",
                     "别在下跌途中摊平成本，先等企稳信号",
                     source="price"))
@@ -578,12 +821,17 @@ def watch_positions(hours: int = 24) -> str:
         us_tickers = by_market.get("US", [])
         if us_tickers:
             try:
-                sources.append("options_flow")
-                days = max(1, hours // 24 + 1)
+                # hours 转成自然日窗口：day 是自然日列，跟 hours 有粒度
+                # 差，往回多留一天缓冲。calendar_days_covered 是 SQL 实际
+                # 覆盖的自然日数（含今天），文案直接用这个数，不再像以前
+                # 那样另算一遍导致对不上（评审 I5）
+                lookback_days = max(1, hours // 24 + 1)
+                calendar_days_covered = lookback_days + 1
                 p90 = {r["ticker"]: r["p90"]
                        for r in pg.query(_FLOW_P90_SQL, (us_tickers,))}
                 big_by_ticker: dict[str, list[dict]] = {}
-                for row in pg.query(_FLOW_RECENT_SQL, (us_tickers, days)):
+                for row in pg.query(_FLOW_RECENT_SQL,
+                                    (us_tickers, lookback_days)):
                     if is_big_flow(row, p90.get(row["ticker"])):
                         big_by_ticker.setdefault(row["ticker"], []).append(row)
 
@@ -595,31 +843,62 @@ def watch_positions(hours: int = 24) -> str:
                                       for r in bullish)
                     bearish_sum = sum(float(r["total_premium"] or 0)
                                       for r in bearish)
+                    total_sum = bullish_sum + bearish_sum
                     biggest = max(big_rows,
                                  key=lambda r: float(r["total_premium"] or 0))
                     net_bearish = bearish_sum > bullish_sum
+                    kind = "big_bearish_flow" if net_bearish else "big_bullish_flow"
+                    # 「看涨/看跌」的计数和「最大一笔」的方向判定统一用
+                    # sentiment，合约本身是 CALL 还是 PUT 单独标出来，
+                    # 不混进方向词里说（评审 I2）
+                    biggest_dir = {"bullish": "看涨", "bearish": "看跌"}.get(
+                        biggest["sentiment"], "中性")
+                    is_large = total_sum >= BIG_PREMIUM
+                    scale_phrase = ("大额期权交易" if is_large else
+                                    "期权交易（进了这只票近期活跃度前 10%，"
+                                    "但合计金额不算大）")
+                    what_happened = (
+                        f"近 {calendar_days_covered} 天有 {len(big_rows)} 笔"
+                        f"{scale_phrase}：看涨 {len(bullish)} 笔合计 "
+                        f"{bullish_sum / 1e4:.0f} 万美元、看跌 {len(bearish)} "
+                        f"笔合计 {bearish_sum / 1e4:.0f} 万美元，最大一笔 "
+                        f"{float(biggest['total_premium']) / 1e4:.0f} 万美元，"
+                        f"情绪判定为{biggest_dir}（{biggest['opt_type']} 合约，"
+                        f"行权价 {biggest['strike']}，到期 {biggest['expiry']}）")
+                    if is_large:
+                        what_it_means = (
+                            "有大资金在这个方向上集中押注，" +
+                            ("跟你的多头仓位是反的" if net_bearish else "跟你的方向一致"))
+                        suggested_action = (
+                            "别只凭这一条动手，配合价格看——"
+                            "价格同时跌破均线才是真信号" if net_bearish
+                            else "可以作为继续持有的旁证，不构成加仓理由")
+                        severity = SEVERITY[kind]
+                    else:
+                        # 只是靠 score 分位数这条软门槛过线（这条门槛按
+                        # 定义每只票永远有约 10% 的行满足），总金额没到
+                        # 50 万美元这条硬门槛——不该叫「大资金押注」
+                        # （评审 I4）
+                        what_it_means = (
+                            "量级不算大，只是恰好排进了这只票近期期权"
+                            "交易活跃度的前 10%，还谈不上「大资金押注」")
+                        suggested_action = "量级不大，不用为这一条单独采取行动，留意就好"
+                        severity = (OPTIONS_FLOW_SMALL_BEARISH_SEVERITY
+                                   if net_bearish
+                                   else OPTIONS_FLOW_SMALL_BULLISH_SEVERITY)
                     options_flow_direction[ticker] = _alert(
-                        ticker,
-                        "big_bearish_flow" if net_bearish else "big_bullish_flow",
-                        f"近 {days} 天有 {len(big_rows)} 笔大额期权交易：看涨 "
-                        f"{len(bullish)} 笔合计 {bullish_sum / 1e4:.0f} 万美元、"
-                        f"看跌 {len(bearish)} 笔合计 {bearish_sum / 1e4:.0f} "
-                        f"万美元，最大一笔 {float(biggest['total_premium']) / 1e4:.0f} "
-                        f"万美元（{biggest['opt_type']}，行权价 {biggest['strike']}，"
-                        f"到期 {biggest['expiry']}）",
-                        "有大资金在这个方向上集中押注，" +
-                        ("跟你的多头仓位是反的" if net_bearish else "跟你的方向一致"),
-                        "别只凭这一条动手，配合价格看——"
-                        "价格同时跌破均线才是真信号" if net_bearish
-                        else "可以作为继续持有的旁证，不构成加仓理由",
-                        source="options_flow_archive")
+                        ticker, kind, what_happened, what_it_means,
+                        suggested_action, source="options_flow_archive",
+                        severity=severity)
+                # 放在查询和处理都成功之后，查询挂了就不会假装这一路
+                # 成功过（评审 M8）
+                sources.append("options_flow")
             except Exception as exc:
                 gaps.append(f"期权异动拉取失败：{exc}")
 
         cn_tickers = by_market.get("CN", [])
         if cn_tickers:
             try:
-                sources.append("cn_fund_flow")
                 for ticker, flow in cn_signals.fund_flow(cn_tickers).items():
                     if not flow:
                         continue
@@ -631,6 +910,7 @@ def watch_positions(hours: int = 24) -> str:
                             "机构资金在持续出货，散户接盘的行情很难走远",
                             "考虑减仓，至少不要在这个位置加",
                             source="cn_fund_flow"))
+                sources.append("cn_fund_flow")
             except Exception as exc:
                 gaps.append(f"A股主力资金拉取失败：{exc}")
 
@@ -647,16 +927,16 @@ def watch_positions(hours: int = 24) -> str:
                 gaps.append(f"龙虎榜拉取失败：{exc}")
 
         # ---- 第四路：突发消息。中性情绪不算正面；挂票数够多的大盘综述
-        # 不算这只仓位的专属消息，直接不发（模块 docstring 有详细说明）----
+        # 不算这只仓位的专属消息，直接不发；每票的上限在过滤之后才生效
+        # （模块 docstring 有详细说明，评审 M9）----
         try:
             news = catalyst.news_for(all_tickers, days=max(1, hours // 24),
-                                     min_significance="High", per_ticker=1)
-            if news:
-                sources.append("news")
+                                     min_significance="High",
+                                     per_ticker=NEWS_CANDIDATES_PER_TICKER)
             for ticker, items in news.items():
                 for item in items:
                     if len(item.get("tickers") or []) >= MARKET_WIDE_TICKER_COUNT:
-                        continue  # 大盘综述，不是这只票的专属消息
+                        continue  # 大盘综述，跳过找下一条候选
                     label = (item.get("sentiment_label") or "").lower()
                     if label == "negative":
                         kind, tag, means = ("bad_news", "负面",
@@ -682,6 +962,12 @@ def watch_positions(hours: int = 24) -> str:
                         "先看股价反应过了没有——已经跳完的消息不用再动作；"
                         "还没反应的才需要决定",
                         source="news"))
+                    break  # 每票只发这一条最新的个股专属消息
+            # `catalyst.news_for()` 会给每只查询到的票预填空列表，
+            # `if news:` 这种写法永远为真（评审 M8）——要判断的是「有没有
+            # 真的查到内容」，不是「返回的字典存不存在」
+            if any(items for items in news.values()):
+                sources.append("news")
         except Exception as exc:
             gaps.append(f"消息拉取失败：{exc}")
 
@@ -693,7 +979,6 @@ def watch_positions(hours: int = 24) -> str:
             if uw.available():
                 live = uw.alerts(limit=100)
                 if live is not None:
-                    sources.append("uw_alerts")
                     held = set(all_tickers)
                     # ticker -> {"bullish": [规则名...], "bearish": [...],
                     #            "unknown": [...]}
@@ -749,6 +1034,7 @@ def watch_positions(hours: int = 24) -> str:
                                 "去 Unusual Whales 看这条警报的细节，"
                                 "自己判断方向",
                                 source="uw_live_alert"))
+                    sources.append("uw_alerts")
         except Exception as exc:
             gaps.append(f"UW 实时警报拉取失败：{exc}")
 

@@ -300,11 +300,12 @@ def test_stop_alert_severity_is_not_a_constant():
 
 
 def test_stop_breach_severity_scales_with_real_breach_depth_and_pnl_sign():
-    """用真实持仓独立算一遍：严重度必须真的随跌破幅度和盈亏方向变化，
-    不能是抄回同一个定值。今天的 6 只真实持仓分布：MP/ORCL/RKLB 深度击穿
-    （浮亏中），GOOGL 浅破但也浮亏，AMZN/NVO 只是移动止损被触及（还在浮
-    盈）——一个浮盈只是轻触均线的仓位，严重度必须低于一个浮亏且远远跌穿
-    止损的仓位（协调者原话）。"""
+    """用真实持仓独立算一遍：严重度必须真的随跌破幅度、盈亏方向、以及
+    '破了多久'变化，不能是抄回同一个定值。修复轮 3 加了第三个维度
+    （评审 C1）：浮亏且最近才破位的是 `stop_breached`（按深浅分 95/75），
+    浮亏但已经破位很久的降级成 `stop_breached_longstanding`（固定档，
+    远低于 95），浮盈只是碰到移动止损线的是 `trailing_stop_touched`。
+    这里独立复算每只票该落在哪个桶、严重度该是多少，跟真实输出核对。"""
     from core import scoring
     from core import snapshot as snap_mod
     from db import pg
@@ -313,11 +314,10 @@ def test_stop_breach_severity_scales_with_real_breach_depth_and_pnl_sign():
                          "from user_positions")
     out = run()
     by_key = {(a["ticker"], a["kind"]): a for a in out["alerts"]
-             if a["kind"] in ("stop_breached", "trailing_stop_touched")}
+             if a["kind"] in ("stop_breached", "stop_breached_longstanding",
+                              "trailing_stop_touched")}
 
-    # (跌破幅度, 严重度, kind)，分浮盈/浮亏两桶，用来做协调者要求的
-    # 那个直接比较：浮盈里最浅的 vs 浮亏里最深的。
-    touched, breached = [], []
+    touched, breached_recent, breached_long = [], [], []
     checked = 0
     for pos in positions:
         snap = snap_mod.get([pos["ticker"]], pos["market"]).get(pos["ticker"])
@@ -328,17 +328,36 @@ def test_stop_breach_severity_scales_with_real_breach_depth_and_pnl_sign():
             continue
         pnl = ((snap["close"] - float(pos["avg_cost"]))
               * float(pos["shares"]))
-        expected_kind = "trailing_stop_touched" if pnl >= 0 else "stop_breached"
+        depth = abs(stop["distance_pct"])
+
+        if pnl >= 0:
+            expected_kind = "trailing_stop_touched"
+            expected_severity = wp._stop_alert_severity(expected_kind, depth)
+        else:
+            # 独立查历史行情，用被测的纯函数（已经有自己的 fixture 单测
+            # 单独守着）算连续破位天数，判断落在哪个桶
+            hist_rows = pg.query(wp._STOP_HISTORY_SQL,
+                                 ([pos["ticker"]], pos["market"],
+                                  wp.STOP_HISTORY_LOOKBACK_DAYS))
+            consecutive_days, _ = wp._consecutive_breach_days(
+                float(pos["avg_cost"]), hist_rows)
+            if consecutive_days <= wp.STOP_BREACH_RECENT_DAYS:
+                expected_kind = "stop_breached"
+                expected_severity = wp._stop_alert_severity(expected_kind, depth)
+            else:
+                expected_kind = "stop_breached_longstanding"
+                expected_severity = wp.SEVERITY["stop_breached_longstanding"]
+
         alert = by_key.get((pos["ticker"], expected_kind))
         assert alert is not None, (
             f"{pos['ticker']} 应该有一条 {expected_kind} 告警")
-        depth = abs(stop["distance_pct"])
-        expected_severity = wp._stop_alert_severity(expected_kind, depth)
         assert alert["severity"] == expected_severity, (
             f"{pos['ticker']} 严重度应该是 {expected_severity}"
-            f"（{expected_kind}，跌破 {depth:.2f}%），实际是 {alert['severity']}")
-        (touched if expected_kind == "trailing_stop_touched" else breached).append(
-            (depth, alert["severity"]))
+            f"（{expected_kind}），实际是 {alert['severity']}")
+        bucket = {"trailing_stop_touched": touched,
+                 "stop_breached": breached_recent,
+                 "stop_breached_longstanding": breached_long}[expected_kind]
+        bucket.append((depth, alert["severity"]))
         checked += 1
 
     assert checked > 0, "今天应该真的有票触发止损相关告警（6 只持仓一直都有）"
@@ -346,12 +365,21 @@ def test_stop_breach_severity_scales_with_real_breach_depth_and_pnl_sign():
     assert len(severities) > 1, (
         "止损相关告警的严重度全都一样，说明分档没有真正生效")
 
-    if touched and breached:
+    if touched and breached_recent:
         shallowest_touch_severity = min(touched, key=lambda t: t[0])[1]
-        deepest_breach_severity = max(breached, key=lambda t: t[0])[1]
+        deepest_breach_severity = max(breached_recent, key=lambda t: t[0])[1]
         assert shallowest_touch_severity < deepest_breach_severity, (
             f"浮盈中只是轻触均线的严重度（{shallowest_touch_severity}）应该"
             f"低于浮亏中远远跌穿止损的严重度（{deepest_breach_severity}）")
+
+    if breached_long and breached_recent:
+        # 协调者原话：一只连续破位几十个交易日的票，严重度必须低于一只
+        # 今天刚跌破的票
+        longstanding_severity = max(s for _, s in breached_long)
+        recent_severity = max(s for _, s in breached_recent)
+        assert longstanding_severity < recent_severity, (
+            f"长期破位的严重度（{longstanding_severity}）应该低于"
+            f"最近才破位的严重度（{recent_severity}）")
 
 
 def test_no_duplicate_below_ma20_when_stop_basis_is_ma20():
@@ -359,7 +387,8 @@ def test_no_duplicate_below_ma20_when_stop_basis_is_ma20():
     那是同一件事。今天真实数据里至少有一只票的止损依据是 ma_20。"""
     out = run()
     ma20_stop_tickers = {a["ticker"] for a in out["alerts"]
-                         if a["kind"] in ("stop_breached", "trailing_stop_touched")
+                         if a["kind"] in ("stop_breached", "stop_breached_longstanding",
+                                          "trailing_stop_touched")
                          and "依据：ma_20" in a["what_happened"]}
     if not ma20_stop_tickers:
         pytest.skip("今天没有票的止损依据正好是 ma_20，测不出这条去重")
@@ -371,19 +400,22 @@ def test_no_duplicate_below_ma20_when_stop_basis_is_ma20():
 
 
 def test_stop_breach_pnl_wording_matches_the_real_sign():
-    """`stop_breached` 只在浮亏时出现，措辞必须是「浮亏」且不带负号；
-    `trailing_stop_touched` 只在浮盈时出现，措辞必须是「浮盈」。
-    独立算一遍真实盈亏（不复用被测代码的算法）核对。"""
+    """`stop_breached`/`stop_breached_longstanding` 只在浮亏时出现，措辞
+    必须是「浮亏」且不带负号；`trailing_stop_touched` 只在浮盈时出现，
+    措辞必须是「浮盈」。独立算一遍真实盈亏（不复用被测代码的算法）核对。
+    修复轮 3 加了 `stop_breached_longstanding`（破位破了很久的降档），
+    浮亏时可能是这三个 kind 里的任意一个，不再是非黑即白的两个。"""
     from core import snapshot as snap_mod
     from db import pg
 
+    LOSS_KINDS = ("stop_breached", "stop_breached_longstanding")
     positions = {p["ticker"]: p for p in
                 pg.query("select ticker, market, avg_cost, shares "
                         "from user_positions")}
     out = run()
     checked = 0
     for alert in out["alerts"]:
-        if alert["kind"] not in ("stop_breached", "trailing_stop_touched"):
+        if alert["kind"] not in LOSS_KINDS + ("trailing_stop_touched",):
             continue
         pos = positions.get(alert["ticker"])
         if not pos:
@@ -401,10 +433,10 @@ def test_stop_breach_pnl_wording_matches_the_real_sign():
         if pnl >= 0:
             assert alert["kind"] == "trailing_stop_touched", (
                 f"{alert['ticker']} 实际浮盈 {pnl:.0f}，"
-                f"不该被归为 stop_breached")
+                f"不该被归为 {alert['kind']}")
             assert "浮盈" in text and "浮亏" not in text
         else:
-            assert alert["kind"] == "stop_breached", (
+            assert alert["kind"] in LOSS_KINDS, (
                 f"{alert['ticker']} 实际浮亏 {pnl:.0f}，"
                 f"不该被归为 trailing_stop_touched")
             assert "浮亏" in text and "浮盈" not in text
@@ -1026,3 +1058,455 @@ def test_bad_news_alert_carries_the_explicit_severity(monkeypatch):
     assert len(matched) == 1
     assert matched[0]["severity"] == wp.SEVERITY["bad_news"]
     assert matched[0]["severity"] != 30
+
+
+# ---------------- 修复轮3 / C1（根本问题）：破位要看"什么时候破的" ----------------
+
+def _find_loss_breached_ticker():
+    """找一只今天真实浮亏且跌破止损的票，不管它连续破位了多少天。找不到
+    返回 None，调用方负责 skip。"""
+    from core import scoring
+    from core import snapshot as snap_mod
+    from db import pg
+
+    positions = pg.query("select ticker, market, avg_cost, shares "
+                         "from user_positions")
+    for pos in positions:
+        snap = snap_mod.get([pos["ticker"]], pos["market"]).get(pos["ticker"])
+        if not snap or snap.get("close") is None:
+            continue
+        stop = scoring.position_stop(float(pos["avg_cost"]), snap)
+        if not stop.get("breached"):
+            continue
+        pnl = ((snap["close"] - float(pos["avg_cost"]))
+              * float(pos["shares"]))
+        if pnl < 0:
+            return pos["ticker"]
+    return None
+
+
+def test_consecutive_breach_days_counts_from_most_recent_backward():
+    """纯函数：从最新一天往前数，遇到第一个"没破位"的日子就停。用手造的
+    fixture 数据（不查库），每一天用它自己的 ma_20/ATR 重新算一遍止损位。
+    avg_cost=100，ATR=2："成本-2×ATR"=96 这一档在这组数据里始终是止损位
+    （因为 ma_20 都低于 96）。"""
+    avg_cost = 100.0
+    rows = [
+        {"date": "2026-08-28", "close": 80.0, "ma_20": 90.0, "atr_14": 2.0},
+        {"date": "2026-08-27", "close": 82.0, "ma_20": 91.0, "atr_14": 2.0},
+        {"date": "2026-08-26", "close": 83.0, "ma_20": 92.0, "atr_14": 2.0},
+        {"date": "2026-08-25", "close": 99.0, "ma_20": 93.0, "atr_14": 2.0},  # 99>96，没破位
+        {"date": "2026-08-24", "close": 70.0, "ma_20": 94.0, "atr_14": 2.0},
+    ]
+    count, last_above = wp._consecutive_breach_days(avg_cost, rows)
+    assert count == 3
+    assert last_above == "2026-08-25"
+
+
+def test_consecutive_breach_days_all_breached_counts_everything():
+    avg_cost = 100.0
+    rows = [{"date": f"2026-08-{28-i:02d}", "close": 50.0, "ma_20": 90.0,
+            "atr_14": 2.0} for i in range(5)]
+    count, last_above = wp._consecutive_breach_days(avg_cost, rows)
+    assert count == 5
+    assert last_above is None
+
+
+def test_consecutive_breach_days_empty_rows_is_zero():
+    count, last_above = wp._consecutive_breach_days(100.0, [])
+    assert count == 0
+    assert last_above is None
+
+
+def test_recent_breach_uses_stop_breached_kind_not_longstanding(monkeypatch):
+    """把连续天数强制设成一个小于阈值的数（用 monkeypatch 直接控制
+    `_consecutive_breach_days` 的返回值，不依赖今天真实数据恰好是多少
+    天），验证走的是 `stop_breached` 这条"最近发生"的分支。"""
+    target = _find_loss_breached_ticker()
+    if not target:
+        pytest.skip("今天没有票同时'浮亏'且'跌破止损'，测不出这条分类")
+
+    monkeypatch.setattr(wp, "_consecutive_breach_days",
+                        lambda cost, rows: (1, "2026-08-30"))
+    out = run()
+    matched = [a for a in out["alerts"] if a["ticker"] == target
+              and a["kind"] in ("stop_breached", "stop_breached_longstanding")]
+    assert len(matched) == 1
+    assert matched[0]["kind"] == "stop_breached"
+
+
+def test_longstanding_breach_uses_downgraded_kind_and_forward_stop(monkeypatch):
+    """把连续天数强制设成一个大于阈值的数，验证走的是
+    `stop_breached_longstanding` 这条"持仓状态"的分支：严重度降档、
+    不再说"按纪律该减仓或清掉"、原止损位不再被当成今天能用的价位。"""
+    target = _find_loss_breached_ticker()
+    if not target:
+        pytest.skip("今天没有票同时'浮亏'且'跌破止损'，测不出这条分类")
+
+    monkeypatch.setattr(
+        wp, "_consecutive_breach_days",
+        lambda cost, rows: (wp.STOP_BREACH_RECENT_DAYS + 5, "2026-01-01"))
+    out = run()
+    matched = [a for a in out["alerts"] if a["ticker"] == target
+              and a["kind"] in ("stop_breached", "stop_breached_longstanding")]
+    assert len(matched) == 1
+    alert = matched[0]
+    assert alert["kind"] == "stop_breached_longstanding"
+    assert alert["severity"] == wp.SEVERITY["stop_breached_longstanding"]
+    assert alert["severity"] < 95
+    assert "按纪律该减仓或清掉" not in alert["suggested_action"]
+    assert "已经连续 20 个交易日" in alert["what_happened"]
+
+
+def test_real_longstanding_breach_severity_is_lower_than_a_recent_one():
+    """协调者原话：一只连续在止损位下方几十个交易日的票，严重度必须低于
+    一只今天刚跌破的票。用真实数据（MP/ORCL 是长期的）核对——前提不成立
+    就跳过并说明，不放松断言。"""
+    out = run()
+    longstanding = [a for a in out["alerts"]
+                    if a["kind"] == "stop_breached_longstanding"]
+    recent = [a for a in out["alerts"] if a["kind"] == "stop_breached"]
+    if not longstanding or not recent:
+        pytest.skip("今天没有同时出现'长期破位'和'最近破位'两种真实持仓，"
+                   "测不出这条对比（monkeypatch 那两条测试已经把分类逻辑"
+                   "本身钉死了）")
+    assert (max(a["severity"] for a in longstanding)
+           < max(a["severity"] for a in recent))
+
+
+def test_no_positions_are_stuck_at_top_severity_for_months_old_breaches():
+    """协调者复核实测：MP 连续 58 个交易日、ORCL 连续 56 个交易日在止损
+    位下方，之前每天都报最高严重度 95。这条断言：真实数据里已经没有
+    "严重度 95 但其实是几十个交易日前就破位"的情况——凡是被归为
+    `stop_breached_longstanding` 的告警，严重度都不该到 95。
+
+    先查前提是否成立（今天真的有票被归为'长期破位'），不成立就跳过——
+    不加这个前提检查的话，'longstanding 列表是空的'也会让下面这条断言
+    空对空地通过，测不出'长期降档这整块功能被删掉了'这种更严重的问题
+    （踩过这个坑：验证时把 recent 判断硬改成永远 True，longstanding 桶
+    整个消失，这条断言在没有前提检查时照样绿）。"""
+    out = run()
+    longstanding = [a for a in out["alerts"]
+                    if a["kind"] == "stop_breached_longstanding"]
+    if not longstanding:
+        pytest.skip("今天没有票的破位状态被归为'长期破位'，测不出这条")
+    longstanding_at_top = [a for a in longstanding if a["severity"] >= 95]
+    assert longstanding_at_top == [], (
+        f"{longstanding_at_top} 这些'长期破位'的告警不该拿到最高严重度 95")
+
+
+def test_forward_stop_is_below_current_price_when_used():
+    """`stop_breached_longstanding` 的建议动作里如果提到了参考止损位
+    （forward_stop），那个数字必须是今天真能用的——低于现价，不能是历史
+    上的旧价位。"""
+    import re
+
+    from core import snapshot as snap_mod
+    from db import pg
+
+    positions = {p["ticker"]: p for p in
+                pg.query("select ticker, market from user_positions")}
+    out = run()
+    longstanding = [a for a in out["alerts"]
+                    if a["kind"] == "stop_breached_longstanding"]
+    if not longstanding:
+        pytest.skip("今天没有票是'长期破位'状态，测不出这条")
+    checked = 0
+    for alert in longstanding:
+        pos = positions.get(alert["ticker"])
+        if not pos:
+            continue
+        snap = snap_mod.get([pos["ticker"]], pos["market"]).get(pos["ticker"])
+        if not snap or snap.get("close") is None:
+            continue
+        matches = re.findall(r"参考止损可以放在 ([\d.]+)", alert["suggested_action"])
+        if not matches:
+            continue
+        forward_value = float(matches[0])
+        assert forward_value < snap["close"], (
+            f"{alert['ticker']} 的参考止损 {forward_value} 应该低于"
+            f"现价 {snap['close']}，不能是历史上的旧价位")
+        checked += 1
+    assert checked > 0, "样本里应该真的核对到至少一条带 forward_stop 的建议"
+
+
+# ---------------- 修复轮3 / I2：期权异动一句话不能混两个口径 ----------------
+
+def test_options_flow_direction_wording_uses_a_single_consistent_criterion(
+        monkeypatch):
+    """看涨/看跌的计数和"最大一笔"的方向判定必须用同一个口径（sentiment），
+    不能一半用 sentiment 一半用 opt_type——之前混着说，评审实测近 2 天
+    200 行里 88 行两者不一致，输出出现过"看涨 26 笔…最大一笔（PUT，
+    行权价 270）"这种自相矛盾的句子。这里故意构造一行 opt_type=CALL 但
+    sentiment=bearish 的数据，验证方向词只跟着 sentiment 走。"""
+    from db import pg
+
+    held = [r["ticker"] for r in
+           pg.query("select ticker from user_positions where market='US'")]
+    if not held:
+        pytest.skip("没有美股持仓")
+    target = held[0]
+    original_query = wp.pg.query
+
+    def fake_query(sql, params=None):
+        if "from flow_alerts_archive" in sql and "percentile_cont" in sql:
+            return [{"ticker": target, "p90": 60.0}]
+        if "from flow_alerts_archive" in sql:
+            return [{"ticker": target, "opt_type": "CALL",
+                     "total_premium": 900_000, "score": 70,
+                     "sentiment": "bearish", "day": "2026-08-28",
+                     "strike": 100, "expiry": "2026-09-19"}]
+        return original_query(sql, params)
+
+    monkeypatch.setattr(wp.pg, "query", fake_query)
+    out = run()
+    matched = [a for a in out["alerts"] if a["ticker"] == target
+              and a["kind"] == "big_bearish_flow"
+              and a["source"] == "options_flow_archive"]
+    assert len(matched) == 1
+    text = matched[0]["what_happened"]
+    assert "情绪判定为看跌" in text
+    assert "看跌 1 笔" in text
+    assert "看涨 0 笔" in text
+    assert "CALL 合约" in text  # opt_type 单独标注，不混进方向词
+
+
+# ---------------- 修复轮3 / I3：期权异动查询按票取，不是全局截断 ----------------
+
+def test_flow_recent_sql_returns_every_qualifying_row_per_ticker():
+    """真实验证：`_FLOW_RECENT_SQL` 现在是按票取（unnest + lateral），
+    不会因为别的票交易更活跃、全局按溢价排序时被挤出前 N 名而丢行。
+    独立按票查一遍 `flow_alerts_archive` 的真实行数，跟 SQL 结果核对
+    每票的总数对得上（安全网上限 1000，今天真实活跃度远低于这个数）。"""
+    from db import pg
+
+    held = [r["ticker"] for r in
+           pg.query("select ticker from user_positions where market='US'")]
+    if not held:
+        pytest.skip("没有美股持仓")
+
+    days = 8  # 覆盖评审实测过"719 行"的那个窗口量级
+    rows = pg.query(wp._FLOW_RECENT_SQL, (held, days))
+    got_by_ticker: dict[str, int] = {}
+    for r in rows:
+        got_by_ticker[r["ticker"]] = got_by_ticker.get(r["ticker"], 0) + 1
+
+    checked = 0
+    for ticker in held:
+        expected = pg.query_one(
+            "select count(*) as n from flow_alerts_archive "
+            "where ticker = %s and day >= current_date - %s",
+            (ticker, days))["n"]
+        expected_capped = min(expected, 1000)
+        assert got_by_ticker.get(ticker, 0) == expected_capped, (
+            f"{ticker} 期望拿到 {expected_capped} 行，实际拿到 "
+            f"{got_by_ticker.get(ticker, 0)} 行——说明按票取这件事没有"
+            "真正生效")
+        checked += 1
+    assert checked > 0, "样本里应该真的核对到至少一只票"
+
+
+# ---------------- 修复轮3 / I4：小额异动不该被叫成"大资金押注" ----------------
+
+def test_small_options_flow_gets_downgraded_wording_and_severity(monkeypatch):
+    """靠 score 分位数这条软门槛过线、但总金额没到 50 万美元硬门槛的期权
+    异动，不该被叫成"大资金押注"，严重度也该明显更低——评审真实抓到的
+    案例：RKLB 一笔 18.98 万美元的交易被叫成"大资金集中押注"，严重度 70，
+    比跌破 20 日均线（60）还高。判据（is_big_flow 的门槛）没有改，改的是
+    汇总后的措辞和严重度。"""
+    from db import pg
+
+    held = [r["ticker"] for r in
+           pg.query("select ticker from user_positions where market='US'")]
+    if not held:
+        pytest.skip("没有美股持仓")
+    target = held[0]
+    original_query = wp.pg.query
+
+    def fake_query(sql, params=None):
+        if "from flow_alerts_archive" in sql and "percentile_cont" in sql:
+            return [{"ticker": target, "p90": 40.0}]
+        if "from flow_alerts_archive" in sql:
+            return [{"ticker": target, "opt_type": "put",
+                     "total_premium": 189_760, "score": 50,
+                     "sentiment": "bearish", "day": "2026-08-28",
+                     "strike": 70, "expiry": "2026-09-25"}]
+        return original_query(sql, params)
+
+    monkeypatch.setattr(wp.pg, "query", fake_query)
+    out = run()
+    matched = [a for a in out["alerts"] if a["ticker"] == target
+              and a["kind"] == "big_bearish_flow"
+              and a["source"] == "options_flow_archive"]
+    assert len(matched) == 1
+    alert = matched[0]
+    # 小额那档的措辞会明说'谈不上大资金押注'——这句话本身含'大资金'三个
+    # 字（用来否定它），不能用裸子串判；要判的是没有'有大资金…集中押注'
+    # 这句正面断言（那是'大额'那档专属的措辞）
+    assert "有大资金在这个方向上集中押注" not in alert["what_happened"]
+    assert "有大资金在这个方向上集中押注" not in alert["what_it_means"]
+    assert "谈不上" in alert["what_it_means"], (
+        "小额那档应该明说'谈不上大资金押注'，不能含糊带过")
+    assert alert["severity"] == wp.OPTIONS_FLOW_SMALL_BEARISH_SEVERITY
+    assert alert["severity"] < wp.SEVERITY["below_ma20"], (
+        "一笔 19 万美元的交易不该比'跌破 20 日均线'还严重")
+
+
+def test_large_options_flow_keeps_big_money_wording_and_severity(monkeypatch):
+    """反过来：总金额真的过了 50 万美元硬门槛时，"大资金押注"这个措辞和
+    原有严重度要保留，不能被上面那条降档逻辑误伤。"""
+    from db import pg
+
+    held = [r["ticker"] for r in
+           pg.query("select ticker from user_positions where market='US'")]
+    if not held:
+        pytest.skip("没有美股持仓")
+    target = held[0]
+    original_query = wp.pg.query
+
+    def fake_query(sql, params=None):
+        if "from flow_alerts_archive" in sql and "percentile_cont" in sql:
+            return [{"ticker": target, "p90": 40.0}]
+        if "from flow_alerts_archive" in sql:
+            return [{"ticker": target, "opt_type": "put",
+                     "total_premium": 900_000, "score": 50,
+                     "sentiment": "bearish", "day": "2026-08-28",
+                     "strike": 70, "expiry": "2026-09-25"}]
+        return original_query(sql, params)
+
+    monkeypatch.setattr(wp.pg, "query", fake_query)
+    out = run()
+    matched = [a for a in out["alerts"] if a["ticker"] == target
+              and a["kind"] == "big_bearish_flow"
+              and a["source"] == "options_flow_archive"]
+    assert len(matched) == 1
+    assert "大资金" in matched[0]["what_it_means"]
+    assert matched[0]["severity"] == wp.SEVERITY["big_bearish_flow"]
+
+
+# ---------------- 修复轮3 / I5：窗口标签要跟实际查询范围对上 ----------------
+
+def test_options_flow_window_label_matches_actual_query_range(monkeypatch):
+    """评审实测：`hours=24` 时 SQL 实际覆盖 3 个自然日，但文案曾经写
+    "近 2 天"。现在两处必须对上：`hours=24` -> `lookback_days=2` ->
+    文案里的天数应该是 `lookback_days+1=3`。"""
+    from db import pg
+
+    held = [r["ticker"] for r in
+           pg.query("select ticker from user_positions where market='US'")]
+    if not held:
+        pytest.skip("没有美股持仓")
+    target = held[0]
+    original_query = wp.pg.query
+
+    def fake_query(sql, params=None):
+        if "from flow_alerts_archive" in sql and "percentile_cont" in sql:
+            return [{"ticker": target, "p90": 40.0}]
+        if "from flow_alerts_archive" in sql:
+            return [{"ticker": target, "opt_type": "put",
+                     "total_premium": 900_000, "score": 50,
+                     "sentiment": "bearish", "day": "2026-08-28",
+                     "strike": 70, "expiry": "2026-09-25"}]
+        return original_query(sql, params)
+
+    monkeypatch.setattr(wp.pg, "query", fake_query)
+    out = run(hours=24)
+    matched = [a for a in out["alerts"] if a["ticker"] == target
+              and a["kind"] == "big_bearish_flow"
+              and a["source"] == "options_flow_archive"]
+    assert len(matched) == 1
+    assert "近 3 天" in matched[0]["what_happened"], (
+        f"hours=24 应该标成'近 3 天'（lookback_days=2，覆盖 3 个自然日），"
+        f"实际文案：{matched[0]['what_happened']}")
+
+
+# ---------------- 修复轮3 / M6：价格数字要四舍五入 ----------------
+
+def test_price_numbers_in_alert_text_are_rounded():
+    """现价、均线数值不能带十几位小数糊给用户看（比如
+    56.1300010681152）。"""
+    import re
+
+    out = run()
+    checked = False
+    for alert in out["alerts"]:
+        for match in re.findall(r"\d+\.\d+", alert["what_happened"]):
+            decimals = match.split(".")[1]
+            assert len(decimals) <= 2, (
+                f"{alert['ticker']}/{alert['kind']} 里的数字 {match} "
+                f"小数位数超过 2 位：{alert['what_happened']}")
+            checked = True
+    assert checked, "样本里应该真的有带小数的数字，不然这条测试测不出东西"
+
+
+# ---------------- 修复轮3 / M7：uw_alert_direction_unknown 要有显式严重度 ----------------
+
+def test_uw_alert_direction_unknown_has_explicit_severity():
+    assert wp.SEVERITY["uw_alert_direction_unknown"] != 30
+    assert wp.SEVERITY["uw_alert_direction_unknown"] > wp.SEVERITY["neutral_news"]
+
+
+# ---------------- 修复轮3 / M8：checked_sources 只在真成功时才报 ----------------
+
+def test_options_flow_source_not_reported_when_query_fails(monkeypatch):
+    """查询挂了的话，`options_flow` 不该出现在 `checked_sources` 里——
+    早期写法在查询之前就 append 了，查询哪怕失败，`checked_sources` 里
+    照样有这一项，会跟 `data_gaps`/`warnings` 里同时报的失败信息自相
+    矛盾。"""
+    real_query = wp.pg.query
+
+    def boom(sql, params=None):
+        if "from flow_alerts_archive" in sql:
+            raise RuntimeError("模拟期权异动查询失败")
+        return real_query(sql, params)
+
+    monkeypatch.setattr(wp.pg, "query", boom)
+    out = run()
+    assert "options_flow" not in out["checked_sources"]
+    assert any("期权异动拉取失败" in g for g in out["data_gaps"])
+
+
+def test_news_source_only_reported_when_actual_articles_found(monkeypatch):
+    """`catalyst.news_for()` 会给每只查询到的票预填空列表，`if news:`
+    这种写法永远为真（只要 dict 非空，不管里面的列表是不是全是空的）。
+    要判断的是"有没有真的查到内容"，不是"返回的字典存不存在"。"""
+    def fake_news_for(tickers, days, min_significance, per_ticker):
+        return {t: [] for t in tickers}  # 字典非空，但每票都是空列表
+
+    monkeypatch.setattr(wp.catalyst, "news_for", fake_news_for)
+    out = run()
+    assert "news" not in out["checked_sources"]
+
+
+# ---------------- 修复轮3 / M9：每票新闻上限要在过滤大盘综述之后生效 ----------------
+
+def test_market_wide_article_does_not_starve_a_ticker_of_its_own_news(
+        monkeypatch):
+    """每票只发一条的上限必须在"过滤掉大盘综述"之后生效——如果这只票
+    最新一条新闻恰好是大盘综述、第二条才是真正的个股专属消息，这只票
+    当天也该拿到那条个股专属消息，不能因为综述占了唯一名额就整天没有
+    新闻告警。"""
+    from db import pg
+
+    held = [r["ticker"] for r in pg.query("select ticker from user_positions")]
+    if not held:
+        pytest.skip("没有持仓")
+    target = held[0]
+    wide_tickers = [target] + [f"FAKE{i}" for i in
+                               range(wp.MARKET_WIDE_TICKER_COUNT)]
+
+    def fake_news_for(tickers, days, min_significance, per_ticker):
+        assert per_ticker >= 2, "至少要多拉几条候选，不能只拉 1 条就指望过滤"
+        return {target: [
+            {"title": "大盘综述排第一条", "sentiment_label": "Positive",
+             "significant": "High", "tickers": wide_tickers},
+            {"title": "个股专属消息排第二条", "sentiment_label": "Negative",
+             "significant": "High", "tickers": [target]},
+        ]}
+
+    monkeypatch.setattr(wp.catalyst, "news_for", fake_news_for)
+    out = run()
+    matched = [a for a in out["alerts"] if a["ticker"] == target]
+    assert any("个股专属消息排第二条" in a["what_happened"] for a in matched), (
+        "大盘综述占了第一名额，第二条个股专属消息不该被丢掉")
+    assert not any("大盘综述排第一条" in a["what_happened"] for a in matched)
