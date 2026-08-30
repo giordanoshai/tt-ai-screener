@@ -109,9 +109,9 @@ def analyze_ticker(ticker: str, horizon: str = "both") -> str:
             insider = catalyst.insider_for([ticker], days=180).get(ticker)
             congress = catalyst.congress_for([ticker], days=365).get(ticker, [])
         else:
+            # 板块缺失不在这里 append——score_short_cn 在真正用得上板块的时候
+            # 自己会写进 gaps。两处都报的话，同一件事会在清单里出现两遍
             board = cn_signals.board_of([ticker]).get(ticker)
-            if board is None:
-                gaps.append(cn_signals.BOARD_MAPPING_GAP)
             cn = {
                 "fund_flow": cn_signals.fund_flow([ticker]).get(ticker),
                 "lhb": cn_signals.lhb([ticker], days=90).get(ticker, []),
@@ -127,11 +127,14 @@ def analyze_ticker(ticker: str, horizon: str = "both") -> str:
 
         # ---- 形态和交易计划 ----
         first_news = news[0] if news else None
-        setup = scoring.detect_short_setup(snap)
-        tier = "short"
+        setup, tier = None, "short"
+        if horizon != "mid":
+            # mid 档明确表示「只看中线」，就不该先拿短线形态去套——
+            # 不然 mid 和 both 除了回显的 horizon 字段之外会一模一样
+            setup = scoring.detect_short_setup(snap)
         if setup is None and horizon in ("mid", "both"):
             setup = scoring.detect_mid_setup(snap, fund)
-            tier = "mid" if setup else "short"
+            tier = "mid"
 
         if tier == "short" and market == "US":
             scored = scoring.score_short(snap, flow, first_news)
@@ -143,6 +146,11 @@ def analyze_ticker(ticker: str, horizon: str = "both") -> str:
             scored = scoring.score_mid(snap, fund, first_news)
 
         plan = scoring.plan_trade(snap, setup) if setup else None
+        risks = list(scored["risks"])
+        if plan and (scored["score"] < 50 or len(gaps) >= 3):
+            risks.append(
+                f"这份计划的价位是按现价和 ATR 机械算出来的。评分只有 "
+                f"{scored['score']}，还缺 {len(gaps)} 项依据——价位精确不等于这笔值得做")
 
         return json.dumps({
             "ticker": ticker,
@@ -159,6 +167,8 @@ def analyze_ticker(ticker: str, horizon: str = "both") -> str:
                 "ma_20": snap["ma_20"], "ma_50": snap["ma_50"],
                 "ma_200": snap["ma_200"],
                 "ma_50_slope_pct": snap["ma_50_slope_pct"],
+                "dist_ma20_pct": snap["dist_ma20_pct"],
+                "dist_ma50_pct": snap["dist_ma50_pct"],
                 "rsi_14": snap["rsi_14"],
                 "vol_ratio": snap["vol_ratio"],
                 "atr_14": snap["atr_14"], "atr_pct": snap["atr_pct"],
@@ -179,7 +189,7 @@ def analyze_ticker(ticker: str, horizon: str = "both") -> str:
             "setup_label": scoring.SETUP_LABELS.get(setup) if setup else None,
             "score": scored["score"],
             "reasons": scored["reasons"],
-            "risks": scored["risks"],
+            "risks": risks,
             "plan": plan,
             "data_gaps": sorted(set(gaps + scored["gaps"]
                                     + (plan["gaps"] if plan else []))),
