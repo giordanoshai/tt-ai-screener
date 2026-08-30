@@ -175,6 +175,27 @@ def _clean_tickers(raw, filter_set: set | None) -> list[str]:
     })
 
 
+def _freshness_warnings(market: str, fresh: dict) -> list[str]:
+    """把 `regime.freshness()` 的结论翻成人话警告。
+
+    拆成纯函数专门是为了能测——真实数据哪天行情不陈旧、采集任务都正常，
+    端到端测这条warnings 逻辑就会全绿，测不出「陈旧警告被删掉了」这种
+    改坏（修复轮 3 评审员实测：把 `if fresh["stale"]:` 改成 `if False:`，
+    `test_market_freshness_warning_is_consistent_with_regime` 当天因为
+    美股不陈旧、两边都是 False 照样通过）。喂一个写死 `stale=True` 的假
+    `fresh` 字典进来，不管哪天跑都能验证这条逻辑还在工作。"""
+    out = []
+    if fresh["stale"]:
+        out.append(f"{market} 行情最新只到 {fresh['latest_trading_day']}，"
+                   f"距今 {fresh['days_since']} 天")
+    if fresh["failed_jobs"]:
+        out.append(f"{market} 有采集任务失败：{fresh['failed_jobs']}")
+    if fresh["partial_jobs"]:
+        out.append(f"{market} 有采集任务只跑了一半（数据写了，某个可选源"
+                   f"没取到）：{fresh['partial_jobs']}")
+    return out
+
+
 def _scope_tickers(scope: str) -> tuple[set[str], set[str], dict[str, str]]:
     """返回 (持仓集合, 自选集合, 代码 -> 市场)。"""
     held, watched, markets = set(), set(), {}
@@ -318,17 +339,7 @@ def detect_catalysts(scope: str = "positions", hours: int = 24,
             except Exception:
                 fresh = None
             if fresh:
-                if fresh["stale"]:
-                    warnings.append(
-                        f"{market} 行情最新只到 {fresh['latest_trading_day']}，"
-                        f"距今 {fresh['days_since']} 天")
-                if fresh["failed_jobs"]:
-                    warnings.append(
-                        f"{market} 有采集任务失败：{fresh['failed_jobs']}")
-                if fresh["partial_jobs"]:
-                    warnings.append(
-                        f"{market} 有采集任务只跑了一半（数据写了，某个可选源"
-                        f"没取到）：{fresh['partial_jobs']}")
+                warnings.extend(_freshness_warnings(market, fresh))
 
         # ---- 第三路：价格自己说的话。按市场分批查，一个市场挂了
         # 不连累另一个市场，也不连累前两路已经拿到的新闻 ----

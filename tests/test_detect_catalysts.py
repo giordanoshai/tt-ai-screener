@@ -183,11 +183,16 @@ def test_watchlist_scope_marks_watched():
     assert all(e["watched"] or e["held"] for e in out["events"])
 
 
-def test_news_source_appears_when_it_has_data():
+def test_news_source_appears_when_it_has_data(monkeypatch):
     """I1：这条测试名叫「合并两个新闻源」，原来的子集断言
     （`sources <= {"news","uw_news"}`）空集也满足，评审员把 uw_news 那一路
     整个删掉照样全绿。改成断言 news 表真的贡献了事件——先查一次库确认
-    这个窗口内 news 表确实有数据，不然遇到某天真的没数据会假红。"""
+    这个窗口内 news 表确实有数据，不然遇到某天真的没数据会假红。
+
+    修复轮 3：把 MAX_EVENTS 临时调大，让来源判断跑在完整（未截断）的
+    列表上——`market, 72h` 默认会被砍到 40 条，uw_news 天然排得靠后
+    （见 market_wide/significance 那套排序），哪天它的条目全排到 40 名
+    开外，跑在截断后的列表上就会假红（不会放过真 bug，但会误报）。"""
     from db import pg
 
     hours = 72
@@ -197,13 +202,15 @@ def test_news_source_appears_when_it_has_data():
     if not count:
         pytest.skip(f"news 表最近 {hours} 小时内没有数据，测不出合并逻辑")
 
+    monkeypatch.setattr(dc, "MAX_EVENTS", 100000)
     out = run(scope="market", hours=hours)
     sources = {e["source_table"] for e in out["events"]}
     assert "news" in sources, "news 表这个窗口内明明有数据，工具却没吐出任何一条"
 
 
-def test_uw_news_source_appears_when_it_has_data():
-    """I1 的另一半：uw_news 那一路也要真的验到，不能只测 news 那一路。"""
+def test_uw_news_source_appears_when_it_has_data(monkeypatch):
+    """I1 的另一半：uw_news 那一路也要真的验到，不能只测 news 那一路。
+    同样把 MAX_EVENTS 临时调大，理由见上一条测试的说明。"""
     from db import pg
 
     hours = 72
@@ -213,6 +220,7 @@ def test_uw_news_source_appears_when_it_has_data():
     if not count:
         pytest.skip(f"uw_news 表最近 {hours} 小时内没有数据，测不出合并逻辑")
 
+    monkeypatch.setattr(dc, "MAX_EVENTS", 100000)
     out = run(scope="market", hours=hours)
     sources = {e["source_table"] for e in out["events"]}
     assert "uw_news" in sources, ("uw_news 表这个窗口内明明有数据，"
@@ -356,15 +364,79 @@ def test_clean_tickers_drops_empty_and_blank_strings():
 
 # ---------------- I3 附带：行情陈旧也要报（另外三个工具都有） ----------------
 
-def test_market_freshness_warning_is_consistent_with_regime():
-    """行情陈不陈旧要跟 core.regime.freshness() 说的一致，不能是摆设——
-    工具自己不该重新发明一套「陈旧」的判法，只能如实转述 regime 的结论。"""
+def test_freshness_warnings_reports_stale():
+    """`_freshness_warnings()` 纯函数测试：喂一个写死 stale=True 的假
+    `fresh` 字典，不管哪天跑都要能验证「陈旧」这条逻辑还在工作。
+
+    修复轮 3：原来的 `test_market_freshness_warning_is_consistent_with_regime`
+    断言 `mentions_stale == bool(fresh["stale"])`，今天美股不陈旧、两边
+    都是 False，等式成立——评审员把 `if fresh["stale"]:` 改成 `if False:`
+    （陈旧警告整条删掉），照样通过。拆出纯函数、喂假数据，就不再依赖
+    当天行情陈不陈旧。"""
+    fresh = {"market": "US", "latest_trading_day": "2020-01-01",
+             "days_since": 999, "stale": True,
+             "failed_jobs": [], "partial_jobs": []}
+    out = dc._freshness_warnings("US", fresh)
+    assert any("行情最新只到 2020-01-01" in w and "999" in w for w in out)
+
+
+def test_freshness_warnings_reports_failed_and_partial_jobs():
+    """同一个纯函数，覆盖「采集失败」「采集只跑一半」这两个分支。"""
+    fresh = {"market": "US", "latest_trading_day": "2026-08-28",
+             "days_since": 1, "stale": False,
+             "failed_jobs": ["us_news(failed)"],
+             "partial_jobs": ["us_fundamentals(partial)"]}
+    out = dc._freshness_warnings("US", fresh)
+    assert any("采集任务失败" in w and "us_news(failed)" in w for w in out)
+    assert any("采集任务只跑了一半" in w and "us_fundamentals(partial)" in w
+              for w in out)
+
+
+def test_freshness_warnings_all_clear_produces_nothing():
+    """三个分支都没触发时，不该凭空生成警告。"""
+    fresh = {"market": "US", "latest_trading_day": "2026-08-28",
+             "days_since": 1, "stale": False,
+             "failed_jobs": [], "partial_jobs": []}
+    assert dc._freshness_warnings("US", fresh) == []
+
+
+def test_stale_market_warning_reaches_the_tool_output(monkeypatch):
+    """光测纯函数还不够——还要确认 `detect_catalysts()` 真的把
+    `regime.freshness()` 的结论接了过去，接线本身没有断。用 monkeypatch
+    让 `regime.freshness` 报告陈旧，不依赖今天美股是不是真的陈旧。"""
+    def _fake_freshness(market):
+        return {"market": market, "latest_trading_day": "2020-01-01",
+                "days_since": 999, "stale": True, "recent_jobs": [],
+                "failed_jobs": [], "partial_jobs": []}
+
+    monkeypatch.setattr(dc.regime, "freshness", _fake_freshness)
+    out = run(scope="positions", hours=72)
+    assert any("行情最新只到" in w for w in out["warnings"])
+
+
+def test_failed_job_warning_is_backed_by_real_ingest_runlog():
+    """I3 附带的「采集失败」警告：用今天真实的 `ingest_runlog` 数据验证，
+    不是只测纯函数。查不到失败任务就跳过并说明原因，不放松断言。"""
     from core import regime
 
-    out = run(scope="positions", hours=72)
     fresh = regime.freshness("US")  # 6 只持仓全是美股
-    mentions_stale = any("行情最新只到" in w for w in out["warnings"])
-    assert mentions_stale == bool(fresh["stale"])
+    if not fresh["failed_jobs"]:
+        pytest.skip("US 最近没有失败的采集任务，测不出这条警告是不是真的在工作")
+
+    out = run(scope="positions", hours=72)
+    assert any("采集任务失败" in w for w in out["warnings"])
+
+
+def test_partial_job_warning_is_backed_by_real_ingest_runlog():
+    """同上，测「采集只跑了一半」那个分支。"""
+    from core import regime
+
+    fresh = regime.freshness("US")
+    if not fresh["partial_jobs"]:
+        pytest.skip("US 最近没有半途的采集任务，测不出这条警告是不是真的在工作")
+
+    out = run(scope="positions", hours=72)
+    assert any("采集任务只跑了一半" in w for w in out["warnings"])
 
 
 def test_price_reaction_stale_flag_matches_snapshot():
