@@ -173,8 +173,8 @@ def _swing_points(values: list[float], window: int, high: bool) -> list[float]:
 # --------------------------------------------------------------- 主函数
 
 
-def get_hourly_setup(ticker: str, bars: int = 60,
-                     market: str | None = None) -> str:
+def hourly_setup(ticker: str, bars: int = 60,
+                 market: str | None = None) -> dict:
     """看一只票在小时线上的进出场位置：现价卡在哪、上面压着什么、下面托着什么。
 
     日线定方向，小时线定点位。日线看好了一只票之后，用这个工具回答
@@ -192,27 +192,27 @@ def get_hourly_setup(ticker: str, bars: int = 60,
     try:
         ticker = (ticker or "").upper().strip()
         if not ticker:
-            return json.dumps({"error": "没给股票代码"}, ensure_ascii=False)
+            return {"error": "没给股票代码"}
 
         market = (market or _infer_market(ticker) or "").upper()
         if market not in MARKET_TZ:
-            return json.dumps({
+            return {
                 "error": f"认不出 {ticker} 属于哪个市场。"
                          "A股要带交易所后缀（600519.SH / 000001.SZ / 430139.BJ），"
                          "美股直接写代码（AAPL）。"
                          "也可以用 market 参数手动指定 US 或 CN。",
-            }, ensure_ascii=False)
+            }
 
         bars = max(MIN_BARS, min(int(bars), MAX_BARS))
         tz = MARKET_TZ[market]
 
         rows = pg.query(HOURLY_SQL, (tz, ticker, market, bars))
         if not rows:
-            return json.dumps({
+            return {
                 "error": f"{ticker}（{market}）没有小时线数据。"
                          "小时线只采活跃池（持仓 + 自选 + 粗筛命中），"
                          "把它加进自选就会开始采。",
-            }, ensure_ascii=False)
+            }
 
         # SQL 是 order by ts desc，翻回正序，最后一根就是最新的
         rows = list(reversed(rows))
@@ -329,10 +329,17 @@ def get_hourly_setup(ticker: str, bars: int = 60,
         }
         result["signals"] = _signals(result)
         result["summary"] = _summary(result)
-        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+        return result
 
     except Exception as exc:
-        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+        return {"error": str(exc)}
+
+
+def get_hourly_setup(ticker: str, bars: int = 60,
+                     market: str | None = None) -> str:
+    """（保留给现有测试和网页面板用；MCP 那边已经并进 analyze_ticker）"""
+    return json.dumps(hourly_setup(ticker, bars, market),
+                      ensure_ascii=False, indent=2, default=str)
 
 
 # --------------------------------------------------------------- 结论
