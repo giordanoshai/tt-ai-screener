@@ -93,3 +93,56 @@ def test_freshness_only_reports_jobs_from_that_market():
                    in us["failed_jobs"] + us["partial_jobs"])
     assert not any(name.startswith("us_") for name
                    in cn["failed_jobs"] + cn["partial_jobs"])
+
+
+# ---------------- 评审 C3：A股「创 20 个交易日新高」的窗口不能含当天 ----------------
+
+def test_cn_new_highs_20_window_excludes_today():
+    """跟 `tools/watch_positions.py` 的「20 交易日新低」是同一个 bug：
+    库里的 `high_20` 这一列**包含当天**（`core/snapshot.py` 为此专门准备了
+    `prior_high_20`），所以早期写法 `close >= high_20` 只在「收盘价正好等于
+    当日最高价、而且这个最高价恰好是 20 日最高」时才成立。
+
+    2026-08-28 实测（1500 只 A股）：那种写法命中 155 只，按真实语义
+    （当日最高价创出**此前** 20 个交易日以来的新高）应该命中 316 只。
+
+    这里独立按两种口径各算一遍，跟 `regime.get("CN")` 的返回值核对：必须
+    等于「不含当天」那个数，而且必须跟「含当天」那个数不一样——两个数如果
+    碰巧相等，这条测试就区分不了，会明说测不出来而不是假装通过。
+    """
+    from core import regime, snapshot
+    from db import pg
+
+    day = snapshot.latest_trading_day("CN")
+    if day is None:
+        pytest.skip("库里没有 A股行情")
+
+    counts = pg.query_one("""
+        with recent as (
+          select ticker, date, high, close, high_20,
+                 max(high) over (partition by ticker order by date
+                                 rows between 20 preceding and 1 preceding)
+                     as prior_high,
+                 row_number() over (partition by ticker order by date desc) as rn
+          from stock_ohlcv_daily
+          where market = 'CN' and date >= %s::date - 60 and date <= %s
+        )
+        select
+          count(*) filter (where high_20 is not null and close >= high_20)
+              as including_today,
+          count(*) filter (where prior_high is not null and high >= prior_high)
+              as excluding_today
+        from recent where rn = 1
+    """, (day, day))
+
+    including, excluding = counts["including_today"], counts["excluding_today"]
+    if including == excluding:
+        pytest.skip(f"今天两种口径碰巧都是 {including}，区分不了")
+
+    got = regime.get("CN")["new_highs_20"]
+    assert got == excluding, (
+        f"new_highs_20 应该是「当日最高价创出此前 20 个交易日新高」的只数 "
+        f"{excluding}，实际返回 {got}")
+    assert got != including, (
+        f"返回值等于「把当天算进 high_20」那种口径的 {including}，"
+        "说明窗口又把当天算进去了")

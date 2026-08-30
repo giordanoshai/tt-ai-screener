@@ -33,6 +33,21 @@ from db import pg
 #: 重要性从高到低。min_significance='Medium' 的意思是 High + Medium。
 SIGNIFICANCE_ORDER = ("High", "Medium", "Low")
 
+#: 一条新闻挂到这么多只票以上，就不是个股新闻而是大盘综述。
+#: 实测近 7 天 759 条新闻，95.1% 挂在 6 只票以内；挂 7 只以上的 24 条
+#: （3.2%）从多到少抽查全是「今天大盘涨跌」这类综述，例如：
+#:   [13只] Stocks Fall as Hawkish Warsh Boosts Fed Rate Hike Chances
+#:   [10只] Stock Indices Settle Higher as Nvidia Earnings Spur a Tech Rally
+#:   [ 8只] Stocks open on mixed footing ahead of Warsh's Jackson Hole speech
+#:
+#: **这个数字只在这里定义一次**（评审 I3）。五个工具、同一批新闻数据、
+#: 同一天、同一个用户，判据没道理不同；早期只有 `detect_catalysts` 和
+#: `watch_positions` 做了这个过滤，真实后果是 NVDA 靠一条挂 7 只票的
+#: 《马斯克加速燃气轮机生产之路伴随污染难题》在 `scan_swing` 里拿到
+#: 消息面满分 20/20，ORCL 靠一条挂 8 只票的《大型科技公司AI支出规模远超
+#: 预期》在 `review_positions` 里把紧急度从 20 抬到 65。
+MARKET_WIDE_TICKER_COUNT = 7
+
 #: 内部人交易代码：P = 公开市场买入，S = 卖出。
 #: A（授予）、M（期权行权）、F（代扣税）、D（处置）不是主动买卖，是噪音。
 #: 实测近 30 天：S 4697 条、M 1981 条、A 1870 条、F 996 条、P 770 条。
@@ -132,6 +147,36 @@ def _levels(min_significance: str) -> list[str]:
     except ValueError:
         cut = 1
     return list(SIGNIFICANCE_ORDER[:cut + 1])
+
+
+def is_market_wide(item_or_count) -> bool:
+    """这条新闻是不是「大盘/行业综述」而不是个股专属消息。
+
+    可以直接传一条 `_shape_news()` 出来的新闻（读它的 `tickers`），也可以
+    传一个**过滤前**的原始票数。传票数时必须是过滤前的——一条挂了 13 只
+    票的大盘综述，如果按「过滤后只剩我持仓那 1 只」去数，几乎总是数不到
+    阈值，会被误判成个股专属（`tools/detect_catalysts.py` 模块 docstring
+    里有这个坑的详细说明和专门的回归测试）。
+    """
+    if isinstance(item_or_count, dict):
+        count = len(item_or_count.get("tickers") or [])
+    else:
+        count = item_or_count or 0
+    return count >= MARKET_WIDE_TICKER_COUNT
+
+
+def first_stock_specific(items: list[dict] | None) -> dict | None:
+    """一串新闻里第一条**不是大盘综述**的。全是综述或者压根没有就返回 None。
+
+    「先按每票只留 1 条、再判断是不是综述」是错的顺序：那唯一的一条恰好
+    是综述时，这只票当天就一条个股消息都没有了，哪怕它后面紧跟着一条真
+    正的个股专属消息（评审 M9 在 `watch_positions` 里抓到过）。所以调用方
+    要多拉几条候选，交给这个函数挑。
+    """
+    for item in items or []:
+        if not is_market_wide(item):
+            return item
+    return None
 
 
 def _shape_news(row: dict) -> dict:

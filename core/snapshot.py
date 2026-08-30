@@ -173,6 +173,29 @@ where r.rn = 1
 """
 
 
+# 止损「破了多久」要靠这批历史行情重新按天算，见
+# `core/scoring.consecutive_breach_days()`。放在这里而不是放在某个工具里，
+# 是因为 `tools/review_positions.py` 和 `tools/watch_positions.py` 都要用
+# （评审 C1：两个工具对同一只票必须给出一致的判断，那就不能各查各的）。
+_STOP_HISTORY_SQL = """
+select t.ticker, o.date, o.close, o.ma_20, o.atr_14
+from unnest(%s::text[]) as t(ticker)
+left join lateral (
+    select date, close, ma_20, atr_14
+    from stock_ohlcv_daily
+    where ticker = t.ticker
+      and market = %s
+    order by date desc
+    limit %s
+) o on true
+order by t.ticker, o.date desc
+"""
+
+#: 算「止损连续破了多久」时往回查几根日线。120 个交易日约半年，实测最长
+#: 的一笔连续破位（MP，58 个交易日）在这个窗口里能完整数完，留了一倍余量。
+STOP_HISTORY_BARS = 120
+
+
 def _check_market(market: str) -> str:
     market = (market or "").upper()
     if market not in MARKETS:
@@ -288,6 +311,26 @@ def get(tickers: list[str], market: str) -> dict[str, dict | None]:
         grouped.setdefault(row["ticker"], []).append(row)
 
     return {t: _enrich(grouped.get(t, []), t, market, today) for t in tickers}
+
+
+def stop_history(tickers: list[str], market: str,
+                 bars: int = STOP_HISTORY_BARS) -> dict[str, list[dict]]:
+    """按票取最近 `bars` 根日线的 date/close/ma_20/atr_14，**日期倒序**
+    （最新的在前），喂给 `core/scoring.consecutive_breach_days()`。
+
+    没有行情的票值是空列表，但键一定在——调用方不用先判断有没有这个键。
+    """
+    market = _check_market(market)
+    tickers = [t.upper().strip() for t in (tickers or []) if t and t.strip()]
+    if not tickers:
+        return {}
+
+    out: dict[str, list[dict]] = {t: [] for t in tickers}
+    for row in pg.query(_STOP_HISTORY_SQL, (tickers, market, bars)):
+        # lateral 左连接：这只票一根日线都没有时会回一行全 None 的占位行
+        if row.get("date") is not None:
+            out.setdefault(row["ticker"], []).append(row)
+    return out
 
 
 def scan(market: str, min_dollar_volume: float | None = None) -> list[dict]:

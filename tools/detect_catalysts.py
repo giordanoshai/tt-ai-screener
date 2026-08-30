@@ -84,12 +84,9 @@ REACTED_ATR_MULT = 2.0
 REACTED_VOL_RATIO = 2.0
 
 #: 一条新闻挂到这么多只票以上，就不是个股新闻而是大盘综述。
-#: 实测近 7 天 759 条新闻，95.1% 挂在 6 只票以内；挂 7 只以上的 24 条
-#: 从多到少抽查全是「今天大盘涨跌」这类综述，例如：
-#:   [13只] Stocks Fall as Hawkish Warsh Boosts Fed Rate Hike Chances
-#:   [10只] Stock Indices Settle Higher as Nvidia Earnings Spur a Tech Rally
-#:   [ 8只] Stocks open on mixed footing ahead of Warsh's Jackson Hole speech
-MARKET_WIDE_TICKER_COUNT = 7
+#: **定义在 `core/catalyst.py`，这里只是引用**（评审 I3：五个工具共用
+#: 同一个数，不许各自定义）。阈值本身的实测依据见那边的注释。
+MARKET_WIDE_TICKER_COUNT = catalyst.MARKET_WIDE_TICKER_COUNT
 
 #: `events` 最多返回这么多条（按排序后的顺序截断，最相关的排在前面）。
 #: 一条新闻改成一个事件（见模块 docstring「一条新闻就是一个事件」）之后，
@@ -156,8 +153,9 @@ def is_market_wide(ticker_count: int) -> bool:
     """一条新闻挂的票达到这个数，就判定成大盘综述而不是个股新闻。
 
     调用方必须传**过滤前**的原始票数，见模块 docstring 里的坑。
+    判定本体在 `core/catalyst.is_market_wide()`，五个工具共用（评审 I3）。
     """
-    return ticker_count >= MARKET_WIDE_TICKER_COUNT
+    return catalyst.is_market_wide(ticker_count)
 
 
 def _round2(value):

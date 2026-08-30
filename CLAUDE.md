@@ -254,7 +254,7 @@ MCP_TOKEN=...              # auto-generated on first run
 
 | Table | Notes |
 |---|---|
-| `stocks_meta` | Ticker metadata: `company_name`, `sector`, `industry`, `exchange`, **`market`**, `currency`. `sector` is populated for roughly half the universe |
+| `stocks_meta` | Ticker metadata: `company_name`, `sector`, `industry`, `exchange`, **`market`**, `currency`. **`sector` is almost always empty**: measured 2026-08-31, 2,020 of 34,683 rows have one (5.8%) — all of them US (2,020 / 29,133 = 6.9%); every one of the 5,550 CN rows is empty. Anything that needs a sector must fall back to `ticker_over20b.sector` the way `tools/screening.py` does |
 | `stock_ohlcv_daily` | Daily OHLCV + RSI14 + `ma_20/50/200` + `dist_ma20_pct`/`dist_ma50_pct` + `high_20` + `vol_ratio` + `atr_pct`. Keyed `(ticker, date)`, carries **`market`** |
 | `stock_ohlcv_min` | Intraday bars, **three timeframes share this table** — split by the `timeframe` column (`'1h'` / `'1m'` / `'5m'`). Minute data is ~20M rows / 9.3GB, so a query missing `timeframe = '1h'` is a disaster. `ts` is the bar's **start** time, stored as `timestamptz` (convert to `America/New_York` or `Asia/Shanghai` for display). US bars carry a `session` of `RTH`/`ETH` |
 | `v_ohlcv_hourly` | Convenience view over the `'1h'` rows. `tools/hourly.py` deliberately queries the base table instead — the view hides `session` and `timeframe`, and Postgres inlines it anyway (identical plan, cost 6.33) |

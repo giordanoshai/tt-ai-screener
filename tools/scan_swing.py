@@ -23,6 +23,26 @@
 短波段：财报 3 个交易日内的**直接剔除**。波段是赌趋势延续，财报是掷骰子，
 两件事不该混在一笔交易里。
 中线：**保留但标注**。持有两个月本来就会跨过财报，而且财报可能正是催化剂。
+
+## 期权流有两路，评分用的是哪一路必须标出来（评审 I1）
+
+打分用的是**库里 5 天的期权归档**（`catalyst.options_flow`）；`scope="pool"`
+时最后还会给入选的几只补一次 **UW 实时**期权流。早期实现把实时那份直接
+覆盖到同一个 `flow` 键上，两者都不带标签——2026-08-31 实测：NVDA 的
+reasons 写「期权资金偏空（净 −10%）」，旁边 `flow.net_premium` 却是净
+**−43.7%**；S 的 reasons 写「大致平衡」（归档 +1.6%），旁边 `flow` 是
+**−15.1%**。评分依据和贴出来的证据是两个不同的东西，读的人会以为算错了。
+
+现在两份分开放、各自标明来源和时间窗：`flow`（打分用的那份，
+`used_for_score: true`）和 `flow_live`（后补的实时那份，
+`used_for_score: false`）。
+
+## 每一路取数各自 try/except（评审 C2）
+
+基本面、财报、新闻、期权流、A股各路信号、市场环境、新鲜度——每一路各自
+包在 try/except 里，挂了只把这一路写进 `data_gaps`，其余照常出候选。
+唯一的例外是行情快照本身：连价格都没有的话，这个工具没有任何东西可以
+算，那种情况才返回 error。
 """
 import json
 
@@ -36,8 +56,21 @@ SCOPES = ("pool", "full")
 #: 一次最多返回多少只。再多 Claude 也讲不完，用户也看不过来。
 MAX_LIMIT = 30
 
-#: 短波段排雷：财报在这么多天内的直接剔除（3 个交易日 ≈ 5 个自然日）。
-EARNINGS_BLACKOUT_DAYS = 3
+#: 短波段排雷：财报在这么多天内的直接剔除。
+#:
+#: 模块 docstring 声明的是「财报 **3 个交易日**内直接剔除」，而
+#: `earnings_for()` 给的 `days_until` 是**自然日**，所以这里要写 5
+#: （3 个交易日跨一个周末就是 5 个自然日）。早期这里写的是 3，注释却写着
+#: 「3 个交易日 ≈ 5 个自然日」——注释和值对不上，实际排雷窗口比声称的窄
+#: 了两天（评审 I2）。`review_positions.EARNINGS_SOON_DAYS` 用的是同一个
+#: 5 天窗口、同一套换算；`watch_positions` 用 7 天，因为它是盯盘、职责是
+#: 提前打招呼，理由写在那边的常量注释里。
+EARNINGS_BLACKOUT_DAYS = 5
+
+#: 每票拉几条新闻候选，再从里面挑第一条「不是大盘综述」的拿去打分。
+#: 拉 1 条再判断的话，那 1 条恰好是综述就等于这只票没有消息面依据了
+#: （跟 `watch_positions.NEWS_CANDIDATES_PER_TICKER` 是同一个道理）。
+NEWS_CANDIDATES_PER_TICKER = 3
 
 #: pool 范围里，最终给几只补实时期权流。全市场扫描不补（太慢）。
 LIVE_FLOW_TOP_N = 15
@@ -62,6 +95,23 @@ def _passes_liquidity(snap: dict, market: str) -> bool:
     return bool(snap.get("dollar_volume") and snap["dollar_volume"] >= floor)
 
 
+def _freshness_warnings(market: str, fresh: dict) -> list[str]:
+    """把 `regime.freshness()` 的结论翻成人话警告。拆成纯函数是为了能测
+    ——真实数据哪天行情不陈旧、采集任务都正常，端到端测这条逻辑就会全绿。
+    失败和「只跑了一半」无条件报，不挂在 stale 下面：「行情是新的但某个
+    采集任务挂了」恰恰最该说。"""
+    out = []
+    if fresh["stale"]:
+        out.append(f"{market} 行情最新只到 {fresh['latest_trading_day']}，"
+                   f"距今 {fresh['days_since']} 天")
+    if fresh["failed_jobs"]:
+        out.append(f"{market} 有采集任务失败：{fresh['failed_jobs']}")
+    if fresh["partial_jobs"]:
+        out.append(f"{market} 有采集任务只跑了一半（数据写了，某个可选源"
+                   f"没取到）：{fresh['partial_jobs']}")
+    return out
+
+
 def _candidates(snaps: list[dict], horizon: str,
                 funds: dict) -> list[tuple[dict, str, str]]:
     """挑出命中形态的票。返回 (快照, 形态, 档位)。"""
@@ -79,8 +129,15 @@ def _candidates(snaps: list[dict], horizon: str,
     return out
 
 
+def _round2(value):
+    """价格类数字只保留 2 位小数交出去。`"price": 64.3899993896484` 这种
+    十几位小数没有任何信息量（同 `tools/watch_positions.py` 的 `_round2`）。"""
+    return None if value is None else round(float(value), 2)
+
+
 def _shape(snap: dict, setup: str, tier: str, scored: dict,
-           plan: dict, earnings: dict | None, extra_gaps: list[str]) -> dict:
+           plan: dict, earnings: dict | None, extra_gaps: list[str],
+           flow: dict | None = None) -> dict:
     risks = list(scored["risks"])
     days_until = (earnings or {}).get("days_until")
     if tier == "mid" and days_until is not None and 0 <= days_until <= EARNINGS_BLACKOUT_DAYS:
@@ -93,16 +150,25 @@ def _shape(snap: dict, setup: str, tier: str, scored: dict,
         "horizon": tier,
         "setup": setup,
         "setup_label": scoring.SETUP_LABELS.get(setup, setup),
-        "price": snap["close"],
-        "vol_ratio": snap.get("vol_ratio"),
+        "price": _round2(snap["close"]),
+        "rsi": _round2(snap.get("rsi_14")),
+        "vol_ratio": _round2(snap.get("vol_ratio")),
+        "atr_pct": _round2(snap.get("atr_pct")),
         "entry_zone": plan["entry_zone"],
         "stop": plan["stop"],
         "stop_pct": plan["stop_pct"],
         "targets": plan["targets"],
         "rr_ratio": plan["rr_ratio"],
         "score": scored["score"],
+        # 这个分是用多少比例的评分表打出来的（100 = 一项没缺）。缺一半
+        # 依据打出来的 80 分，跟依据齐全打出来的 80 分不是一回事（评审 C4）
+        "evidence_pct": scored["evidence_pct"],
         "reasons": scored["reasons"],
         "risks": risks,
+        # 打分用的就是这一份（库里 5 天的期权归档）。实时那份在
+        # `flow_live` 里另放，两份都标了来源和时间窗（评审 I1）
+        "flow": (dict(flow, window="库里近 5 天的期权归档",
+                      used_for_score=True) if flow else None),
         "earnings": earnings or {},
         "data_gaps": sorted(set(scored["gaps"] + plan["gaps"] + extra_gaps)),
     }
@@ -139,7 +205,18 @@ def scan_swing(market: str = "US", horizon: str = "short",
                               ensure_ascii=False)
         limit = max(1, min(int(limit), MAX_LIMIT))
 
-        # ---- 1. 取候选池 ----
+        gaps: list[str] = []
+
+        # 每一路各自 try/except：挂了只丢这一路，其余照常出候选（评审 C2）
+        def _try(label: str, fn, default):
+            try:
+                return fn()
+            except Exception as exc:
+                gaps.append(f"{label}拉取失败：{exc}")
+                return default
+
+        # ---- 1. 取候选池。这一路是唯一挂了就没法继续的：连价格都没有，
+        # 后面所有判断都无从谈起 ----
         if scope == "full":
             snaps = snapshot.scan(market)
         else:
@@ -148,12 +225,12 @@ def scan_swing(market: str = "US", horizon: str = "short",
             snaps = [s for s in snaps if _passes_liquidity(s, market)]
         scanned = len(snaps)
 
-        gaps: list[str] = []
-
         # ---- 2. 中线档要基本面才能判形态 ----
         funds = {}
         if horizon in ("mid", "both"):
-            funds = fundamental.get([s["ticker"] for s in snaps], market)
+            funds = _try("基本面",
+                         lambda: fundamental.get(
+                             [s["ticker"] for s in snaps], market), {})
             if market == "CN":
                 gaps.append("A股基本面只覆盖 150 只票且字段大多为空，"
                             "中线档的判断依据不完整")
@@ -163,26 +240,32 @@ def scan_swing(market: str = "US", horizon: str = "short",
         codes = [snap["ticker"] for snap, _, _ in hits]
 
         # ---- 4. 只对命中的票补消息面和资金面 ----
-        earnings = catalyst.earnings_for(codes, market)
-        news = catalyst.news_for(codes, days=7, min_significance="Medium",
-                                 per_ticker=1)
+        earnings = _try("财报日",
+                        lambda: catalyst.earnings_for(codes, market), {})
+        news = _try("新闻",
+                    lambda: catalyst.news_for(
+                        codes, days=7, min_significance="Medium",
+                        per_ticker=NEWS_CANDIDATES_PER_TICKER), {})
 
         flows, cn_flows, boards, sentiment = {}, {}, {}, None
         if market == "US":
-            flows = catalyst.options_flow(codes, days=5)
+            flows = _try("期权异动",
+                         lambda: catalyst.options_flow(codes, days=5), {})
         else:
-            cn_flows = cn_signals.fund_flow(codes)
+            cn_flows = _try("A股主力资金",
+                            lambda: cn_signals.fund_flow(codes), {})
             # 板块和情绪只有短线档用得上——score_mid 连 board 参数都没有。
             # 无条件报「缺板块数据」会把一个中线档根本不用的缺口说成问题
             if horizon in ("short", "both"):
-                boards = cn_signals.board_of(codes)
-                sentiment = cn_signals.limit_sentiment()
+                boards = _try("A股板块", lambda: cn_signals.board_of(codes), {})
+                sentiment = _try("A股涨停情绪",
+                                 cn_signals.limit_sentiment, None)
                 gaps.append(cn_signals.BOARD_MAPPING_GAP)
-                dates = cn_signals.signal_dates()
-                if not dates["in_sync"]:
+                dates = _try("A股信号表日期", cn_signals.signal_dates, None)
+                if dates and not dates["in_sync"]:
                     gaps.append(dates["gap"])
 
-        # ---- 5. 短波段排雷：财报 3 天内的直接剔除 ----
+        # ---- 5. 短波段排雷：财报窗口内的直接剔除 ----
         rows = []
         for snap, setup, tier in hits:
             code = snap["ticker"]
@@ -191,7 +274,11 @@ def scan_swing(market: str = "US", horizon: str = "short",
                     and 0 <= days_until <= EARNINGS_BLACKOUT_DAYS):
                 continue
 
-            first_news = (news.get(code) or [None])[0]
+            # 打分用的那条新闻要挑「不是大盘综述」的第一条（评审 I3）。
+            # 真实后果：NVDA 靠一条挂了 7 只票的《马斯克加速燃气轮机生产
+            # 之路伴随污染难题》拿到消息面满分 20/20——那是大盘/行业综述，
+            # 不是这只票的催化剂
+            first_news = catalyst.first_stock_specific(news.get(code))
             if tier == "short" and market == "US":
                 scored = scoring.score_short(snap, flows.get(code), first_news)
             elif tier == "short":
@@ -203,44 +290,54 @@ def scan_swing(market: str = "US", horizon: str = "short",
 
             rows.append(_shape(snap, setup, tier, scored,
                                scoring.plan_trade(snap, setup),
-                               earnings.get(code), []))
+                               earnings.get(code), [], flows.get(code)))
 
         # 同分时按量能排：放量更大的说明后面跟的钱更多，比按股票代码排有意义
         rows.sort(key=lambda r: (-r["score"], -(r.get("vol_ratio") or 0),
                                  r["ticker"]))
+        matched_count = len(rows)
         rows = rows[:limit]
 
-        # ---- 6. pool 范围给最终入选的补一次实时期权流 ----
+        # ---- 6. pool 范围给最终入选的补一次实时期权流。**另放一个键**，
+        # 不覆盖打分用的那份——覆盖的话 reasons 里的百分比会跟旁边贴着的
+        # 证据对不上（评审 I1）----
         if scope == "pool" and market == "US" and rows:
-            live = catalyst.options_flow_live(
-                [r["ticker"] for r in rows[:LIVE_FLOW_TOP_N]])
+            live = _try("实时期权流",
+                        lambda: catalyst.options_flow_live(
+                            [r["ticker"] for r in rows[:LIVE_FLOW_TOP_N]]), {})
             for row in rows:
                 flow = live.get(row["ticker"])
                 if flow:
-                    row["flow"] = flow
+                    row["flow_live"] = dict(
+                        flow, window="实时接口（取不到时退回库里的，看 source）",
+                        used_for_score=False)
 
-        fresh = regime.freshness(market)
-        warnings = []
-        if fresh["stale"]:
-            warnings.append(f"{market} 行情最新只到 {fresh['latest_trading_day']}，"
-                            f"距今 {fresh['days_since']} 天")
-        if fresh["failed_jobs"]:
-            # 失败要无条件报。挂在 stale 下面的话，「行情是新的但某个采集任务挂了」
-            # 会完全不出声——而那恰恰最该说
-            warnings.append(f"{market} 有采集任务失败：{fresh['failed_jobs']}")
-        if fresh["partial_jobs"]:
-            warnings.append(f"{market} 有采集任务只跑了一半（数据写了，某个可选源没取到）："
-                            f"{fresh['partial_jobs']}")
+        fresh = _try(f"{market} 行情新鲜度",
+                     lambda: regime.freshness(market), None)
+        warnings = _freshness_warnings(market, fresh) if fresh else []
 
         return json.dumps({
             "market": market,
             "horizon": horizon,
             "scope": scope,
-            "as_of": snaps[0]["date"] if snaps else None,
+            # 停牌退市的票最后一根 K 线不是最新交易日，取 max 而不是取第一只
+            # ——`snapshot.get()` 刻意保留这类票，任何一只排在首位就会给整批
+            # 结果贴错日期
+            "as_of": max((s["date"] for s in snaps if s.get("date")),
+                         default=None),
             "scanned": scanned,
+            # matched = 命中形态的只数（财报排雷**之前**）；
+            # qualified = 排完雷、真正够格进候选名单的只数；
+            # returned_count = 被 limit 砍完实际返回的只数。
+            # 三个数基数不同，分开写出来，别让人拿 matched 去跟
+            # returned_count 相减以为那就是被截断的量
             "matched": len(hits),
+            "qualified": matched_count,
             "candidates": rows,
-            "regime": regime.get(market),
+            "returned_count": len(rows),
+            "truncated": matched_count > len(rows),
+            "regime": _try(f"{market} 市场环境",
+                           lambda: regime.get(market), None),
             "warnings": warnings,
             "data_gaps": sorted(set(gaps)),
         }, ensure_ascii=False, indent=2, default=str)

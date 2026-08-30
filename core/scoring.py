@@ -15,6 +15,27 @@
 要是缺一项就白扣 25 分，一只好票会因为「我们没查到它的期权数据」
 而被排到烂票后面——那是拿系统的无知去惩罚股票。
 
+## 但是要如实说清楚「这个分是用多少依据打出来的」（评审 C4）
+
+归一化本身没错，错在**没有下限、也没有任何字段说明分母被砍掉了多少**。
+2026-08-30 实测的真实后果：平安银行（000001.SZ）走中线档，满分 100 里
+基本面 35 分 + 相对强度 20 分整块被移出分母（A股没有基本面数据），剩下的
+45 分几乎全来自「价格站在均线上方」，打出来 **82 分**；同一次跑，基本面
+齐全、营收 +20.6%、ROE 53.4% 的 ORCL 只有 **77 分**。这两个 82 和 77
+放在一起，Claude 会把平安银行排在 Oracle 前面——而它们根本不是同一种
+东西：一个是「45% 的评分表打出来的 82」，一个是「100% 的评分表打出来
+的 77」。
+
+所以每份评分结果都带上 `evidence_pct`（**这次实际用上的评分项占满分的
+百分比**，`_Ledger.possible / 满分`），低于 `LOW_EVIDENCE_PCT` 时还会往
+`risks` 里塞一条明写的提醒。
+
+**分数本身不打折**，理由有两条：一是打折等于把「缺数据」重新变成扣分，
+正好推翻上面那条归一化的设计；二是打完折之后的分数既不是「拿到的依据
+里有几成是好的」、也不是「依据有多充分」，两个意思混在一个数里，现有
+所有按分数定的阈值（比如「评分低于 50 要提示」）会全部悄悄变味。
+把「依据有多少」单独做成一个看得见的字段，比把它偷偷揉进分数里诚实。
+
 ## 单位约定：进来的比率全是百分点
 
 本模块收到的 `snap` 来自 `core/snapshot.py`、`fund` 来自 `core/fundamental.py`。
@@ -56,12 +77,46 @@ OVERSOLD_DIST_MA50 = -8.0
 #: 中线趋势延续：离 52 周高点不超过这么多
 MID_NEAR_52W_HIGH = 15.0
 
+#: 底部反转：离 52 周高点**至少**这么远才算「还在底部区域」。
+#: 跟 `MID_NEAR_52W_HIGH` 是同一个数、方向相反——一只票要么离高点近
+#: （趋势延续），要么离高点远（底部反转），不该两头都算。
+#: 2026-08-30 实测（2082 只美股）：原来的判据不看价格在不在底部，
+#: 命中 353 只，其中 APGE 离 52 周高点 0.0%、CRNX 0.1%、ATKR 0.4%，
+#: MSFT 离高点只有 6% 也被标成「底部反转」——贴着 52 周新高的票被贴上
+#: 「底部反转」标签，是直接骗人。
+MID_BOTTOM_MIN_GAP_FROM_52W_HIGH = 15.0
+
+#: 底部反转：收盘价高出 200 日均线不超过这么多才算「刚站上」。
+#: 同一次实测里，命中的票有高出 200 日均线 173% 的——那不是「刚站上
+#: 200 日均线」，那是早就走出去半年了。收紧后剩 78 只（`bottom_reversal`
+#: 的入场区间本来就是围着 200 日均线给的，只有真在均线附近的票用得上）。
+MID_BOTTOM_MAX_ABOVE_MA200 = 15.0
+
 #: 止损放在入场价下方几倍 ATR。不同波动性的票用同一个百分比止损没有意义。
 STOP_ATR_MULT = 1.5
 #: 持仓止损：成本下方几倍 ATR（比新开仓宽，已经有浮盈浮亏的仓位不该被扫）
 POSITION_STOP_ATR_MULT = 2.0
 #: 目标价按几倍风险距离给
 TARGET_R_MULTIPLES = (2.0, 3.0)
+
+#: 评分实际用上的项占满分不到这个百分比时，往 `risks` 里塞一条明写的
+#: 提醒。60% 的意思是「三成以上的评分表根本没参与」——2026-08-30 实测的
+#: 真实分布：美股中线档绝大多数票是 100%（基本面齐全），A股中线档是 45%
+#: （基本面和相对强度整块缺），中间几乎没有票，阈值放在这个空档里。
+LOW_EVIDENCE_PCT = 60
+
+#: 「没有基本面数据」这句话在 `core/` 和 `tools/` 两处都要说，写死成一个
+#: 常量，免得两边措辞差一个字就 `sorted(set())` 去不掉重，同一件事在
+#: `data_gaps` 里出现两遍（评审顺手修一条）。
+NO_FUNDAMENTAL_GAP = "没有基本面数据（A股基本面目前只覆盖 150 只票）"
+
+#: 止损被击穿后，连续多少个交易日之内算「最近发生」——超过这个数就该降级成
+#: 「持仓状态」，不再当「立刻处理」的信号。依据见
+#: `tools/watch_positions.py` 模块 docstring「止损告警」一节「坑三」：
+#: 2026-08-31 用六只真实持仓的分布定的，15~55 个交易日这段区间里当天
+#: 没有任何一只票落进去。**两个工具共用这一个数**（`review_positions`
+#: 和 `watch_positions`），不允许各自定一个（评审 C1）。
+STOP_BREACH_RECENT_DAYS = 15
 
 #: 主力净流入占成交额多少算「满分」。取实测的 90 分位——2026-08-28 当日
 #: 净流入为正的 2379 只 A股里，中位数是 9.1%、90 分位是 22.7%。
@@ -160,10 +215,30 @@ def detect_mid_setup(snap: dict, fund: dict | None) -> str | None:
                 return None
         return "trend_continuation"
 
-    # 底部反转：刚站上 200 日均线，均线走平或翘头，基本面没在恶化
+    # 底部反转：**先得真在底部**，再谈刚站上 200 日均线、均线走平或翘头、
+    # 基本面没在恶化。
+    #
+    # 早期写法完全不检查价格在不在底部，2026-08-30 实测把 MSFT（离 52 周
+    # 高点只有 6%）、APGE（离高点 0.0%）这种贴着新高的票也标成「底部
+    # 反转」，命中 353 只——一个交易者看到「底部反转」四个字会以为这是
+    # 一只跌透了正在修复的票，照着这个印象去买一只 52 周新高附近的票，
+    # 是被标签直接误导。所以补两条判据：
+    #
+    # 1. 离 52 周高点至少 `MID_BOTTOM_MIN_GAP_FROM_52W_HIGH`——不然它是
+    #    「趋势延续」那一类，不是底部。**拿不到 52 周高点就不给这个形态**，
+    #    判断不了在不在底部就不该贴底部的标签（缺数据不猜，跟本模块
+    #    其它地方一致）。
+    # 2. 收盘价高出 200 日均线不超过 `MID_BOTTOM_MAX_ABOVE_MA200`——
+    #    「刚站上」才叫反转起步，高出一大截说明这波早就走完了，而
+    #    `plan_trade()` 给 bottom_reversal 的入场区间是围着 200 日均线
+    #    画的，价格离均线太远的话那个区间根本没法用。
     if (close > ma_200 and (slope is None or slope >= -0.5)
             and ma_50 is not None and close > ma_50
-            and (revenue_growth is None or revenue_growth > -10)):
+            and (revenue_growth is None or revenue_growth > -10)
+            and week_52_high
+            and (week_52_high - close) / week_52_high * 100
+                >= MID_BOTTOM_MIN_GAP_FROM_52W_HIGH
+            and (close - ma_200) / ma_200 * 100 <= MID_BOTTOM_MAX_ABOVE_MA200):
         return "bottom_reversal"
 
     return None
@@ -195,12 +270,30 @@ class _Ledger:
     def risk(self, text: str):
         self.risks.append(text)
 
-    def result(self) -> dict:
+    def result(self, full_marks: float = 100.0) -> dict:
+        """`full_marks` 是这张评分表**没缺任何数据时**的满分（每个评分
+        函数把自己那几项的权重加起来传进来，都是 100）。
+
+        `evidence_pct` = 实际进了分母的权重 / 满分——「这个分是用多少
+        比例的评分表打出来的」。缺数据不扣分（见模块 docstring），
+        但缺了多少必须写在脸上，不然 45% 依据打出来的 82 分会被拿去
+        跟 100% 依据打出来的 77 分直接比大小（评审 C4）。
+        """
         score = round(self.earned / self.possible * 100) if self.possible else 0
+        evidence_pct = (round(self.possible / full_marks * 100)
+                        if full_marks else 0)
+        risks = list(self.risks)
+        if evidence_pct < LOW_EVIDENCE_PCT:
+            risks.append(
+                f"这个分只用上了 {evidence_pct}% 的评分表——"
+                f"{100 - evidence_pct}% 的评分项因为缺数据被移出了分母，"
+                f"不能拿它跟依据齐全的票直接比大小")
         return {
             "score": max(0, min(100, score)),
+            # 这次实际用上的评分项占满分的百分比。100 = 一项没缺
+            "evidence_pct": evidence_pct,
             "reasons": self.reasons,
-            "risks": self.risks,
+            "risks": risks,
             "gaps": self.gaps,
         }
 
@@ -270,7 +363,10 @@ def _score_flow(led: _Ledger, flow: dict | None, weight: float):
     elif tilt >= 0.3:
         led.add(weight * 0.7, weight, f"期权资金偏多（净 {tilt:.0%}）")
     elif tilt >= 0:
-        led.add(weight * 0.4, weight, "期权资金多空大致平衡")
+        # 这一档也把数字印出来。四档里只有它不带数字的话，「大致平衡」这句
+        # 话就没法跟旁边贴出来的期权流对账（评审 I1 抓到的 S：reasons 写
+        # 「大致平衡」，旁边 flow 是 −15.1%，读的人无从判断该信哪个）
+        led.add(weight * 0.4, weight, f"期权资金多空大致平衡（净 {tilt:.0%}）")
     else:
         led.add(0.0, weight)
         led.risk(f"期权资金偏空（净 {tilt:.0%}）")
@@ -316,7 +412,7 @@ def score_short(snap: dict, flow: dict | None = None,
     _score_news(led, news, 20)
     if snap.get("stale"):
         led.risk(f"行情已经 {snap.get('days_since_bar')} 天没更新")
-    return led.result()
+    return led.result(100)
 
 
 def score_short_cn(snap: dict, fund_flow: dict | None = None,
@@ -406,7 +502,7 @@ def score_short_cn(snap: dict, fund_flow: dict | None = None,
 
     if snap.get("stale"):
         led.risk(f"行情已经 {snap.get('days_since_bar')} 天没更新")
-    return led.result()
+    return led.result(100)
 
 
 def score_mid(snap: dict, fund: dict | None = None,
@@ -419,7 +515,7 @@ def score_mid(snap: dict, fund: dict | None = None,
     _score_trend(led, snap, 25)
 
     if not fund:
-        led.skip("没有基本面数据（A股基本面目前只覆盖 150 只票）")
+        led.skip(NO_FUNDAMENTAL_GAP)
     else:
         # 每一项都按幅度分档，不是「大于零就满分」。净利率 0.1% 的公司
         # 和净利率 25% 的公司不该拿一样的分——那样打出来的 95 分是假的
@@ -486,7 +582,7 @@ def score_mid(snap: dict, fund: dict | None = None,
     _score_news(led, news, 20)
     if snap.get("stale"):
         led.risk(f"行情已经 {snap.get('days_since_bar')} 天没更新")
-    return led.result()
+    return led.result(100)
 
 
 # --------------------------------------------------------- 止损与目标
@@ -590,3 +686,73 @@ def position_stop(avg_cost: float, snap: dict) -> dict:
         "forward_stop": forward_stop,
         "gaps": [],
     }
+
+
+# ------------------------------------------- 「跌破止损」到底是哪一种（评审 C1）
+#
+# `position_stop()["breached"]` 只是一个布尔值，但它底下藏着三件性质完全
+# 不同的事，用同一个最高档报警会把真正紧急的那几只淹掉：
+#
+# 1. 仓位还在**浮盈**：止损位是 20 日均线（均线抬到成本上方护利润），
+#    跌破它是「保护线没了」，不是「这笔交易错了」。
+# 2. 仓位**浮亏**、而且**最近**才破位：真正紧急，该按纪律处理。
+# 3. 仓位浮亏、但破位已经持续几十个交易日：这是持仓状态，不是今天的新
+#    信号。每天当最高优先级重播，用户要么被催着在底部割肉、要么看几天
+#    就麻木，把真正「今天刚破」的那条一起忽略掉。
+#
+# 这两个函数是 `tools/review_positions.py` 和 `tools/watch_positions.py`
+# **共用的唯一判定**。评审 C1 抓到的原始事故就是两边各判各的：同一天
+# 同一只 AMZN（浮盈 204 美元、只跌破 0.17%），`watch_positions` 说
+# 「移动止损被触及、严重度 40、不必马上动」，`review_positions` 说
+# 「跌破止损、紧急度 90（最高档）、按纪律该清掉」——用户先读到哪个就信
+# 哪个。判定放在这里，两个工具就不可能再各说各话；各自的档位名称和措辞
+# 仍然可以不一样（两个工具的语境不同），但**分到哪一类必须是同一个答案**。
+
+STOP_STATE_TRAILING = "trailing_touched"
+STOP_STATE_RECENT = "breached_recent"
+STOP_STATE_LONGSTANDING = "breached_longstanding"
+
+
+def consecutive_breach_days(avg_cost: float,
+                            daily_rows: list[dict]) -> tuple[int, object]:
+    """这只票连续多少个交易日「现价低于当天算出来的止损位」，以及上次
+    站上止损位是哪一天。
+
+    `daily_rows` 已经按日期倒序（最新的在前），每行要有 `date` / `close` /
+    `ma_20` / `atr_14`。**每一天都用那一天自己的 ma_20/ATR 重新算一遍止损
+    位**——不是拿今天的止损位去套过去的价格，过去每天的均线和 ATR 本来就
+    不一样。从最新一天开始往前数，遇到第一个「没破位」的日子就停。
+
+    数据不够（比如某天缺 ATR 又缺均线，`position_stop()` 算不出
+    `breached`）时也当成「停在这里」处理，不会把 None 当成「破位」继续
+    往前数——宁可低估连续天数，不猜。
+    """
+    count = 0
+    last_above = None
+    for row in daily_rows:
+        snap = {"close": row.get("close"), "atr_14": row.get("atr_14"),
+                "ma_20": row.get("ma_20")}
+        stop = position_stop(avg_cost, snap)
+        if stop.get("breached") is True:
+            count += 1
+        else:
+            last_above = row.get("date")
+            break
+    return count, last_above
+
+
+def classify_stop_breach(pnl_amount: float | None, consecutive_days: int,
+                         recent_days: int = STOP_BREACH_RECENT_DAYS) -> str:
+    """已经确定「跌破止损」之后，判断这是三种情况里的哪一种。
+
+    只在 `position_stop()["breached"]` 为真时调用。
+
+    pnl_amount:       这笔仓位现在的浮动盈亏金额（正数=浮盈）。None 当浮亏
+                      处理——不知道盈亏时按更该提醒的那一边走。
+    consecutive_days: `consecutive_breach_days()` 数出来的连续破位交易日数。
+    """
+    if pnl_amount is not None and pnl_amount >= 0:
+        return STOP_STATE_TRAILING
+    if consecutive_days is None or consecutive_days <= recent_days:
+        return STOP_STATE_RECENT
+    return STOP_STATE_LONGSTANDING

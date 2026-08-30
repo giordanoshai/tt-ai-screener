@@ -234,8 +234,13 @@ def build_screen_sql(
             order by ticker, updated_at desc
         ),
         sector_src as (
-            -- 临时兜底：stocks_meta.sector 现在 15661 行全是空的，
-            -- 唯一有行业分类的地方是 ticker_over20b 这张主选股池表
+            -- 临时兜底：stocks_meta.sector 几乎全是空的（2026-08-31 实测：
+            -- 34683 行里只有 2020 行有值，不到十七分之一，而且全在美股那
+            -- 29133 行里；5550 只 A股一行都没有）。
+            -- 注意：这段注释里不能出现百分号——psycopg2 会把它当成占位符，
+            -- 跟下面的 %(market)s 混在一起直接报「argument formats can't
+            -- be mixed」。
+            -- 主要有行业分类的地方是 ticker_over20b 这张主选股池表
             -- （约 2164 只，最低市值 20 亿美元 —— 表名里的 over20b 是骗人的，
             --   中位数 85.6 亿，一半以上在 10 亿~100 亿这一档；
             --   其中 2099 只带行业分类）。

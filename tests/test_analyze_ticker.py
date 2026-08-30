@@ -117,3 +117,187 @@ def test_get_hourly_setup_still_returns_json_string():
     """网页面板和现有测试还在用这个包装，不能删。"""
     from tools import hourly
     assert isinstance(hourly.get_hourly_setup("NVDA", bars=30), str)
+
+
+# ================ 评审 C2：任何一路数据源挂了，其余结论照常给 ================
+
+def _boom(*args, **kwargs):
+    raise RuntimeError("探针：这一路挂了")
+
+
+_US_SOURCES = [
+    ("fundamental", "get", "基本面"),
+    ("catalyst", "news_for", "新闻"),
+    ("catalyst", "earnings_for", "财报日"),
+    ("catalyst", "options_flow_live", "期权异动"),
+    ("catalyst", "gamma_walls", "gamma 墙"),
+    ("catalyst", "insider_for", "内部人交易"),
+    ("catalyst", "congress_for", "国会交易"),
+    ("regime", "freshness", "行情新鲜度"),
+    ("hourly_mod", "hourly_setup", "小时线"),
+]
+
+
+def test_every_data_source_can_fail_without_killing_the_checkup(monkeypatch):
+    """每一路取数各写一次「这一路挂了」：其余结论照常返回、`data_gaps` 里
+    写明挂的是哪一路。
+
+    评审 C2 实测：改之前，news 或 gamma 墙任意一路抛异常，返回体就只剩
+    `{"error": ...}`——而 gamma 墙只覆盖约 40 只大盘股、代码注释自己写着
+    「加分项，缺了不致命」，它却有本事干掉整只票的体检。
+    """
+    baseline = run("AAPL", horizon="both")
+    assert "error" not in baseline
+    assert baseline["score"] is not None
+
+    for module_name, func_name, label in _US_SOURCES:
+        module = getattr(at, module_name)
+        with monkeypatch.context() as mp:
+            mp.setattr(module, func_name, _boom)
+            out = run("AAPL", horizon="both")
+        assert "error" not in out, (
+            f"{module_name}.{func_name} 挂了就把整只票的体检打死了："
+            f"{out.get('error')}")
+        assert out["score"] is not None and out["trend"], (
+            f"{module_name}.{func_name} 挂了之后连趋势和评分都没有了")
+        assert any(label in g and "失败" in g for g in out["data_gaps"]), (
+            f"{module_name}.{func_name} 挂了，data_gaps 里没写明是"
+            f"「{label}」这一路：{out['data_gaps']}")
+
+
+def test_cn_data_sources_can_fail_without_killing_the_checkup(monkeypatch):
+    """A股那几路同理。"""
+    _CN = [("cn_signals", "fund_flow", "A股主力资金"),
+           ("cn_signals", "lhb", "龙虎榜"),
+           ("cn_signals", "board_of", "A股板块"),
+           ("cn_signals", "limit_sentiment", "A股涨停情绪"),
+           ("cn_signals", "signal_dates", "A股信号表日期")]
+    baseline = run("000001.SZ", horizon="both")
+    assert "error" not in baseline
+
+    for module_name, func_name, label in _CN:
+        module = getattr(at, module_name)
+        with monkeypatch.context() as mp:
+            mp.setattr(module, func_name, _boom)
+            out = run("000001.SZ", horizon="both")
+        assert "error" not in out, (
+            f"{module_name}.{func_name} 挂了就把整只票的体检打死了："
+            f"{out.get('error')}")
+        assert out["score"] is not None
+        assert any(label in g and "失败" in g for g in out["data_gaps"]), (
+            f"{module_name}.{func_name} 挂了，data_gaps 里没写明："
+            f"{out['data_gaps']}")
+
+
+# ================ 评审 C4：分数旁边要写清楚「依据有多少」 ================
+
+def test_evidence_pct_is_reported_and_matches_the_missing_blocks():
+    """A股走中线档时，基本面 35 分 + 相对强度 20 分整块缺——满分 100 里
+    只用上 45 分。返回体必须把这件事写出来，不能只给一个 82 分。"""
+    out = run("000001.SZ", horizon="mid")
+    assert "error" not in out
+    assert out["evidence_pct"] == 45, (
+        f"A股中线档应该只用上 45% 的评分表（趋势 25 + 消息面 20），"
+        f"实际报的是 {out['evidence_pct']}")
+    assert out["score"] > 0
+
+
+def test_full_evidence_scores_report_one_hundred_percent():
+    """反过来：依据齐全的美股中线档必须是 100%。缺了这一条，
+    上面那条可以被「evidence_pct 永远写死 45」蒙混过去。"""
+    out = run("ORCL", horizon="mid")
+    assert "error" not in out
+    assert out["evidence_pct"] == 100, (
+        f"ORCL 基本面齐全，evidence_pct 应该是 100，实际 {out['evidence_pct']}")
+
+
+def test_low_evidence_score_carries_an_explicit_warning():
+    """依据比例低于门槛时必须有一条明写的提醒，不能光靠用户自己看数字。"""
+    from core import scoring
+
+    out = run("000001.SZ", horizon="mid")
+    assert out["evidence_pct"] < scoring.LOW_EVIDENCE_PCT
+    assert any("评分表" in r for r in out["risks"]), (
+        f"依据只有 {out['evidence_pct']}%，risks 里却没有任何提醒："
+        f"{out['risks']}")
+
+
+def test_confidence_warning_fires_even_when_there_is_no_plan(monkeypatch):
+    """低置信度提示不能挂在 `plan` 的存在与否上。
+
+    原来写的是 `if plan and (...)`——没识别出形态时 `plan` 是 None，整条提示
+    被跳过，而「没形态 + 缺一堆依据 + 分还不低」恰恰是最该被警告的一类，
+    它成了唯一拿不到警告的一类（评审 C4）。
+    """
+    from core import scoring
+
+    # 造一个「认不出形态、依据缺一堆、分数不低」的场景
+    monkeypatch.setattr(at.scoring, "detect_short_setup", lambda snap: None)
+    monkeypatch.setattr(at.scoring, "detect_mid_setup",
+                        lambda snap, fund: None)
+    monkeypatch.setattr(
+        at.scoring, "score_mid",
+        lambda snap, fund=None, news=None: {
+            "score": 82, "evidence_pct": 45, "reasons": [], "risks": [],
+            "gaps": ["探针缺口 1", "探针缺口 2", "探针缺口 3"]})
+
+    out = run("000001.SZ", horizon="mid")
+    assert out["plan"] is None, "这条测试的前提就是没有 plan"
+    assert out["score"] == 82
+    assert any("依据" in r for r in out["risks"]), (
+        f"没有 plan 时低置信度提示被整条跳过了：{out['risks']}")
+    assert scoring is not None
+
+
+# ================ 评审 I4：这个工具原来是五个里唯一没有 warnings 的 ================
+
+def test_freshness_warnings_are_reported(monkeypatch):
+    """2026-08-30 `us_news` 采集失败、5 个任务只跑了一半，其余四个工具都报
+    了，个股体检一个字不提——用户会以为这份体检的消息面是完整的。"""
+    from core import regime as regime_mod
+
+    real = regime_mod.freshness
+
+    def fresh_but_broken(market):
+        out = dict(real(market))
+        out["stale"] = False
+        out["failed_jobs"] = ["us_news(failed)"]
+        out["partial_jobs"] = []
+        return out
+
+    monkeypatch.setattr(at.regime, "freshness", fresh_but_broken)
+    out = run("AAPL", horizon="short")
+    assert any("采集任务失败" in w and "us_news" in w
+               for w in out["warnings"]), (
+        f"采集失败必须无条件报进 warnings：{out['warnings']}")
+
+
+def test_no_fundamental_gap_is_not_listed_twice():
+    """「没有基本面数据」这句话在 core 和 tools 两处都会说。措辞差一个字的话
+    `sorted(set(...))` 去不掉重，同一件事在 data_gaps 里出现两遍。"""
+    out = run("000001.SZ", horizon="mid")
+    hits = [g for g in out["data_gaps"] if "没有基本面数据" in g]
+    assert len(hits) == 1, f"「没有基本面数据」出现了 {len(hits)} 次：{hits}"
+
+
+def test_trend_numbers_are_rounded():
+    """`"rsi": 55.8322681571604` 这种十几位小数别糊到用户脸上。"""
+    out = run("AAPL", horizon="short")
+    checked = 0
+    for key in ("close", "rsi_14", "vol_ratio", "atr_pct", "ma_20"):
+        value = out["trend"][key]
+        if value is None:
+            continue
+        assert round(value, 2) == value, f"{key} = {value} 没四舍五入"
+        checked += 1
+    assert checked >= 4
+
+
+def test_news_items_are_flagged_when_they_are_market_wide():
+    """挂了很多只票的新闻要标出来，别让人当成这只票的专属消息。"""
+    import pytest
+
+    out = run("AAPL", horizon="short")
+    if not out["news"]:
+        pytest.skip("AAPL 近 14 天没有新闻")
+    assert all("market_wide" in n for n in out["news"])

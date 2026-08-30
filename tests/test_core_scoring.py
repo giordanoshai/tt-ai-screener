@@ -309,3 +309,187 @@ def test_score_mid_fundamentals_scale_with_magnitude_holding_fields_equal():
               "profit_margin": 24.0, "roe": 22.0}
     assert (scoring.score_mid(snap(), fund=strong)["score"]
             > scoring.score_mid(snap(), fund=thin)["score"])
+
+
+# ================ 评审 C4：分数旁边要带上「用了多少比例的评分表」 ================
+
+def _bare_snap(**over):
+    snap = {"close": 100.0, "ma_20": 95.0, "ma_50": 90.0, "ma_200": 80.0,
+            "above_ma20": True, "above_ma50": True, "above_ma200": True,
+            "vol_ratio": 1.6, "rsi_14": 55.0, "atr_14": 2.0, "stale": False}
+    snap.update(over)
+    return snap
+
+
+def test_evidence_pct_is_one_hundred_when_nothing_is_missing():
+    """所有评分项都有数据时，evidence_pct 必须是 100。"""
+    fund = {"revenue_growth_yoy": 20.0, "earnings_growth_yoy": 20.0,
+            "profit_margin": 25.0, "roe": 30.0,
+            "analyst_target_price": 130.0, "week_52_high": 110.0}
+    out = scoring.score_mid(_bare_snap(), fund,
+                            {"sentiment_label": "Positive",
+                             "significant": "High"})
+    assert out["evidence_pct"] == 100
+
+
+def test_evidence_pct_drops_by_exactly_the_missing_weights():
+    """中线满分 100 = 趋势 25 + 基本面 35 + 相对强度 20 + 消息面 20。
+    没有基本面时，基本面 35 和相对强度 20（52 周高点来自基本面）整块被移出
+    分母，只剩 45——这正是评审 C4 里平安银行那个 82 分背后的真相。"""
+    out = scoring.score_mid(_bare_snap(), None, None)
+    assert out["evidence_pct"] == 45, (
+        f"缺基本面时应该只剩 45% 的评分表，实际 {out['evidence_pct']}")
+    # 分数本身不打折（理由见模块 docstring），但必须打得出来
+    assert out["score"] > 0
+
+
+def test_low_evidence_adds_an_explicit_risk_line():
+    """依据比例低于门槛时要往 risks 里塞一条明写的提醒——光有一个数字字段，
+    读的人不看就等于没有。"""
+    low = scoring.score_mid(_bare_snap(), None, None)
+    assert low["evidence_pct"] < scoring.LOW_EVIDENCE_PCT
+    assert any("评分表" in r for r in low["risks"]), low["risks"]
+
+
+def test_full_evidence_does_not_add_the_low_confidence_line():
+    """反过来：依据齐全时不该有这条提醒，否则它就成了永远都在的噪音。"""
+    fund = {"revenue_growth_yoy": 20.0, "earnings_growth_yoy": 20.0,
+            "profit_margin": 25.0, "roe": 30.0,
+            "analyst_target_price": 130.0, "week_52_high": 110.0}
+    full = scoring.score_mid(_bare_snap(), fund, None)
+    assert full["evidence_pct"] == 100
+    assert not any("评分表" in r for r in full["risks"]), full["risks"]
+
+
+def test_all_three_scorers_report_evidence_pct():
+    """三个评分函数都要带这个字段，不能只改一个。"""
+    short_us = scoring.score_short(_bare_snap(), None, None)
+    short_cn = scoring.score_short_cn(_bare_snap(), None, None, None, None)
+    mid = scoring.score_mid(_bare_snap(), None, None)
+    for name, out in (("score_short", short_us), ("score_short_cn", short_cn),
+                      ("score_mid", mid)):
+        assert "evidence_pct" in out, f"{name} 没带 evidence_pct"
+        assert 0 < out["evidence_pct"] <= 100
+
+
+def test_evidence_pct_equals_the_weights_that_entered_the_denominator():
+    """A股短线档：没有主力资金、没有板块、没有情绪和消息时，只剩趋势 25。"""
+    out = scoring.score_short_cn(_bare_snap(), None, None, None, None)
+    assert out["evidence_pct"] == 25, (
+        f"只剩趋势 25 分进分母，evidence_pct 应该是 25，实际 "
+        f"{out['evidence_pct']}")
+
+
+# ================ 顺手修：「底部反转」要真在底部 ================
+
+def _mid_snap(close, ma_200, **over):
+    snap = {"close": close, "ma_20": close * 0.99, "ma_50": close * 0.98,
+            "ma_200": ma_200, "ma_50_slope_pct": 0.5, "stale": False}
+    snap.update(over)
+    return snap
+
+
+def test_bottom_reversal_rejects_a_stock_sitting_near_its_52w_high():
+    """MSFT 离 52 周高点只有 6% 却被标成「底部反转」——一个交易者看到这四个
+    字会以为这是一只跌透了正在修复的票。贴着新高的票不是底部。"""
+    # 均线不是多头排列（50 在 200 下方），走不到 trend_continuation 那一支
+    snap = _mid_snap(100.0, 95.0)
+    snap["ma_50"] = 94.0          # close > ma_50，但 ma_50 < ma_200
+    fund = {"revenue_growth_yoy": -5.0, "profit_margin": -1.0,
+            "week_52_high": 106.0}     # 离高点只有 5.7%
+    assert scoring.detect_mid_setup(snap, fund) is None
+
+
+def test_bottom_reversal_accepts_a_stock_that_is_really_off_its_high():
+    """反过来：真的离 52 周高点很远、而且刚站上 200 日均线的票照常命中。
+    缺了这一条，上面那条可以被「干脆永远返回 None」蒙混过去。"""
+    snap = _mid_snap(100.0, 95.0)
+    snap["ma_50"] = 94.0
+    fund = {"revenue_growth_yoy": -5.0, "profit_margin": -1.0,
+            "week_52_high": 150.0}     # 离高点 33%
+    assert scoring.detect_mid_setup(snap, fund) == "bottom_reversal"
+
+
+def test_bottom_reversal_rejects_a_stock_far_above_its_200day_line():
+    """高出 200 日均线 70% 不叫「刚站上」，那一波早走完了；而且
+    `plan_trade()` 给这个形态的入场区间是围着 200 日均线画的，
+    价格离均线太远那个区间根本没法用。"""
+    snap = _mid_snap(100.0, 59.0)
+    snap["ma_50"] = 94.0
+    fund = {"revenue_growth_yoy": -5.0, "profit_margin": -1.0,
+            "week_52_high": 150.0}
+    assert scoring.detect_mid_setup(snap, fund) is None
+
+
+def test_bottom_reversal_needs_a_52w_high_to_judge_at_all():
+    """拿不到 52 周高点就判断不了在不在底部——不猜，不给这个形态。"""
+    snap = _mid_snap(100.0, 95.0)
+    snap["ma_50"] = 94.0
+    fund = {"revenue_growth_yoy": -5.0, "profit_margin": -1.0}
+    assert scoring.detect_mid_setup(snap, fund) is None
+
+
+def test_bottom_reversal_on_real_data_is_not_full_of_52w_high_names():
+    """拿真实数据核一遍：命中的票必须真的离 52 周高点有距离。
+    收紧之前 2026-08-30 实测命中 353 只，其中 APGE 离高点 0.0%、CRNX 0.1%。"""
+    from core import fundamental, snapshot
+
+    snaps = snapshot.scan("US")
+    if not snaps:
+        pytest.skip("拿不到美股全市场快照")
+    funds = fundamental.get([s["ticker"] for s in snaps], "US")
+    hits = [(s, funds.get(s["ticker"])) for s in snaps
+            if scoring.detect_mid_setup(s, funds.get(s["ticker"]))
+            == "bottom_reversal"]
+    assert hits, "一只都没命中，这个形态整个塌掉了"
+    for snap, fund in hits:
+        gap = ((fund["week_52_high"] - snap["close"])
+               / fund["week_52_high"] * 100)
+        assert gap >= scoring.MID_BOTTOM_MIN_GAP_FROM_52W_HIGH, (
+            f"{snap['ticker']} 离 52 周高点只有 {gap:.1f}%，"
+            "不该被叫成「底部反转」")
+
+
+# ================ 评审 C1：止损三分类是两个工具共用的唯一判定 ================
+
+def test_classify_stop_breach_profitable_position_is_a_trailing_touch():
+    assert (scoring.classify_stop_breach(204.0, 3)
+            == scoring.STOP_STATE_TRAILING)
+    # 破了很久也一样：浮盈优先——止损位是均线，均线每天重算，不会变成历史价位
+    assert (scoring.classify_stop_breach(204.0, 99)
+            == scoring.STOP_STATE_TRAILING)
+
+
+def test_classify_stop_breach_recent_loss_is_the_urgent_one():
+    assert (scoring.classify_stop_breach(-500.0, 1)
+            == scoring.STOP_STATE_RECENT)
+    assert (scoring.classify_stop_breach(
+        -500.0, scoring.STOP_BREACH_RECENT_DAYS)
+        == scoring.STOP_STATE_RECENT)
+
+
+def test_classify_stop_breach_longstanding_loss_is_a_position_state():
+    assert (scoring.classify_stop_breach(
+        -500.0, scoring.STOP_BREACH_RECENT_DAYS + 1)
+        == scoring.STOP_STATE_LONGSTANDING)
+
+
+def test_classify_stop_breach_unknown_pnl_leans_to_the_louder_side():
+    """不知道盈亏时按浮亏处理——宁可多提醒一次，不许把可能在亏钱的仓位
+    悄悄降档成「还在浮盈」。"""
+    assert scoring.classify_stop_breach(None, 1) == scoring.STOP_STATE_RECENT
+
+
+def test_consecutive_breach_days_is_the_shared_implementation():
+    """两个工具的同名薄封装必须都指向 core 这一份，不许各写一套。"""
+    from tools import review_positions as rp
+    from tools import watch_positions as wp
+
+    rows = [{"date": "2026-08-28", "close": 80.0, "ma_20": 90.0, "atr_14": 2.0},
+            {"date": "2026-08-27", "close": 99.0, "ma_20": 91.0, "atr_14": 2.0}]
+    expected = scoring.consecutive_breach_days(100.0, rows)
+    assert wp._consecutive_breach_days(100.0, rows) == expected
+    assert rp._consecutive_breach_days(100.0, rows) == expected
+    assert expected == (1, "2026-08-27")
+    assert (wp.STOP_BREACH_RECENT_DAYS
+            == scoring.STOP_BREACH_RECENT_DAYS)

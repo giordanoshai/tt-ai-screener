@@ -648,39 +648,112 @@ def test_real_neutral_market_wide_news_does_not_become_good_news():
         "不该被报成正面/负面消息")
 
 
-# ---------------- 修复轮1 / 四：「20 交易日新低」窗口要跟文字对得上 ----------------
+# --------- 修复轮1 / 四 + 评审 C3：「20 交易日新低」的窗口不能含当天 ---------
 
-def test_new_low_window_matches_a_real_20_trading_day_low():
-    """SQL 窗口现在是真正的最近 20 根日线，不是 40 个自然日的近似
-    ——独立按票查最近 20 行验证数值对得上。"""
+def _prior_low_key():
+    return f"prior_low_{wp.NEW_LOW_WINDOW}"
+
+
+def test_new_low_window_excludes_today_and_matches_a_manual_count():
+    """窗口必须是**今天之前**的 20 根日线，不含今天。
+
+    这条测试上一版跟实现犯了同一个错误：它自己也用 `rn <= 20`（含当天）
+    去挑候选票，所以实现把当天算进 min(low) 它照样绿（评审 C3）。现在
+    独立按「前 20 根日线」手工复算，并且**专门挑出「今天的最低价就是这
+    21 根里最低的那一根」的票**——只有这种票能区分两种窗口：含当天的话
+    返回值会等于今天的 low，不含当天才会等于前 20 根的最低。
+    """
     from db import pg
 
-    held = [r["ticker"] for r in
-           pg.query("select ticker from user_positions where market='US'")]
-    if not held:
-        pytest.skip("没有美股持仓")
-    rows = {r["ticker"]: r["low_20"]
-           for r in pg.query(wp._NEW_LOW_SQL, (held, "US"))}
-    checked = 0
-    for ticker in held:
+    tickers = [r["ticker"] for r in pg.query(
+        "select distinct ticker from stock_ohlcv_daily where market='US' "
+        "and date = (select max(date) from stock_ohlcv_daily "
+        "            where market='US' and date >= current_date - 30)")]
+    assert tickers, "拿不到美股票池，这条测试测不出东西"
+    rows = {r["ticker"]: r for r in pg.query(wp._NEW_LOW_SQL, (tickers, "US"))}
+
+    key = _prior_low_key()
+    checked = discriminating = 0
+    for ticker in tickers[:120]:
         manual = pg.query(
             "select low from stock_ohlcv_daily where ticker=%s "
-            "and market='US' order by date desc limit 20", (ticker,))
-        if not manual or ticker not in rows:
+            "and market='US' order by date desc limit 21", (ticker,))
+        if len(manual) < 21 or ticker not in rows:
             continue
-        expected = min(r["low"] for r in manual)
-        assert abs(rows[ticker] - expected) < 1e-6, (
-            f"{ticker} 的 20 交易日最低价算出来是 {rows[ticker]}，"
-            f"手工核对应该是 {expected}")
+        today_low = manual[0]["low"]
+        expected_prior = min(r["low"] for r in manual[1:])
+        got = rows[ticker]
+        assert abs(got["today_low"] - today_low) < 1e-6, (
+            f"{ticker} 的 today_low 应该是当天的最低价 {today_low}，"
+            f"实际是 {got['today_low']}")
+        assert abs(got[key] - expected_prior) < 1e-6, (
+            f"{ticker} 前 {wp.NEW_LOW_WINDOW} 个交易日的最低价应该是 "
+            f"{expected_prior}，实际是 {got[key]}——窗口算错了")
         checked += 1
-    assert checked > 0, "没有核对到任何一只票，这条测试测不出东西"
+        if today_low < expected_prior:
+            # 这种票才能区分「含当天」和「不含当天」两种窗口
+            discriminating += 1
+            assert got[key] > today_low, (
+                f"{ticker} 今天创了新低，前 20 日最低价不该等于今天的低点"
+                "——窗口把当天算进去了")
+    assert checked > 50, f"只核对到 {checked} 只票，样本太小"
+    assert discriminating > 0, (
+        "样本里没有一只票今天创了 20 日新低，这条测试区分不了两种窗口")
+
+
+def test_new_low_hit_count_is_in_the_right_order_of_magnitude():
+    """拿全市场真实数据跑一遍生产用的 SQL + 判定函数，命中数量必须落在
+    合理量级（几百只），不是个位数。
+
+    评审 C3 实测：窗口把当天算进去时命中 9 只，按真实语义应该命中 222 只
+    ——漏报 96%。数学上 `close ≥ 当日 low ≥ min(含当天的 low)`，所以那种
+    写法只有「收盘价正好等于当日最低价」时才成立，命中数必然掉到个位数。
+    这条断言就是盯着这个量级差：把窗口改回 `rn <= 21` 含当天，命中数会从
+    两百多掉到十位以下，这一行立刻变红。
+    """
+    from db import pg
+
+    tickers = [r["ticker"] for r in pg.query(
+        "select distinct ticker from stock_ohlcv_daily where market='US' "
+        "and date = (select max(date) from stock_ohlcv_daily "
+        "            where market='US' and date >= current_date - 30)")]
+    assert len(tickers) > 1500, f"美股票池只有 {len(tickers)} 只，样本不对"
+
+    key = _prior_low_key()
+    hits = [r for r in pg.query(wp._NEW_LOW_SQL, (tickers, "US"))
+            if wp.is_new_low(r["today_low"], r[key])]
+    # 2026-08-31 实测 218/2082（约 10%）。下限定在 50 只（约 2.4%）——
+    # 真实市场再怎么普涨也不至于全市场只有几十只票创 20 日新低，而含当天
+    # 那种写法给出的是个位数，中间隔着一个数量级
+    assert len(hits) >= 50, (
+        f"全市场 {len(tickers)} 只美股里只有 {len(hits)} 只创 20 交易日"
+        "新低——这是个位数量级，说明窗口又把当天算进 min(low) 了")
+
+    # 光看命中数还不够：窗口如果含当天，`prior_low` 里就包含了今天的低点，
+    # 每一条命中都只能是 `today_low == prior_low`（持平），永远不可能出现
+    # 「今天的低点比此前 20 日最低还低一截」。所以额外要求至少有一批票是
+    # **严格更低**的——这一条只有窗口真的排除了当天才可能成立
+    strictly_lower = [r for r in hits if r["today_low"] < r[key]]
+    assert len(strictly_lower) >= 10, (
+        f"{len(hits)} 只命中里只有 {len(strictly_lower)} 只是「今天的低点"
+        "严格低于此前 20 日最低」——说明 prior_low 里混进了今天自己")
+
+
+def test_is_new_low_compares_today_low_against_the_prior_window():
+    """纯函数：今天的最低价跌破（或持平）此前 20 日最低价才算创新低。
+    缺任何一边都不算——判断不了不等于创了新低。"""
+    assert wp.is_new_low(9.5, 10.0) is True
+    assert wp.is_new_low(10.0, 10.0) is True
+    assert wp.is_new_low(10.5, 10.0) is False
+    assert wp.is_new_low(None, 10.0) is False
+    assert wp.is_new_low(9.5, None) is False
 
 
 def test_new_low_alert_fires_with_correct_wording_on_a_real_qualifying_ticker(
         monkeypatch):
-    """找一只真实数据里今天确实创了 20 交易日新低的票，验证告警文字
-    跟真实窗口对得上（不再是「20 日新低」这种跟旧的 40 自然日窗口对不上
-    的文案）。"""
+    """找一只真实数据里今天确实创了 20 交易日新低的票（按**正确**语义挑：
+    当日最低价跌破此前 20 个交易日的最低价），验证告警文字把两个数都印
+    出来，读的人能自己核对。"""
     from db import pg as real_pg_mod
 
     candidates = real_pg_mod.query("""
@@ -691,9 +764,9 @@ def test_new_low_alert_fires_with_correct_wording_on_a_real_qualifying_ticker(
         )
         select r1.ticker
         from recent r1
-        join (select ticker, min(low) as low_20 from recent
-             where rn <= 20 group by ticker) m on m.ticker = r1.ticker
-        where r1.rn = 1 and r1.close <= m.low_20 and r1.close > 1
+        join (select ticker, min(low) as prior_low from recent
+             where rn between 2 and 21 group by ticker) m on m.ticker = r1.ticker
+        where r1.rn = 1 and r1.low <= m.prior_low and r1.close > 1
         limit 1
     """)
     if not candidates:
@@ -713,7 +786,10 @@ def test_new_low_alert_fires_with_correct_wording_on_a_real_qualifying_ticker(
     matched = [a for a in out["alerts"]
               if a["ticker"] == target and a["kind"] == "new_low"]
     assert len(matched) == 1, f"{target} 应该触发一条 new_low 告警"
-    assert "20 个交易日新低" in matched[0]["what_happened"]
+    text = matched[0]["what_happened"]
+    assert "20 个交易日新低" in text
+    assert "今日最低" in text and "此前" in text, (
+        f"文字要把两个数都说清楚，实际是：{text}")
 
 
 # ---------------- 期权异动：按票汇总，不按笔数扇出 ----------------
@@ -1313,7 +1389,12 @@ def test_small_options_flow_gets_downgraded_wording_and_severity(monkeypatch):
     异动，不该被叫成"大资金押注"，严重度也该明显更低——评审真实抓到的
     案例：RKLB 一笔 18.98 万美元的交易被叫成"大资金集中押注"，严重度 70，
     比跌破 20 日均线（60）还高。判据（is_big_flow 的门槛）没有改，改的是
-    汇总后的措辞和严重度。"""
+    汇总后的措辞和严重度。
+
+    这里用 30 万美元：落在"过了绝对下限 25 万、但没到 50 万硬门槛"这一段
+    ——正是"值得知道但不用动手"的量级（评审 I5 加了绝对下限之后，19 万
+    那种整条都不再发了，见 test_tiny_options_flow_is_not_reported_at_all）。
+    """
     from db import pg
 
     held = [r["ticker"] for r in
@@ -1328,7 +1409,7 @@ def test_small_options_flow_gets_downgraded_wording_and_severity(monkeypatch):
             return [{"ticker": target, "p90": 40.0}]
         if "from flow_alerts_archive" in sql:
             return [{"ticker": target, "opt_type": "put",
-                     "total_premium": 189_760, "score": 50,
+                     "total_premium": 300_000, "score": 50,
                      "sentiment": "bearish", "day": "2026-08-28",
                      "strike": 70, "expiry": "2026-09-25"}]
         return original_query(sql, params)
@@ -1349,7 +1430,7 @@ def test_small_options_flow_gets_downgraded_wording_and_severity(monkeypatch):
         "小额那档应该明说'谈不上大资金押注'，不能含糊带过")
     assert alert["severity"] == wp.OPTIONS_FLOW_SMALL_BEARISH_SEVERITY
     assert alert["severity"] < wp.SEVERITY["below_ma20"], (
-        "一笔 19 万美元的交易不该比'跌破 20 日均线'还严重")
+        "一笔 30 万美元的交易不该比'跌破 20 日均线'还严重")
 
 
 def test_large_options_flow_keeps_big_money_wording_and_severity(monkeypatch):
@@ -1569,3 +1650,115 @@ def test_option_flow_total_counts_rows_whose_direction_is_unknown(monkeypatch):
     assert "方向判不出来的 1 笔" in alert["what_happened"], (
         f"有方向未知的笔数就要说出来，否则「共 3 笔：看涨 1 笔、看跌 1 笔」"
         f"会让人找不到剩下那笔：{alert['what_happened']}")
+
+
+# ---------------- 评审 I5：期权异动汇总额有绝对下限，低于它整条不发 ----------------
+
+def _fake_flow_query(target, premium):
+    original_query = wp.pg.query
+
+    def fake_query(sql, params=None):
+        if "from flow_alerts_archive" in sql and "percentile_cont" in sql:
+            return [{"ticker": target, "p90": 40.0}]
+        if "from flow_alerts_archive" in sql:
+            return [{"ticker": target, "opt_type": "put",
+                     "total_premium": premium, "score": 50,
+                     "sentiment": "bearish", "day": "2026-08-28",
+                     "strike": 70, "expiry": "2026-09-25"}]
+        return original_query(sql, params)
+    return fake_query
+
+
+def _flow_alerts_for(out, target):
+    return [a for a in out["alerts"] if a["ticker"] == target
+            and a["source"] == "options_flow_archive"]
+
+
+def test_tiny_options_flow_is_not_reported_at_all(monkeypatch):
+    """上一轮只改了措辞和严重度，没改「发不发」。分位数门槛按定义每只票
+    每天都有约 10% 的行满足，等于保证天天有货，直接撞上这个工具「没事就
+    说没事」的第一条设计原则——2026-08-31 实测 17 条告警里 3 条是这么来
+    的：NVO 汇总 1.4 万美元、MP 2.7 万、RKLB 20.1 万（评审 I5）。
+
+    汇总总额低于 `OPTIONS_FLOW_MIN_TOTAL_PREMIUM` 时整条不发。"""
+    from db import pg
+
+    held = [r["ticker"] for r in
+           pg.query("select ticker from user_positions where market='US'")]
+    if not held:
+        pytest.skip("没有美股持仓")
+    target = held[0]
+    tiny = wp.OPTIONS_FLOW_MIN_TOTAL_PREMIUM - 1
+
+    monkeypatch.setattr(wp.pg, "query", _fake_flow_query(target, tiny))
+    out = run()
+    assert _flow_alerts_for(out, target) == [], (
+        f"{target} 汇总只有 {tiny:.0f} 美元，低于下限 "
+        f"{wp.OPTIONS_FLOW_MIN_TOTAL_PREMIUM:.0f}，这条告警根本不该发")
+
+
+def test_flow_just_over_the_floor_is_still_reported(monkeypatch):
+    """反过来：刚过下限的照常发——下限是为了砍噪音，不是把整路信号关掉。
+    这一条和上一条成对，缺了任何一条都可能被「干脆一条都不发」蒙混过去。"""
+    from db import pg
+
+    held = [r["ticker"] for r in
+           pg.query("select ticker from user_positions where market='US'")]
+    if not held:
+        pytest.skip("没有美股持仓")
+    target = held[0]
+
+    monkeypatch.setattr(
+        wp.pg, "query",
+        _fake_flow_query(target, wp.OPTIONS_FLOW_MIN_TOTAL_PREMIUM + 1))
+    out = run()
+    matched = _flow_alerts_for(out, target)
+    assert len(matched) == 1, (
+        f"刚过下限（{wp.OPTIONS_FLOW_MIN_TOTAL_PREMIUM:.0f}+1 美元）"
+        "的期权异动应该照常发一条")
+
+
+def test_options_flow_floor_sits_below_the_hard_big_premium_threshold():
+    """下限必须低于 `BIG_PREMIUM`。定成 50 万的话，「靠分位数过线」这条路
+    整个死掉，`is_big_flow()` 的第二条判据和「量级不算大」那套措辞会变成
+    永远走不到的死代码。"""
+    assert 0 < wp.OPTIONS_FLOW_MIN_TOTAL_PREMIUM < wp.BIG_PREMIUM
+
+
+# ---------------- 评审 I3：大盘综述的阈值只定义一次 ----------------
+
+def test_market_wide_threshold_is_the_one_in_core_not_a_local_copy():
+    """五个工具共用同一个数。各自抄一份字面量的话，改一处漏三处。"""
+    from core import catalyst as catalyst_mod
+    from tools import detect_catalysts as dc
+    from tools import review_positions as rp
+    assert wp.MARKET_WIDE_TICKER_COUNT is catalyst_mod.MARKET_WIDE_TICKER_COUNT
+    assert dc.MARKET_WIDE_TICKER_COUNT is catalyst_mod.MARKET_WIDE_TICKER_COUNT
+    # review_positions 直接调 catalyst.is_market_wide()，不再自己存一个数
+    assert rp.catalyst.MARKET_WIDE_TICKER_COUNT is (
+        catalyst_mod.MARKET_WIDE_TICKER_COUNT)
+
+
+def test_news_title_none_is_not_printed_as_the_word_none(monkeypatch):
+    """上游偶尔抓到链接但没抓到标题。不兜底的话会直接给用户印出
+    「重大消息（情绪中性）：None」。"""
+    from db import pg
+
+    held = [r["ticker"] for r in pg.query("select ticker from user_positions")]
+    if not held:
+        pytest.skip("没有持仓")
+    target = held[0]
+
+    def fake_news(tickers, days=7, min_significance="Medium", per_ticker=3):
+        return {t: ([{"title": None, "url": "http://x", "tickers": [t],
+                      "sentiment_label": "Neutral", "significant": "High",
+                      "published_at": None}] if t == target else [])
+                for t in tickers}
+
+    monkeypatch.setattr(wp.catalyst, "news_for", fake_news)
+    out = run()
+    matched = [a for a in out["alerts"] if a["ticker"] == target
+               and a["source"] == "news"]
+    assert len(matched) == 1, "标题缺失也该照常发这条告警，只是文案要兜底"
+    assert "None" not in matched[0]["what_happened"], (
+        f"标题为空时不能把 None 印给用户：{matched[0]['what_happened']}")

@@ -31,8 +31,38 @@ order by date desc
 limit 1
 """
 
-# A股当场算。一天 1500 行，走 (ticker, date) 索引，很便宜。
-_CN_BREADTH_SQL = """
+#: 「创 N 个交易日新高」的 N，以及为了算它要往回捞多少个自然日。
+#: 21 个交易日（当天 + 前 20 个）在 A股大约是 30 个自然日，遇上长假会更长，
+#: 所以窗口开到 60 个自然日，留一倍余量。
+NEW_HIGH_WINDOW = 20
+_NEW_HIGH_LOOKBACK_DAYS = 60
+
+# A股当场算。当天 1500 行；为了算「创 20 个交易日新高」要多捞几天的行，
+# 走 (market, date) 过滤 + (ticker, date) 索引，实测仍是百毫秒级。
+#
+# **`new_highs_20` 的窗口不能把当天算进去**（评审 C3，跟
+# `tools/watch_positions.py` 的「创 20 个交易日新低」是同一个 bug）：
+# 早期写法是 `close >= high_20`，而库里的 `high_20` 这一列**包含当天**
+# （`core/snapshot.py` 专门为此准备了 `prior_high_20`，注释写着「跟今天的
+# 比永远不成立，今天的高点包含今天」）。数学上 `close ≤ 当日 high ≤
+# high_20`，所以这个条件只在「收盘价正好等于当日最高价、而且这个最高价
+# 恰好是 20 日最高」时才成立。2026-08-28 实测（1500 只 A股）：
+# 这么写命中 155 只，按真实语义（当日最高价创出前 20 个交易日以来的新高）
+# 应该命中 316 只。
+#
+# 现在用 `rows between 20 preceding and 1 preceding` 取**当天之前**那 20
+# 根日线的最高价，跟当天的 high 比。
+_CN_BREADTH_SQL = f"""
+with recent as (
+    select ticker, date, close, high, pct_chg, ma_20, ma_50, ma_200,
+           max(high) over (partition by ticker order by date
+                           rows between {NEW_HIGH_WINDOW} preceding
+                                    and 1 preceding) as prior_high
+    from stock_ohlcv_daily
+    where market = 'CN'
+      and date > %s::date - {_NEW_HIGH_LOOKBACK_DAYS}
+      and date <= %s
+)
 select count(*) as total,
        count(*) filter (where pct_chg > 0) as advances,
        count(*) filter (where pct_chg < 0) as declines,
@@ -45,11 +75,10 @@ select count(*) as total,
        round(100.0 * count(*) filter (where close > ma_200)
              / nullif(count(*) filter (where ma_200 is not null), 0), 2)
            as pct_above_ma200,
-       count(*) filter (where high_20 is not null
-                          and close >= high_20) as new_highs_20
-from stock_ohlcv_daily
-where market = 'CN'
-  and date = %s
+       count(*) filter (where prior_high is not null
+                          and high >= prior_high) as new_highs_20
+from recent
+where date = %s
 """
 
 _CN_LIMIT_SQL = """
@@ -139,7 +168,7 @@ def get(market: str) -> dict:
     if day is None:
         return _empty("CN", "没有 A股行情", "stock_ohlcv_daily")
 
-    row = pg.query_one(_CN_BREADTH_SQL, (day,)) or {}
+    row = pg.query_one(_CN_BREADTH_SQL, (day, day, day)) or {}
     advances = row.get("advances") or 0
     declines = row.get("declines") or 0
     ad_ratio = round(advances / declines, 2) if declines else None
