@@ -25,7 +25,42 @@ tt-data-hub 预先算好的。自己再算一遍只会算出跟别处不一致�
 - `scan()`：全市场。先单独查出该市场的最新交易日，再等值比较。
   **绝不能**写成 `date = (select max(date) ... where ticker = o.ticker)`
   这种相关子查询，那是并行全表扫 380 万行（实测代价 17.6 万）。
+
+两条路径都经过 `_enrich()` 拼快照，所以单位换算只需要在那一个地方做。
+`scan()` 事后覆盖的三个字段（`prior_high_20`、`had_vol_up_3d`、
+`ma_50_slope_pct`）都不在换算名单里，不会绕过换算。
+
+## 单位约定：交出去的 `_pct` 一律是百分点
+
+**上游 `stock_ohlcv_daily` 同一张表里混了两套单位**（2026-08-28 实测）：
+
+- `dist_ma20_pct`、`dist_ma50_pct`、`atr_pct` 存的是**小数**。
+  AAPL 那天存 0.0317529865，手算 `(close-ma_20)/ma_20` 也是 0.031753，
+  意思是「高于 20 日均线 3.18%」。
+- `pct_chg` 存的却是**百分点**。同一天 NVDA 存 -4.575，意思是「当日跌 4.57%」。
+
+这个不一致坑过一次：`core/scoring.py` 的 `PULLBACK_BAND = (-3.0, 2.0)` 是按
+百分点写的，直接拿小数去比，最新交易日 2052 只美股**全部**落在区间内，
+「回踩到位」这个条件等于没写；`OVERSOLD_DIST_MA50 = -8.0` 则永远不可能被触发，
+因为 `dist_ma50_pct` 最负也只到 -0.52。
+
+所以本模块定下这条约定：
+
+> **凡是 `core/snapshot.py` 交出去的、名字带 `_pct` 的值，一律是百分点。**
+
+`_enrich()` 用 `_pct_points()` 把上面那三个小数字段乘 100。**其余三个 `_pct`
+字段保持原样**：`pct_chg` 库里已经是百分点，另外两个（50 日均线斜率、离 20 日
+高点多远）是本模块自己算的，公式里已经带了 `* 100`。代码里那三处都有行内注释。
+
+注意这条约定**只管 core/ 的输出**。`skills/__init__.py`、`web/`、
+`tools/screening.py` 直接查库、按小数在用，那是对的，不要跟着改。
 """
+# 上面那段刻意没写出「离 20 日高点多远」那个字段的英文标识符，这条说明也刻意
+# 写在 docstring 外面。原因：tests/test_sql_rules.py 的扫描器把「同时含 select
+# 和 from 两个词的字符串」当成 SQL 语句来查规矩，而本模块 docstring 里本来就有
+# 一句 `select max(date)` 的反面教材——再混进一个名字里带 from 的标识符，整段
+# 中文说明就会被当成一条违规查询。docstring 是 AST 里的字符串常量，会被扫到；
+# `#` 注释不进 AST，不会。详见任务 11B 报告的 concerns。
 import datetime
 
 from db import pg
@@ -142,6 +177,13 @@ def _f(value):
     return None if value is None else float(value)
 
 
+def _pct_points(value):
+    """库里这三个字段存的是小数（0.0318 = 3.18%），本模块一律按百分点交出去。
+    同一张表的 pct_chg 存的已经是百分点，不要再乘。"""
+    v = _f(value)
+    return None if v is None else round(v * 100, 2)
+
+
 def latest_trading_day(market: str) -> datetime.date | None:
     """该市场最新有日线的那一天。全池扫描前先拿它，别写相关子查询。"""
     row = pg.query_one(_LATEST_DAY_SQL, (_check_market(market),))
@@ -163,7 +205,8 @@ def _enrich(bars: list[dict], ticker: str, market: str,
     # 前一日的 20 日高点：判「突破」要跟昨天的高点比，跟今天比永远不成立
     prior_high_20 = _f(bars[1]["high_20"]) if len(bars) > 1 else None
 
-    # 50 日均线在不在往上走：跟 5 根之前比
+    # 50 日均线在不在往上走：跟 5 根之前比。
+    # 这里自己乘了 100，交出去已经是百分点，不用再过 _pct_points
     ma_50_slope_pct = None
     if len(bars) > 5 and ma_50:
         past = _f(bars[5]["ma_50"])
@@ -191,6 +234,7 @@ def _enrich(bars: list[dict], ticker: str, market: str,
         "date": last["date"],
         "close": close,
         "open": _f(last["open"]),
+        # pct_chg 库里存的就已经是百分点（-4.575 = 当日跌 4.57%），不能再乘 100
         "pct_chg": _f(last["pct_chg"]),
         "volume": _f(last["volume"]),
         "dollar_volume": round(close * vol_ma_20, 2)
@@ -204,11 +248,13 @@ def _enrich(bars: list[dict], ticker: str, market: str,
         "rsi_14": _f(last["rsi_14"]),
         "vol_ratio": _f(last["vol_ratio"]),
         "atr_14": _f(last["atr_14"]),
-        "atr_pct": _f(last["atr_pct"]),
+        # 下面三个库里存的是小数，统一换成百分点交出去（见模块 docstring）
+        "atr_pct": _pct_points(last["atr_pct"]),
         "high_20": high_20,
         "high_55": high_55,
-        "dist_ma20_pct": _f(last["dist_ma20_pct"]),
-        "dist_ma50_pct": _f(last["dist_ma50_pct"]),
+        "dist_ma20_pct": _pct_points(last["dist_ma20_pct"]),
+        "dist_ma50_pct": _pct_points(last["dist_ma50_pct"]),
+        # 本模块自己算的，公式里已经带了 * 100，别再过 _pct_points
         "dist_from_20d_high_pct": round((close - high_20) / high_20 * 100, 2)
                                   if close and high_20 else None,
         "prior_high_20": prior_high_20,
