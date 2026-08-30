@@ -157,3 +157,27 @@ def test_cn_out_of_sync_signal_dates_reported_as_a_gap():
     finally:
         mod.cn_signals.signal_dates = real
     assert any("不在同一天" in g for g in out["data_gaps"])
+
+
+# ---------------- 修复轮 2：资金流连续化后的并列排序、修 1 的自动化测试 ----------------
+
+
+def test_ties_are_broken_by_volume_not_ticker_code():
+    """同分时要按量能排。按股票代码排的话，先后不带任何交易信息。"""
+    out = run(market="CN", horizon="short", scope="full")
+    cands = out["candidates"]
+    for a, b in zip(cands, cands[1:]):
+        if a["score"] == b["score"]:
+            assert (a["vol_ratio"] or 0) >= (b["vol_ratio"] or 0), (
+                f"{a['ticker']} 和 {b['ticker']} 同分 {a['score']}，"
+                f"但量能 {a['vol_ratio']} < {b['vol_ratio']}，排序没按量能")
+
+
+def test_mid_horizon_does_not_report_the_board_gap():
+    """中线档走 score_mid，那个函数连 board 参数都没有——
+    板块从不参与中线打分，报这个缺口是把缺口说得比实际严重。"""
+    mid = run(market="CN", horizon="mid", scope="full")
+    short = run(market="CN", horizon="short", scope="full")
+    assert not any("板块" in g for g in mid["data_gaps"])
+    assert any("板块" in g for g in short["data_gaps"]), (
+        "短线档应该报板块缺口，不报的话这条测试证明不了两者的区别")

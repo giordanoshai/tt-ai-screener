@@ -94,6 +94,7 @@ def _shape(snap: dict, setup: str, tier: str, scored: dict,
         "setup": setup,
         "setup_label": scoring.SETUP_LABELS.get(setup, setup),
         "price": snap["close"],
+        "vol_ratio": snap.get("vol_ratio"),
         "entry_zone": plan["entry_zone"],
         "stop": plan["stop"],
         "stop_pct": plan["stop_pct"],
@@ -204,7 +205,9 @@ def scan_swing(market: str = "US", horizon: str = "short",
                                scoring.plan_trade(snap, setup),
                                earnings.get(code), []))
 
-        rows.sort(key=lambda r: (-r["score"], r["ticker"]))
+        # 同分时按量能排：放量更大的说明后面跟的钱更多，比按股票代码排有意义
+        rows.sort(key=lambda r: (-r["score"], -(r.get("vol_ratio") or 0),
+                                 r["ticker"]))
         rows = rows[:limit]
 
         # ---- 6. pool 范围给最终入选的补一次实时期权流 ----

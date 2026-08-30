@@ -38,6 +38,11 @@ POSITION_STOP_ATR_MULT = 2.0
 #: 目标价按几倍风险距离给
 TARGET_R_MULTIPLES = (2.0, 3.0)
 
+#: 主力净流入占成交额多少算「满分」。取实测的 90 分位——2026-08-28 当日
+#: 净流入为正的 2379 只 A股里，中位数是 9.1%、90 分位是 22.7%。
+#: 拍一个 5% 的话第 30 分位就顶格了，等于没分档。
+CN_FLOW_FULL_MARK_RATIO = 0.22
+
 SHORT_SETUPS = ("breakout", "pullback", "oversold_bounce")
 MID_SETUPS = ("trend_continuation", "bottom_reversal")
 
@@ -300,9 +305,6 @@ def score_short_cn(snap: dict, fund_flow: dict | None = None,
     led = _Ledger()
     _score_trend(led, snap, 25)
 
-    # 主力资金：不能只看正负。0.06 亿和 2.25 亿都算"流入"，但对一只成交 4 亿
-    # 和一只成交 24 亿的票，意义完全不同。占比才是 A股这边真正有区分度的量，
-    # 相当于美股那边看期权净额的偏向度而不是只看正负。
     if fund_flow is None:
         led.skip("没有主力资金数据")
     else:
@@ -318,20 +320,17 @@ def score_short_cn(snap: dict, fund_flow: dict | None = None,
             led.add(15, 30,
                     f"主力当日净流入 {net / 1e8:.2f} 亿（缺成交额，算不出占比）")
         else:
-            if ratio >= 0.05:
-                base, word = 30, "很强"
-            elif ratio >= 0.02:
-                base, word = 24, "较强"
-            elif ratio >= 0.005:
-                base, word = 16, "一般"
-            else:
-                base, word = 8, "偏弱"
+            # 连续给分，不分档。分档在顶部必然并列，而 A股这边资金流几乎是
+            # 唯一有区分度的项——趋势因为突破条件本身就接近满分，情绪对全市场
+            # 是同一个数，板块大多数票拿不到
+            earned = 30 * min(ratio / CN_FLOW_FULL_MARK_RATIO, 1.0)
             if net_5d <= 0:
-                # 今天流入但 5 日累计还是流出，说明只是反弹不是持续买入
-                base = round(base * 0.6)
+                # 今天流入但 5 日累计还是流出，只是反弹不是持续买入
+                earned *= 0.6
                 led.risk("当日净流入但 5 日累计仍是净流出，持续性存疑")
-            led.add(base, 30,
-                    f"主力净流入 {net / 1e8:.2f} 亿，占成交额 {ratio:.1%}（{word}），"
+            led.add(round(earned, 1), 30,
+                    f"主力净流入 {net / 1e8:.2f} 亿，占成交额 {ratio:.1%}"
+                    f"（满分线 {CN_FLOW_FULL_MARK_RATIO:.0%}），"
                     f"5 日累计 {net_5d / 1e8:.2f} 亿")
 
     # 板块强度。**A股缺个股→行业映射**（cn_universe.industry 和

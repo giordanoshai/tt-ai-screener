@@ -268,15 +268,17 @@ def test_plan_trade_with_zero_price_does_not_raise():
 # ---------------- 复审修 2、修 3：A股主力资金按占比分档、中线基本面按幅度分档 ----------------
 
 def test_score_short_cn_fund_flow_scales_with_share_of_turnover():
-    """主力资金不能只看正负。0.06 亿和 2.25 亿都是「流入」，
-    但对成交 4 亿和成交 24 亿的票意义完全不同。"""
+    """主力资金不能只看正负，也不能粗分几档就顶格。
+    实测：净流入为正的 A股中位数占成交额 9.1%、90 分位 22.7%。"""
     strong = scoring.score_short_cn(
         snap(market="CN"),
         fund_flow={"net_amount": 2.25e8, "net_5d": 7.96e8, "amount": 23.67e8})
     weak = scoring.score_short_cn(
         snap(market="CN"),
         fund_flow={"net_amount": 0.06e8, "net_5d": 0.89e8, "amount": 4.27e8})
-    assert strong["score"] > weak["score"]
+    assert strong["score"] - weak["score"] >= 8, (
+        f"两者占成交额 9.5% vs 1.4%，分差只有 "
+        f"{strong['score'] - weak['score']}，区分度不够")
 
 
 def test_score_short_cn_flags_inflow_without_five_day_follow_through():
@@ -287,13 +289,14 @@ def test_score_short_cn_flags_inflow_without_five_day_follow_through():
 
 
 def test_score_mid_fundamentals_scale_with_magnitude():
-    """净利率 0.1% 的公司不该跟净利率 25% 的拿一样的分。"""
+    """净利率 0.1% 的公司不该跟净利率 24% 的拿一样的分。
+    两组字段种类完全相同，只有数值大小不同——这样才测的是幅度敏感性。"""
     thin = {"revenue_growth_yoy": 0.4, "earnings_growth_yoy": 1.1,
-            "profit_margin": 0.1, "week_52_high": 103.0}
+            "profit_margin": 0.1, "roe": 0.5, "week_52_high": 103.0}
     strong = {"revenue_growth_yoy": 28.0, "earnings_growth_yoy": 35.0,
               "profit_margin": 24.0, "roe": 22.0, "week_52_high": 103.0}
     assert (scoring.score_mid(snap(), fund=strong)["score"]
-            > scoring.score_mid(snap(), fund=thin)["score"])
+            - scoring.score_mid(snap(), fund=thin)["score"]) >= 15
 
 
 def test_score_mid_fundamentals_scale_with_magnitude_holding_fields_equal():
