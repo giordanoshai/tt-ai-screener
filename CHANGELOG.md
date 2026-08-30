@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+### [2026-08-31] 五个交易场景工具上线，MCP 工具从 10 个变 12 个
+
+* **新增 (Added)**: `core/` 取数层——`uw.py`（UW 实时客户端）、
+  `snapshot.py`（日线技术面）、`scoring.py`（形态与评分）、
+  `catalyst.py`（消息面）、`fundamental.py`（基本面）、
+  `regime.py`（市场环境）、`cn_signals.py`（A股信号）。
+* **新增 (Added)**: 五个场景工具——`review_positions` 持仓分析、
+  `scan_swing` 波段扫描、`analyze_ticker` 个股分析、
+  `detect_catalysts` 突发消息侦测、`watch_positions` 持仓盯盘。
+  工具内部算完直接返回结论，不调用大模型。
+* **新增 (Added)**: `tests/test_sql_rules.py`——五条查询规矩和
+  「短线不许碰基本面」的回归测试，扫源码，不连库。
+* **修复 (Fixed)**: `config.py` 读不到 UW 密钥。`.env` 里的键名是
+  `UW_T_KEY` / `UW_T_ENDPOINT`，代码里读的是 `UW_API_TOKEN`，
+  一直拿到空字符串。现在两套名字都认。
+* **修复 (Fixed)**: `core/snapshot.py`、`core/fundamental.py` 交出来的比率
+  字段单位是百分点（`3.18` 代表 3.18%），跟数据库原始存的小数（`0.0318`）
+  差 100 倍。这个量级错位此前真实导致过三处结论算错：短线三种形态判断里
+  有一种因为门槛按错的量级写，永远不会触发；中线基本面评分（满分 35 分）
+  有 12 分因为同样原因全场归零；给用户看的营收增速把 `+106%` 显示成了
+  `+1.1%`。现在两个模块统一对外交百分点，并在 `CLAUDE.md` 里补了一节说明
+  这个单位约定，防止下一个人在这里再摔一次。
+* **修改 (Changed)**: 下线 `analyze_watchlist`（被 `scan_swing(scope="pool")`
+  取代）和 `analyze_positions`（被 `review_positions` 取代），函数一并删除。
+* **修改 (Changed)**: `get_hourly_setup` 不再单独暴露为 MCP 工具，
+  逻辑并进 `analyze_ticker`。函数保留在 `tools/hourly.py`，网页面板还在用。
+* **修改 (Changed)**: `CLAUDE.md` 的查询规矩从四条变五条，
+  补上 `stock_ohlcv_min` 的三种周期（`1h`/`1m`/`5m`）必须带 `timeframe` 条件。
+
 ### [2026-08-30] A 股四张信号表已建好，设计文档第五、六节改写
 
 * **修改 (Changed)**: A 股信号表已在 `tt-data-hub` 建好并挂上定时（那边提交

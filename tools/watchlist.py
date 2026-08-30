@@ -115,22 +115,3 @@ def remove_from_watchlist(ticker: str) -> str:
         return json.dumps({"ok": True, "removed": ticker})
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
-
-
-def analyze_watchlist(analysis_type: str = "longterm") -> str:
-    """对自选池里全部股票跑长线或波段分析。
-
-    analysis_type: 'longterm' | 'swing'
-    """
-    try:
-        rows = pg.query("select ticker from user_watchlist order by created_at")
-        tickers = [r["ticker"] for r in rows]
-        if not tickers:
-            return json.dumps({"error": "自选池是空的，先加几只票。"},
-                              ensure_ascii=False)
-
-        from skills import gather_context
-        skill = "swing_screen" if analysis_type == "swing" else "longterm_screen"
-        return gather_context(skill, {"tickers": tickers})
-    except Exception as exc:
-        return json.dumps({"error": str(exc)}, ensure_ascii=False)

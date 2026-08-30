@@ -190,28 +190,3 @@ def remove_position(ticker: str) -> str:
         return json.dumps({"ok": True, "removed": ticker}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
-
-
-def analyze_positions() -> str:
-    """对全部持仓做综合分析：技术面、基本面、新闻、盈亏。至少要有一笔持仓。
-
-    market 会一起传给分析层——A股和美股的估值口径、交易时段都不一样，
-    分析的时候不能当成一回事。
-    """
-    try:
-        rows = pg.query(
-            "select ticker, market, avg_cost, shares from user_positions "
-            "order by updated_at")
-        if not rows:
-            return json.dumps({"error": "还没有持仓，先添加几笔。"},
-                              ensure_ascii=False)
-
-        from skills import gather_context
-
-        payload = [{"ticker": r["ticker"],
-                    "market": r["market"],
-                    "cost_basis": float(r["avg_cost"]),
-                    "shares": float(r["shares"])} for r in rows]
-        return gather_context("position_review", {"positions": payload})
-    except Exception as exc:
-        return json.dumps({"error": str(exc)}, ensure_ascii=False)

@@ -83,12 +83,14 @@ class TestServerTools:
     """server.py 注册的工具列表就是这个 MCP 服务对外的全部能力。"""
 
     EXPECTED = {
+        "review_positions",
+        "scan_swing",
+        "analyze_ticker",
+        "detect_catalysts",
+        "watch_positions",
         "screen_stocks",
         "list_watchlist", "add_to_watchlist", "remove_from_watchlist",
-        "analyze_watchlist",
         "list_positions", "add_position", "remove_position",
-        "analyze_positions",
-        "get_hourly_setup",
     }
 
     def test_registered_tools(self):

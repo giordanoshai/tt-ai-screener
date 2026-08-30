@@ -75,7 +75,7 @@
 线上 Postgres **没有**这三张表，也不要再建 —— 配置迁到文件之后能进 git、能 review，
 改完文件立刻生效（每次调用都重新读），不用重启。
 
-### 写查询必须守的四条规矩
+### 写查询必须守的五条规矩
 
 每一条都真的把这个项目搞崩过一次：
 
@@ -88,6 +88,8 @@
    （顺带能保住停牌、退市的票）；全池扫描就先单独查一次这个市场的最新交易日，
    再拿去做等值比较（约 109 毫秒）。
 4. **`stock_fundamentals` 一只票有很多行**，必须 `distinct on (ticker)` 去重。
+5. **`stock_ohlcv_min` 一张表混了三种周期**（`1h`/`1m`/`5m`，靠 `timeframe`
+   列区分）。分钟级数据约 2000 万行、9.3GB，漏了 `timeframe` 条件是灾难。
 
 ---
 
@@ -179,7 +181,19 @@ python main.py --port 9000  # 换端口
 
 ---
 
-## 五、MCP 工具（10 个）
+## 五、MCP 工具（12 个）
+
+五个场景工具（针对具体交易场景，工具内部算完直接返回结论，不调用大模型）：
+
+| 工具 | 干什么 |
+|---|---|
+| `review_positions` | 我手上这几只票该不该动：盈亏、止损位、有没有跌破、财报临不临近、消息面、期权/资金流向，**按需要动手的紧急程度排序** |
+| `scan_swing` | 盘后找值得做的波段机会：形态和理由、买入区间、按 ATR 算的止损、目标价。`scope=pool` 只看持仓和自选，`scope=full` 扫全市场 |
+| `analyze_ticker` | 单独一只票的完整体检：日线趋势 + 小时线买卖点位（原 `get_hourly_setup` 并入这里）、基本面、消息面、期权资金流向 |
+| `detect_catalysts` | 最近出了什么事，跟我的票有没有关系，股价反应过了没有 |
+| `watch_positions` | 持仓上有没有需要立刻处理的信号，**没事就说没事**，不制造噪音 |
+
+选股 + 自选 + 持仓的增删查（本轮没动）：
 
 | 工具 | 干什么 |
 |---|---|
@@ -187,12 +201,13 @@ python main.py --port 9000  # 换端口
 | `list_watchlist` | 列出自选池，带最新价、当日涨跌、技术指标 |
 | `add_to_watchlist` | 加自选（这只票必须已经在 `stocks_meta` 里，否则拒绝） |
 | `remove_from_watchlist` | 删自选 |
-| `analyze_watchlist` | 对整个自选池跑长线或波段分析 |
 | `list_positions` | 列出持仓和盈亏。汇总是**按币种分开的**（`{"USD": {...}, "CNY": {...}}`），没有跨币种总计 |
 | `add_position` | 加 / 改持仓，`market` 决定币种 |
 | `remove_position` | 删持仓 |
-| `analyze_positions` | 持仓综合分析：技术面 + 基本面 + 新闻 + 盈亏 |
-| `get_hourly_setup` | 单只票的小时线买卖点：区间位置、20/50 小时均线及斜率、RSI、量比、ATR（用来放止损）、最近的摆动支撑压力，外加一段白话总结。**日线定方向，小时线定价位** |
+
+下线了三个工具：`analyze_watchlist`（被 `scan_swing(scope="pool")` 取代）、
+`analyze_positions`（被 `review_positions` 取代）、`get_hourly_setup`（并进
+`analyze_ticker`，计算逻辑还在，只是不再单独注册成 MCP 工具）。
 
 工具的设计原则：**所有筛选和汇总都在函数里做完**（能交给数据库就交给数据库），
 只把结论丢给 Claude，绝不返回原始整表 —— 这是省 token 的关键。
@@ -219,7 +234,7 @@ python main.py --port 9000  # 换端口
 ```
 tt-ai-screener/
   main.py                # 统一入口（网页 + MCP，或者纯 MCP stdio）
-  server.py              # MCP 服务器，注册 10 个工具 + token 鉴权
+  server.py              # MCP 服务器，注册 12 个工具 + token 鉴权
   config.py              # Postgres 地址、AI 兜底配置、MCP 端口和 token
   ai_client.py           # OpenAI / Anthropic 两种格式的 AI 客户端，读 config/models.json
   config/
@@ -229,13 +244,18 @@ tt-ai-screener/
     001_analysis_history.sql   # 这个仓库唯一拥有的一张表
   db/
     pg.py                # 唯一的数据库出入口（读写分账号）
+  core/
+    snapshot.py / scoring.py / catalyst.py / fundamental.py / regime.py /
+    cn_signals.py / uw.py   # 五个场景工具共用的取数层，纯 Python + SQL
   tools/
     screening.py         # screen_stocks
-    watchlist.py         # 自选的增删查 + 批量分析
-    positions.py         # 持仓的增删查 + 综合分析
-    hourly.py            # get_hourly_setup
+    watchlist.py         # 自选的增删查
+    positions.py         # 持仓的增删查
+    hourly.py            # 小时线计算逻辑，被 analyze_ticker 调用，不再单独暴露为 MCP 工具
+    review_positions.py / scan_swing.py / analyze_ticker.py /
+    detect_catalysts.py / watch_positions.py   # 五个场景工具
   skills/
-    __init__.py          # 分析数据层：给大模型攒上下文
+    __init__.py          # 网页面板分析页的取数层（MCP 工具已经不用它了）
     en/, cn/             # 两种语言的提示词：
                          #   longterm_screen.md / swing_screen.md / position_review.md
   web/

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """skills/__init__.py 的测试。
 
-这个模块是 `analyze_watchlist` 和 `analyze_positions` 两个 MCP 工具的取数层。
-它们是**在函数体里** `from skills import gather_context` 的，所以模块坏掉的时候
+这个模块是网页面板分析页的取数层（MCP 工具已经不用它了）。
+它是**在函数体里** `from skills import gather_context` 被调的，所以模块坏掉的时候
 import 阶段不报错，要等真调用才炸，然后被外面的 except 吞成
 `{"error": ...}`——从工具返回值上根本看不出是这儿坏了。所以这里的测试全部
 直接打在 skills 自己身上。

@@ -9,29 +9,41 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from config import MCP_PORT, MCP_TOKEN, BASE_DIR
 from tools.screening import screen_stocks
-from tools.watchlist import list_watchlist, add_to_watchlist, remove_from_watchlist, analyze_watchlist
-from tools.positions import list_positions, add_position, remove_position, analyze_positions
-from tools.hourly import get_hourly_setup
+from tools.watchlist import list_watchlist, add_to_watchlist, remove_from_watchlist
+from tools.positions import list_positions, add_position, remove_position
+from tools.review_positions import review_positions
+from tools.scan_swing import scan_swing
+from tools.analyze_ticker import analyze_ticker
+from tools.detect_catalysts import detect_catalysts
+from tools.watch_positions import watch_positions
 
 mcp = FastMCP("tt-ai-screener")
 
-# Screening
+# 五个场景工具：围绕实际交易场景，直接返回算好的结论
+mcp.tool()(review_positions)     # 我手上这几只票该不该动
+mcp.tool()(scan_swing)           # 盘后找值得做的波段机会
+mcp.tool()(analyze_ticker)       # 单独一只票的完整体检
+mcp.tool()(detect_catalysts)     # 出了什么事，跟我有没有关系
+mcp.tool()(watch_positions)      # 持仓上有没有要立刻处理的信号
+
+# 选股（长线，本轮没动）
 mcp.tool()(screen_stocks)
 
-# Watchlist
+# 自选池的增删查
 mcp.tool()(list_watchlist)
 mcp.tool()(add_to_watchlist)
 mcp.tool()(remove_from_watchlist)
-mcp.tool()(analyze_watchlist)
 
-# Positions
+# 持仓的增删查
 mcp.tool()(list_positions)
 mcp.tool()(add_position)
 mcp.tool()(remove_position)
-mcp.tool()(analyze_positions)
 
-# 小时线：日线定方向，小时线定进出场点位
-mcp.tool()(get_hourly_setup)
+# 下线的三个：
+#   analyze_watchlist -> scan_swing(scope="pool")
+#   analyze_positions -> review_positions
+#   get_hourly_setup  -> 并进 analyze_ticker（函数还在 tools/hourly.py，
+#                        网页面板还在用，只是不再单独暴露给 MCP）
 
 
 def _ensure_token() -> str:

@@ -16,7 +16,16 @@ Two markets are in the same tables: **`US`** (US stocks, USD) and **`CN`** (A-sh
 
 ## MCP Tools Reference
 
-This is the canonical list of tools this server exposes (10 tools). Each tool maps to a function in `tools/`.
+This is the canonical list of tools this server exposes (12 tools). Each tool maps to a function in `tools/`.
+
+### 五个场景工具（本轮新增，围绕实际交易场景，工具内部算完直接返回结论，不调用大模型）
+| Tool | Params | Description |
+|---|---|---|
+| `review_positions` | `ticker=None` | 我手上这几只票现在什么情况，该不该动。给每只持仓算盈亏、技术面位置、止损该放哪、有没有跌破、几天后财报、近期重大消息、期权/资金流向（A股换成主力资金和龙虎榜），**按需要动手的紧急程度排序**（跌破止损排最前，只是涨得多的排后面）。汇总按币种分开，不填 `ticker` 就看全部持仓 |
+| `scan_swing` | `market='US'`, `horizon='short'`, `scope='pool'`, `limit=15` | 盘后扫一遍，找值得做的波段机会。每只入选票给形态和理由、买入区间、按 ATR 算的止损、2倍/3倍风险距离的目标价。`horizon`: `short` 短波段（3天~2周）/ `mid` 中线（2周~2月）/ `both`。`scope`: `pool` 持仓+自选 / `full` 全市场（建议每天盘后跑 pool，周一周四跑 full）。`limit` 上限 30 |
+| `analyze_ticker` | `ticker`(required), `horizon='both'` | 单独一只票的完整体检：日线趋势 + 小时线买卖点位（原 `get_hourly_setup` 并入这里）、基本面（仅中线档展开）、近两周新闻情绪、期权资金流向、gamma 墙、财报日、内部人买卖；A股换成主力资金、龙虎榜、板块强弱。走实时接口，取不到自动退回数据库缓存 |
+| `detect_catalysts` | `scope='positions'`, `hours=24`, `min_significance='Medium'` | 最近出了什么事，跟我的票有没有关系，股价反应过了没有（已经涨完的利好是风险，纹丝不动的利好才是机会）。一条新闻只算一个事件，不按命中的票数重复扇出；会标出是不是「大盘综述」并降低排序优先级。`scope`: `positions`/`watchlist`/`market` |
+| `watch_positions` | `hours=24` | 持仓上有没有需要立刻处理的信号：价格触发（跌破均线/止损、创20日新低）、财报临近、期权异动、突发消息，外加 UW 实时警报命中持仓的部分。**没事就说没事**，不制造噪音；同一只票的多笔期权异动合并成一条，不按笔数刷屏 |
 
 ### Screening
 | Tool | Params | Description |
@@ -29,7 +38,6 @@ This is the canonical list of tools this server exposes (10 tools). Each tool ma
 | `list_watchlist` | — | List all watchlist tickers with latest price, daily change, and technicals |
 | `add_to_watchlist` | `ticker`(required) | Add ticker to watchlist (rejected if the ticker is not yet in `stocks_meta`) |
 | `remove_from_watchlist` | `ticker`(required) | Remove ticker from watchlist |
-| `analyze_watchlist` | `analysis_type='longterm'`/`'swing'` | Run longterm or swing analysis on all watchlist tickers via skills engine |
 
 ### Positions
 | Tool | Params | Description |
@@ -37,12 +45,11 @@ This is the canonical list of tools this server exposes (10 tools). Each tool ma
 | `list_positions` | — | List all positions with current price, P&L (% and $). Summary is **per currency** (`{"USD": {...}, "CNY": {...}}`) — no cross-currency total |
 | `add_position` | `ticker`(required), `avg_cost`(required), `shares`(required), `market='US'` | Add or update a position. `market` (`US`/`CN`) decides the currency. Primary key is `ticker` alone, so the same ticker cannot be held in two markets |
 | `remove_position` | `ticker`(required) | Remove a position |
-| `analyze_positions` | — | Comprehensive analysis of all positions: technicals, fundamentals, news, P&L via skills engine |
 
-### Intraday
-| Tool | Params | Description |
-|---|---|---|
-| `get_hourly_setup` | `ticker`(required), `bars=60`, `market` | Hourly-bar entry/exit read for one ticker: range position, 20h/50h MAs and slope, RSI, volume ratio, ATR (for stop placement), nearest swing support/resistance, plus a plain-language summary. Daily bars set direction, hourly bars set the price levels. `market` is normally inferred from the ticker suffix. Hourly bars only exist for the active pool (positions + watchlist + screener hits) |
+**下线的三个工具**：`analyze_watchlist`（被 `scan_swing(scope="pool")` 取代，函数已删除）、
+`analyze_positions`（被 `review_positions` 取代，函数已删除）、`get_hourly_setup`
+（逻辑并入 `analyze_ticker`，函数还在 `tools/hourly.py` 里，网页面板和测试仍在用，
+只是不再单独注册成 MCP 工具）。
 
 ---
 
@@ -51,7 +58,7 @@ This is the canonical list of tools this server exposes (10 tools). Each tool ma
 ```
 tt-trading-mcp/
   main.py                # Unified entrypoint (web + MCP, or MCP stdio)
-  server.py              # MCP server — registers all 10 tools, token auth
+  server.py              # MCP server — registers all 12 tools, token auth
   config.py              # Postgres URLs, fallback AI env vars, MCP port/token
   ai_client.py           # OpenAI/Anthropic-compatible AI client; reads config/models.json
   config/
@@ -61,13 +68,26 @@ tt-trading-mcp/
     001_analysis_history.sql   # The one table this repo owns
   db/
     pg.py                # THE ONLY database gateway (read + write)
+  core/                  # 取数层，给下面 tools/ 的五个场景工具共用。纯 Python + SQL，不碰大模型
+    snapshot.py           # 日线技术面快照（均线/RSI/量比/ATR），5 个工具里 4 个要它
+    scoring.py             # 形态识别、分档评分、止损/目标价——纯函数，不碰数据库
+    catalyst.py             # 消息面：新闻、财报日、期权异动、内部人买卖、gamma 墙
+    fundamental.py           # 基本面取数，只有中线档才该调它（短线禁用，见下方「短线禁用字段」）
+    regime.py                 # 市场环境和数据新鲜度（大盘状态、行情陈旧检测）
+    cn_signals.py              # A股独立信号：主力资金、龙虎榜、板块排名、涨停情绪
+    uw.py                       # Unusual Whales 实时接口客户端（期权异动/警报），带浏览器 UA
   tools/
     screening.py         # screen_stocks (parameterized screener, filter required)
-    watchlist.py         # list/add/remove watchlist, analyze_watchlist
-    positions.py         # list/add/remove positions, analyze_positions
-    hourly.py            # get_hourly_setup (hourly-bar entry/exit levels)
+    watchlist.py         # list/add/remove watchlist
+    positions.py         # list/add/remove positions
+    hourly.py            # 小时线计算逻辑，被 analyze_ticker 调用，不再单独暴露为 MCP 工具
+    review_positions.py  # review_positions —— 我手上这几只票该不该动
+    scan_swing.py         # scan_swing —— 盘后找值得做的波段机会
+    analyze_ticker.py      # analyze_ticker —— 单独一只票的完整体检
+    detect_catalysts.py     # detect_catalysts —— 出了什么事，跟我有没有关系
+    watch_positions.py       # watch_positions —— 持仓上有没有要立刻处理的信号
   skills/
-    __init__.py          # Analysis data layer — builds context for the AI models
+    __init__.py          # 网页面板分析页的取数层（MCP 工具已经不用它了，但网页仍依赖它）
     en/, cn/             # Skill prompts per language:
                          #   longterm_screen.md / swing_screen.md / position_review.md
   web/
@@ -89,12 +109,34 @@ Reads and writes use **separate database accounts**, physically isolated:
 
 API: `pg.query(sql, params) -> list[dict]`, `pg.query_one(...) -> dict | None`, `pg.execute_write(...) -> rowcount`, `pg.fetch_write(...)` for `RETURNING`.
 
-**Four rules every query must follow** (each one has already broken this codebase once):
+**Five rules every query must follow** (each one has already broken this codebase once):
 
 1. **Placeholders are `%s`, not `?`.** psycopg2, not DuckDB. A leftover `?` raises `syntax error at or near "?"`.
 2. **Always filter on `market`.** `stock_ohlcv_daily` holds ~2.75M US rows and ~1.05M CN rows in one table; a missing `market` condition silently mixes A-shares into US results.
 3. **Never take the latest date with a correlated subquery.** `o.date = (select max(date) from stock_ohlcv_daily where ticker = o.ticker)` measured as a 2.75M-row sequential scan (~6.7s). Use one of two shapes: for a handful of tickers, a per-ticker `order by date desc limit 1` index scan (also keeps halted/delisted names); for a full-pool scan, fetch the market's latest trading day in a separate small query first, then compare for equality (~109ms).
 4. **`stock_fundamentals` has many rows per ticker** (PK is `(ticker, updated_at)`; ~2,135 tickers spread over ~29,943 rows). Always dedupe with `distinct on (ticker) ... order by ticker, updated_at desc`.
+5. **`stock_ohlcv_min` has three timeframes sharing one table** — `1h` / `1m` / `5m`, split by the `timeframe` column. Minute-level data alone is ~20M rows / 9.3GB, so a query missing a `timeframe` condition is a disaster.
+
+### 比率字段的单位约定：百分点 vs 小数
+
+`core/snapshot.py`（日线技术面快照）和 `core/fundamental.py`（基本面取数）这两个
+模块**对外交出来的比率字段用的是百分点**——比如均线偏离度 `dist_ma20_pct` 是
+`3.18` 这种量级（代表 3.18%），不是 `0.0318`。
+
+这跟 `skills/__init__.py`、`web/`、`tools/screening.py` 里那些**直接查数据库**
+的老代码不一样：数据库里 `stock_ohlcv_daily.dist_ma20_pct` 这些列本身存的就是
+小数（`0.0318`），老代码直接拿小数用，这是对的，不用改。新的 `core/` 层是在
+`snapshot.py`/`fundamental.py` 内部把小数换算成了百分点再往外传，是**故意的
+设计选择**（给五个场景工具的 JSON 输出用，可读性更好），但这意味着：
+
+- **看到一个比率字段，先看它是从 `core/` 来的还是从数据库/`skills/` 来的**，
+  两边量级差 100 倍，混用会出严重的错。
+- 这个坑已经在本轮开发中真实炸过三次：短线三种形态判断里有一种因为门槛值
+  按小数量级写、实际收到百分点量级的数，永远不触发；中线基本面评分（满分
+  35 分）里有 12 分因为同样的量级错位全场归零；给用户展示的营收增速把
+  `+106%` 印成了 `+1.1%`（多除了一次 100）。
+- 新增或修改 `core/` 下的模块、或者对接它们的返回值时，**先确认这个字段是
+  百分点还是小数，不要想当然**。
 
 ---
 
@@ -202,7 +244,8 @@ OPENAI_API_KEY=...
 AI_API_BASE=...            # fallback single-model config, only used if models.json is empty
 SENTIMENT_API_BASE=...     # same, for sentiment scoring
 LANG_UI=en                 # en | cn, output language (fixed, not switchable in the UI)
-UW_API_TOKEN=...           # Unusual Whales (options flow), optional
+UW_API_TOKEN=...           # Unusual Whales (options flow), optional. 历史遗留键名
+                            # UW_T_ENDPOINT / UW_T_KEY 也认，config.py 两套都读
 MCP_PORT=8766
 MCP_TOKEN=...              # auto-generated on first run
 ```
@@ -226,6 +269,30 @@ Three tables that the old DuckDB had and Postgres deliberately does **not**:
 `ai_models`, `skill_prompts`, `app_settings`. They are now `config/models.json`,
 `config/skill_prompts.json`, and (for language) a plain env var. Do not re-create them.
 
+### UW 实时接口的两个坑
+
+1. **必须带浏览器 User-Agent**，否则 Cloudflare 直接 403（Error 1010）。
+   跟 token 无关，换任何鉴权写法都救不了。
+2. **`/api/alerts` 的 `symbol` 是期权合约代码**（`NVDA261002P00190000`），
+   不是股票代码，标的在 `meta.underlying_symbol` 里。
+
+`.env` 里的键名是 `UW_T_ENDPOINT` / `UW_T_KEY`（历史遗留），
+`config.py` 两个名字都认。
+
+### A 股缺个股 → 行业的映射
+
+`cn_universe.industry` 和 `stocks_meta.industry` 对 A股全是 NULL。
+唯一带行业名的是 `cn_limit_pool_daily.industry`，只覆盖当日涨停的票。
+所以板块强度只能给全市场排名，给不了「这只票所在的板块」。
+补这个映射要在 tt-data-hub 做（把行业成分表灌进 `cn_universe.industry`），
+不在本仓库。
+
+### `uw_news.tickers` 是 jsonb 不是 text[]
+
+匹配要用 `jsonb_exists_any(tickers, %s::text[])`。用 `&&` 会报
+`operator does not exist: jsonb && text[]`。
+（`news.related_tickers` 才是 text[]，那个用 `&&`。）
+
 ---
 
 ## MCP Protocol
@@ -236,14 +303,18 @@ Built with the [MCP Python SDK](https://github.com/modelcontextprotocol/python-s
 # server.py pattern
 from mcp.server.fastmcp import FastMCP
 from tools.screening import screen_stocks
-from tools.watchlist import list_watchlist, add_to_watchlist, remove_from_watchlist, analyze_watchlist
-from tools.positions import list_positions, add_position, remove_position, analyze_positions
-from tools.hourly import get_hourly_setup
+from tools.watchlist import list_watchlist, add_to_watchlist, remove_from_watchlist
+from tools.positions import list_positions, add_position, remove_position
+from tools.review_positions import review_positions
+from tools.scan_swing import scan_swing
+from tools.analyze_ticker import analyze_ticker
+from tools.detect_catalysts import detect_catalysts
+from tools.watch_positions import watch_positions
 
 mcp = FastMCP("tt-ai-screener")
-mcp.tool()(screen_stocks)
-mcp.tool()(list_watchlist)
-# ... register all 10 tools
+mcp.tool()(review_positions)
+mcp.tool()(scan_swing)
+# ... register all 12 tools
 
 if __name__ == "__main__":
     mcp.run()

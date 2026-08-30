@@ -357,38 +357,6 @@ class TestRealRoundTrip:
         assert "error" in json.loads(positions.remove_position(PROBE))
 
 
-# ------------------------------------------------------------ analyze_positions
-
-
-class TestAnalyzePositions:
-    def test_empty_positions_reports_error(self):
-        with patch("db.pg.query", MagicMock(return_value=[])):
-            assert "error" in json.loads(positions.analyze_positions())
-
-    def test_passes_market_through_to_skills(self):
-        rows = [{"ticker": "AAPL", "market": "US", "avg_cost": 200.0, "shares": 10.0},
-                {"ticker": "600519.SH", "market": "CN", "avg_cost": 1300.0,
-                 "shares": 100.0}]
-        gather = MagicMock(return_value="{}")
-        with patch("db.pg.query", MagicMock(return_value=rows)):
-            with patch.dict("sys.modules", {"skills": MagicMock(
-                    gather_context=gather)}):
-                positions.analyze_positions()
-        payload = gather.call_args.args[1]["positions"]
-        assert {p["market"] for p in payload} == {"US", "CN"}
-        assert payload[0]["cost_basis"] == 200.0
-
-    def test_no_longer_calls_the_broken_uw_client(self):
-        """data_sources/uw_client.py 读的配置项在 .env 里根本不存在，从没调通过。
-
-        UW 衍生数据现在由 tt-data-hub 采进库，这里不该再直接去调它。
-        """
-        import inspect
-        source = inspect.getsource(positions)
-        assert "uw_client" not in source
-        assert "_extract_uw_summary" not in source
-
-
 # ------------------------------------------------------------ 等上游补数据
 
 

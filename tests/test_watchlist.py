@@ -17,8 +17,6 @@ import ast
 import inspect
 import json
 import re
-import sys
-import types
 from unittest.mock import patch
 
 import pytest
@@ -309,67 +307,6 @@ class TestRealRoundTrip:
         # 清理是否真的干净
         assert _probe_rows() == []
         assert _watchlist_count() == before
-
-
-# ---------------------------------------------------------------- 分析自选
-
-
-def _fake_skills(recorder):
-    module = types.ModuleType("skills")
-
-    def gather_context(skill, payload):
-        recorder.append((skill, payload))
-        return json.dumps({"skill": skill, "tickers": payload["tickers"]})
-
-    module.gather_context = gather_context
-    return module
-
-
-class TestAnalyzeWatchlist:
-    """skills 引擎是任务 6 的活，这里用假模块顶掉，只验参数传对没有。"""
-
-    def test_empty_watchlist_reports_error(self):
-        with patch("db.pg.query", return_value=[]):
-            assert "error" in json.loads(watchlist.analyze_watchlist())
-
-    def test_longterm_is_the_default(self, monkeypatch):
-        calls = []
-        monkeypatch.setitem(sys.modules, "skills", _fake_skills(calls))
-        with patch("db.pg.query", return_value=[{"ticker": "AAPL"}]):
-            watchlist.analyze_watchlist()
-        assert calls[0][0] == "longterm_screen"
-
-    def test_swing_selects_swing_skill(self, monkeypatch):
-        calls = []
-        monkeypatch.setitem(sys.modules, "skills", _fake_skills(calls))
-        with patch("db.pg.query", return_value=[{"ticker": "AAPL"}]):
-            watchlist.analyze_watchlist("swing")
-        assert calls[0][0] == "swing_screen"
-
-    def test_tickers_come_from_the_watchlist_table(self, monkeypatch):
-        calls = []
-        monkeypatch.setitem(sys.modules, "skills", _fake_skills(calls))
-        with patch("db.pg.query",
-                   return_value=[{"ticker": "AAPL"}, {"ticker": "MSFT"}]) as read:
-            watchlist.analyze_watchlist()
-        assert calls[0][1]["tickers"] == ["AAPL", "MSFT"]
-        assert "user_watchlist" in read.call_args.args[0].lower()
-
-    def test_skill_error_becomes_error_json(self, monkeypatch):
-        broken = types.ModuleType("skills")
-
-        def gather_context(skill, payload):
-            raise RuntimeError("boom")
-
-        broken.gather_context = gather_context
-        monkeypatch.setitem(sys.modules, "skills", broken)
-        with patch("db.pg.query", return_value=[{"ticker": "AAPL"}]):
-            assert "error" in json.loads(watchlist.analyze_watchlist())
-
-    def test_real_watchlist_query_runs(self):
-        """真跑一次取票的查询（不调 skills），确认列名对得上。"""
-        rows = pg.query("select ticker from user_watchlist order by created_at")
-        assert isinstance(rows, list)
 
 
 # ---------------------------------------------------------------- 等上游数据
