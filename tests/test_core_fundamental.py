@@ -13,9 +13,26 @@ def test_get_returns_valuation_and_growth():
 
 
 def test_get_dedupes_to_the_newest_row():
-    """stock_fundamentals 一只票几十行，必须只回来一行。"""
+    """一只票在基本面表里有几十行，必须回最新那一行。
+
+    不能只断言「回来的是一个字典」——`get()` 里的字典推导本来就会把同一个
+    ticker 的多行压成一条，把 SQL 里的 distinct on 整个删掉那种断言照样绿。
+    要证明的是「拿到的是最新那行」，所以直接跟表里的 max(updated_at) 比。
+    """
+    from db import pg
+
+    total = pg.query_one(
+        "select count(*) as n from stock_fundamentals "
+        "where ticker = %s and market = %s", ("NVDA", "US"))
+    assert total["n"] > 1, "NVDA 在基本面表里只有一行，这条测试证明不了去重"
+
+    newest = pg.query_one(
+        "select max(updated_at) as newest from stock_fundamentals "
+        "where ticker = %s and market = %s", ("NVDA", "US"))
+
     out = fundamental.get(["NVDA"], "US")
-    assert isinstance(out["NVDA"], dict)
+    assert out["NVDA"] is not None
+    assert out["NVDA"]["updated_at"] == newest["newest"]
 
 
 def test_get_unknown_ticker_is_none():
