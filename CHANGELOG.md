@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+### [2026-08-31] 部署到服务器：用户级 systemd 服务与部署脚本
+
+* **新增 (Added)**: `scripts/tt-mcp.service`——用户级 systemd 服务文件。
+  用「用户级」而不是系统级，是为了跟这台服务器上已有的 `sos`、
+  `sos-autotrader`、`v5-telegram` 保持一致，而且 `tao` 已开启 linger
+  （开机自动拉起用户服务），顺带省掉 sudo。
+* **新增 (Added)**: `scripts/deploy.sh`——推当前分支到服务器裸仓库、
+  服务器拉取、装依赖、重启服务，最后自动验证首页 200 和错误令牌 401。
+
 ### [2026-08-31] 五个交易场景工具上线，MCP 工具从 10 个变 12 个
 
 * **新增 (Added)**: `core/` 取数层——`uw.py`（UW 实时客户端）、

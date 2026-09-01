@@ -1,0 +1,27 @@
+# 用户级 systemd 服务，装在 ~/.config/systemd/user/ 下。
+#
+# 为什么是用户级不是系统级：这台服务器上 sos / sos-autotrader / v5-telegram
+# 都是用户级服务，而且 tao 已经开了 linger（开机自动拉起用户服务），
+# 装用户级能跟现有惯例一致，还省掉 sudo。
+#
+# 操作时 systemctl 一定要带 --user，漏了会去找同名的系统级服务，报 not found。
+
+[Unit]
+Description=TT Trading MCP Server (web dashboard + MCP endpoint)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tao/tt-trading-mcp
+ExecStart=/home/tao/tt-trading-mcp/.venv/bin/python main.py --port 8766
+Restart=always
+RestartSec=5
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONIOENCODING=utf-8"
+StandardOutput=append:/home/tao/tt-trading-mcp/logs/mcp.log
+StandardError=append:/home/tao/tt-trading-mcp/logs/mcp.log
+
+[Install]
+WantedBy=default.target
