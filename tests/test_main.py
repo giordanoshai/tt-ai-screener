@@ -97,3 +97,95 @@ class TestServerTools:
         # list_tools 是协程；项目里没装 pytest-asyncio，直接跑一次事件循环
         tools = asyncio.run(server.mcp.list_tools())
         assert {t.name for t in tools} == self.EXPECTED
+
+
+MCP_TEST_HOST = "127.0.0.1:8766"
+
+
+@pytest.fixture(scope="module")
+def client_and_token():
+    """组合应用的测试客户端，整个模块共用一个。
+
+    必须用 with：TestClient 只有作为上下文管理器时才会跑 lifespan，而 MCP 的
+    会话管理器就在 lifespan 里启动；少了这个 with，测出来的就是部署时踩的
+    那个 500。
+
+    scope 是 module 而不是 function：``StreamableHTTPSessionManager.run()``
+    一个实例只能跑一次，而 ``server.mcp`` 是模块级单例，所以整个测试进程里
+    ``create_app()`` 只能起一次。
+    """
+    from starlette.testclient import TestClient
+    app, token, _ = server.create_app()
+    with TestClient(app, base_url=f"http://{MCP_TEST_HOST}") as client:
+        yield client, token
+
+
+class TestCombinedAppServesMCP:
+    """网页 + MCP 共用一个端口的那个组合应用，必须真的能应答 MCP 请求。
+
+    2026-09-01 第一次部署到服务器时，这里接连炸了三次，而本地测试全绿——
+    因为在此之前**没有任何测试起过这个组合应用**，测的都是 stdio 那条路。
+    三次分别是：
+
+    1. Starlette 不会自动去跑被 Mount 进来的子应用的 lifespan，MCP 的会话
+       管理器压根没启动，每个请求 500，报
+       ``RuntimeError: Task group is not initialized``。
+    2. ``Mount("/mcp")`` 匹配的是 ``/mcp/...``，**裸的 /mcp 不匹配**，请求
+       掉到网页应用上返回 404，鉴权中间件根本没被调用——现象是「错误令牌
+       返回 404 而不是 401」，看起来像路由不存在。
+    3. MCP SDK 自带的 Host 白名单默认只有 127.0.0.1 / localhost，局域网 IP
+       和隧道域名一律 421 Misdirected Request。
+
+    注意：``StreamableHTTPSessionManager.run()`` 一个实例只能跑一次，而
+    ``server.mcp`` 是模块级单例，所以整个测试进程里 ``create_app()`` 只能
+    起一次——用 class 级 fixture 共用同一个客户端，别在别处再起一个。
+    """
+
+    BODY = {
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "pytest", "version": "0"}},
+    }
+    HOST = MCP_TEST_HOST
+
+    def _headers(self, host=None):
+        return {"Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+                "Host": host or self.HOST}
+
+    def test_initialize_over_http(self, client_and_token):
+        """文档和网页 /api/mcp-url 给出的都是不带斜杠的 /mcp，它必须能用。"""
+        client, token = client_and_token
+        r = client.post(f"/mcp?token={token}", json=self.BODY,
+                        headers=self._headers())
+        assert r.status_code == 200, r.text
+
+    def test_trailing_slash_also_works(self, client_and_token):
+        client, token = client_and_token
+        r = client.post(f"/mcp/?token={token}", json=self.BODY,
+                        headers=self._headers())
+        assert r.status_code == 200, r.text
+
+    def test_wrong_token_is_401_not_404(self, client_and_token):
+        """401 而不是 404——404 说明请求没走到鉴权，路由挂了。"""
+        client, _ = client_and_token
+        r = client.post("/mcp?token=WRONG", json=self.BODY,
+                        headers=self._headers())
+        assert r.status_code == 401
+
+    def test_missing_token_is_401(self, client_and_token):
+        client, _ = client_and_token
+        r = client.post("/mcp", json=self.BODY, headers=self._headers())
+        assert r.status_code == 401
+
+    def test_unlisted_host_is_rejected(self, client_and_token):
+        """没配进 MCP_ALLOWED_HOSTS 的 Host 必须被挡（防 DNS 重绑定）。"""
+        client, token = client_and_token
+        r = client.post(f"/mcp?token={token}", json=self.BODY,
+                        headers=self._headers(host="evil.example.net"))
+        assert r.status_code == 421
+
+    def test_web_dashboard_still_served(self, client_and_token):
+        """MCP 挂上去之后网页不能被挤掉。"""
+        client, _ = client_and_token
+        assert client.get("/").status_code == 200

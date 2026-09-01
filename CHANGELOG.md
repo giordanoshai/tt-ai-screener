@@ -14,6 +14,27 @@ All notable changes to this project will be documented in this file.
   `mcp[cli]>=1.0.0`，没有上限。mcp 2.0 把 `FastMCP` 改名成了 `MCPServer`，
   服务器全新装依赖时拿到 2.1.1，`server.py` 一导入就 `ModuleNotFoundError`，
   服务起不来；本地锁在 1.27.2 所以测试全绿，完全看不出来。
+* **修复 (Fixed)**: 远程 MCP 端点此前**完全不可用**，三个原因叠在一起，
+  都是第一次真正部署才暴露的：
+  1. Starlette 不会自动运行被 `Mount` 进来的子应用的 lifespan，而 MCP 的
+     会话管理器就在那里面启动。结果每个请求 500，报
+     `RuntimeError: Task group is not initialized`。现在在组合应用上把
+     子应用的 lifespan 显式接了上来。
+  2. 地址对不上。`streamable_http_path` 默认是 `/mcp`，而应用又把整个
+     MCP 应用 `Mount` 在 `/mcp` 下，两段路径叠成了 `/mcp/mcp`——跟
+     README、CLAUDE.md 和网页 `/api/mcp-url` 交出去的地址都不一致。
+     现在设成 `/`，地址回到文档里写的 `/mcp`。
+  3. `Mount("/mcp")` 只匹配 `/mcp/...`，**裸的 `/mcp` 不匹配**，会掉到网页
+     应用上返回 404，鉴权中间件根本没被调用（现象是错误令牌返回 404 而不是
+     401）。新增 `NormalizeMcpPath` 把裸路径改写成带斜杠的，对客户端透明。
+* **新增 (Added)**: `MCP_ALLOWED_HOSTS` 环境变量。MCP SDK 自带防 DNS 重绑定的
+  Host 白名单，默认只放行 `127.0.0.1`/`localhost`/`[::1]`——**局域网直连
+  `192.168.1.38:8766` 和走 Cloudflare Tunnel 的 `mcp.你的域名` 默认都是
+  421**。没做成关掉防护，而是做成可配置的。
+* **新增 (Added)**: `tests/test_main.py` 的 `TestCombinedAppServesMCP`——
+  真正起一次「网页 + MCP 同端口」的组合应用，跑一次完整 MCP 握手。
+  上面这三个 bug 能一路溜到部署，就是因为此前**没有任何测试起过这个组合
+  应用**，测的都是 stdio 那条路。
 
 ### [2026-08-31] 五个交易场景工具上线，MCP 工具从 10 个变 12 个
 

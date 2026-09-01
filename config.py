@@ -59,3 +59,14 @@ LANG_UI = os.getenv("LANG_UI", "en")
 # MCP remote server
 MCP_PORT = int(os.getenv("MCP_PORT", "8766"))
 MCP_TOKEN = os.getenv("MCP_TOKEN", "")
+
+# MCP SDK 自带一层防 DNS 重绑定的 Host 白名单，默认只放行
+# 127.0.0.1 / localhost / [::1]，别的 Host 一律 421 Misdirected Request。
+# 也就是说下面两种访问【默认都是不通的】，必须把主机名显式加进来：
+#   - 局域网直连          Host: 192.168.1.38:8766
+#   - 走 Cloudflare Tunnel  Host: mcp.你的域名
+#
+# 逗号分隔，端口可以用 * 通配。例：
+#   MCP_ALLOWED_HOSTS=192.168.1.38:*,mcp.example.com
+MCP_ALLOWED_HOSTS = [h.strip() for h in
+                     os.getenv("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]

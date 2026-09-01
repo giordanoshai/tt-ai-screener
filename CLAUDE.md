@@ -248,6 +248,10 @@ UW_API_TOKEN=...           # Unusual Whales (options flow), optional. 历史遗�
                             # UW_T_ENDPOINT / UW_T_KEY 也认，config.py 两套都读
 MCP_PORT=8766
 MCP_TOKEN=...              # auto-generated on first run
+MCP_ALLOWED_HOSTS=...      # 逗号分隔。MCP SDK 的 Host 白名单默认只放行
+                            # 127.0.0.1/localhost/[::1]，局域网 IP 和隧道域名
+                            # 不加进来就是 421。端口可用 * 通配，例：
+                            # 192.168.1.38:*,mcp.你的域名
 ```
 
 **Core database tables** (self-hosted Postgres; market-data schema owned by `tt-data-hub`):
