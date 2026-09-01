@@ -105,12 +105,47 @@ _BAR_COLUMNS = """
     d.dist_ma20_pct, d.dist_ma50_pct
 """
 
+#: 一天要有多少只票才算数——按窗口里最热闹那天的比例算，不用绝对数。
+#: 绝对数没法用：美股池 2000+ 只、A股 1500 只，以后再加市场又是另一个数。
+#: 0.5 的余量足够吸收停牌退市这类正常波动（实测 2091 vs 2099），
+#: 又能挡住只有个位数票的野日子。
+MIN_TICKER_RATIO = 0.5
+
+#: 注意这里查的是「每天有多少只票」，不是 max(date)。
+#: 理由见 pick_trading_day 的文档字符串——一句话：^VIX 这类指数盘前就有
+#: 当天数据，裸 max(date) 会把「只有一只票的那天」当成全市场最新交易日。
+#: 代价：限定 30 天窗口后是小范围索引扫描，比原来的 max(date) 多一点点，
+#: 但仍然远低于任何「在主查询里现算」的写法。
 _LATEST_DAY_SQL = """
-select max(date) as day
+select date, count(*) as n
 from stock_ohlcv_daily
 where market = %s
   and date >= current_date - 30
+group by date
+order by date desc
 """
+
+
+def pick_trading_day(rows):
+    """从「日期 → 当天有多少只票」里挑出最新的那个【真正的】交易日。
+
+    纯函数，不碰数据库，方便把下面这个坑钉死。
+
+    2026-09-01 真实踩到：`^VIX` 是指数不是股票，计算时段跟股票不同，
+    美股还没开盘它就先有一根当天数据了。那天全市场【只有它一只】有数据，
+    而 `max(date)` 会老老实实返回那一天；主查询再按这一天等值筛选，
+    别的票全被排除——`screen_stocks(market="US")` 只返回 ^VIX 一只，
+    同时 A股完全正常（A股池里没有这种指数）。
+
+    所以判断标准从「哪天最新」改成「哪天最新且票够多」。
+    """
+    if not rows:
+        return None
+    floor = max(r["n"] for r in rows) * MIN_TICKER_RATIO
+    for row in rows:                      # SQL 已按日期倒序
+        if row["n"] >= floor:
+            return row["date"]
+    return rows[0]["date"]                # 到不了：最热闹那天自己必过线
 
 # 每只票走一次索引倒扫，取最近 8 根。停牌的票也能拿到它自己最后一根。
 # 顺带把公司名带出来——工具层要拿它显示，不然每个工具都得自己再查一次 stocks_meta。
@@ -216,8 +251,8 @@ def _pct_points(value):
 
 def latest_trading_day(market: str) -> datetime.date | None:
     """该市场最新有日线的那一天。全池扫描前先拿它，别写相关子查询。"""
-    row = pg.query_one(_LATEST_DAY_SQL, (_check_market(market),))
-    return row["day"] if row else None
+    rows = pg.query(_LATEST_DAY_SQL, (_check_market(market),))
+    return pick_trading_day(rows)
 
 
 def _enrich(bars: list[dict], ticker: str, market: str,

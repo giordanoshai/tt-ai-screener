@@ -174,10 +174,20 @@ def load_default_skill_prompt(skill_name: str, lang: str = None) -> str:
 # ------------------------------------------------------------------ SQL
 
 
-# 某个市场最新有日线的那一天。单独查一次，比在主查询里现算便宜两个数量级
-# （这一句吃 (market, date desc) 索引）。
+# 某个市场最新的那个【真正的】交易日。单独查一次，比在主查询里现算便宜
+# 两个数量级；限定 30 天窗口之后仍然是小范围索引扫描。
+#
+# 这里数的是「每天有多少只票」而不是 max(date)：^VIX 这类指数计算时段跟
+# 股票不同，盘前就有当天数据，2026-09-01 那天全市场只有它一只，
+# 裸 max(date) 会把那天当成最新交易日，下游按这一天等值筛选就只剩它。
+# 判断逻辑跟 core/snapshot.py、tools/screening.py 共用同一个纯函数。
 _LATEST_DAY_SQL = """
-    select max(date) as d from stock_ohlcv_daily where market = %(market)s
+    select date, count(*) as n
+    from stock_ohlcv_daily
+    where market = %(market)s
+      and date >= current_date - 30
+    group by date
+    order by date desc
 """
 
 # 基本面取最新一条：主键是 (ticker, updated_at)，不去重一只票会出来十几行。
@@ -339,8 +349,8 @@ _NEWS_SQL = """
 
 def _latest_trading_day(market: str):
     """这个市场最新有日线的那一天；一行数据都没有就返回 None。"""
-    row = pg.query_one(_LATEST_DAY_SQL, {"market": market})
-    return row["d"] if row else None
+    from core.snapshot import pick_trading_day
+    return pick_trading_day(pg.query(_LATEST_DAY_SQL, {"market": market}))
 
 
 def _query_tickers_data(tickers: list[str]) -> list[dict]:

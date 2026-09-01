@@ -24,9 +24,20 @@ def screen(**kwargs) -> dict:
 
 @pytest.fixture(scope="module")
 def us_latest_date():
-    row = pg.query_one(
-        "select max(date) as d from stock_ohlcv_daily where market = %s", ("US",))
-    return row["d"]
+    """美股最新的那个【真正的】交易日。
+
+    2026-09-01 之前这里写的是裸 `max(date)`，把工具的口径钉死在了一个错误的
+    定义上：^VIX 是指数不是股票，盘前就有当天数据，那天全市场只有它一只，
+    max(date) 会返回那一天。用它当期望值，等于要求筛选器也踩同一个坑——
+    实际现象就是筛选器只返回 ^VIX 一只，而这两条测试还是绿的。
+
+    现在直接用被测代码的定义（`screening.latest_trading_day`）。这不是
+    自证：它的判断逻辑本身有 7 条独立的纯函数测试钉在
+    `tests/test_core_snapshot.py::TestPickTradingDayIgnoresStrayDays`，
+    而下面 `test_prices_match_the_latest_day` 会真的去库里核对
+    每只候选票在这一天确实有价格——日期取错了那条测试立刻红。
+    """
+    return screening.latest_trading_day("US")
 
 
 # --------------------------------------------------------------------------
@@ -467,3 +478,22 @@ class TestLongtermRankingCap:
             "返回了增速低于 500% 的票")
         # 确实有票的增速远超封顶线，证明封顶没把它们挡在门外
         assert max(r["revenue_growth_yoy"] for r in rows) > 1000
+
+
+def test_latest_trading_day_ignores_stray_index_only_days():
+    """筛选器的「最新交易日」跟 core/snapshot 用同一套判断，不能是裸 max(date)。
+
+    2026-09-01 踩到的：^VIX 盘前就有当天数据，那天全市场只有它一只，
+    裸 max(date) 会把那天当成最新交易日，主查询等值一筛就只剩 ^VIX。
+    """
+    sql = screening.LATEST_DAY_SQL.lower()
+    assert "max(date)" not in sql
+    assert "count(*)" in sql and "group by" in sql
+    assert screening.latest_trading_day.__module__ == "tools.screening"
+
+
+def test_screener_returns_more_than_one_ticker():
+    """回归：美股筛一个宽条件，结果不能只剩一只票（那就是踩回上面那个坑）。"""
+    out = json.loads(screening.screen_stocks(
+        screen_type="swing", market="US", min_rsi=20, max_rsi=80))
+    assert out["count"] > 1, f"只返回了 {out['count']} 只：{out['candidates']}"

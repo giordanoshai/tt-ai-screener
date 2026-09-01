@@ -42,6 +42,7 @@
 import json
 import re
 
+from core import snapshot
 from db import pg
 
 VALID_MARKETS = ("US", "CN")
@@ -120,15 +121,27 @@ _PCT_POINT_FIELDS = (
 GROWTH_SORT_CAP = 1.0
 
 
-# 最新交易日单独查一次。这一句吃 (market, date desc) 索引，
-# 执行计划代价 1.43，比任何一种「在主查询里现算」都便宜。
-LATEST_DAY_SQL = "select max(date) as d from stock_ohlcv_daily where market = %(market)s"
+# 最新交易日单独查一次，仍然是「两段式」的第一段，别挪进主查询。
+#
+# 这里查的是【每天有多少只票】而不是 max(date)。2026-09-01 踩到：
+# ^VIX 是指数不是股票，盘前就有当天数据，那天全市场只有它一只；
+# max(date) 返回那一天之后，主查询按这一天等值筛选，别的票全被排除，
+# 美股筛选器只吐出 ^VIX 一只。判断逻辑跟 core/snapshot.py 共用一份，
+# 免得两处各写一套、将来只改一边。
+LATEST_DAY_SQL = """
+select date, count(*) as n
+from stock_ohlcv_daily
+where market = %(market)s
+  and date >= current_date - 30
+group by date
+order by date desc
+"""
 
 
 def latest_trading_day(market: str):
-    """查某个市场最新有日线的那一天；这个市场一行数据都没有就返回 None。"""
-    row = pg.query_one(LATEST_DAY_SQL, {"market": market})
-    return row["d"] if row else None
+    """查某个市场最新的那个真正交易日；30 天内一行数据都没有就返回 None。"""
+    rows = pg.query(LATEST_DAY_SQL, {"market": market})
+    return snapshot.pick_trading_day(rows)
 
 
 def _normalize_sector(name: str) -> str:

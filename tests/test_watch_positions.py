@@ -665,10 +665,14 @@ def test_new_low_window_excludes_today_and_matches_a_manual_count():
     """
     from db import pg
 
+    # 挑「最新交易日」不能用裸 max(date)：^VIX 是指数不是股票，盘前就有
+    # 当天数据，2026-09-01 那天全市场只有它一只——票池会只剩一只票，
+    # 下面所有样本量断言全部落空。用跟被测代码同一个「真交易日」定义。
+    from core import snapshot
     tickers = [r["ticker"] for r in pg.query(
-        "select distinct ticker from stock_ohlcv_daily where market='US' "
-        "and date = (select max(date) from stock_ohlcv_daily "
-        "            where market='US' and date >= current_date - 30)")]
+        "select distinct ticker from stock_ohlcv_daily "
+        "where market = 'US' and date = %s",
+        (snapshot.latest_trading_day("US"),))]
     assert tickers, "拿不到美股票池，这条测试测不出东西"
     rows = {r["ticker"]: r for r in pg.query(wp._NEW_LOW_SQL, (tickers, "US"))}
 
@@ -713,10 +717,14 @@ def test_new_low_hit_count_is_in_the_right_order_of_magnitude():
     """
     from db import pg
 
+    # 挑「最新交易日」不能用裸 max(date)：^VIX 是指数不是股票，盘前就有
+    # 当天数据，2026-09-01 那天全市场只有它一只——票池会只剩一只票，
+    # 下面所有样本量断言全部落空。用跟被测代码同一个「真交易日」定义。
+    from core import snapshot
     tickers = [r["ticker"] for r in pg.query(
-        "select distinct ticker from stock_ohlcv_daily where market='US' "
-        "and date = (select max(date) from stock_ohlcv_daily "
-        "            where market='US' and date >= current_date - 30)")]
+        "select distinct ticker from stock_ohlcv_daily "
+        "where market = 'US' and date = %s",
+        (snapshot.latest_trading_day("US"),))]
     assert len(tickers) > 1500, f"美股票池只有 {len(tickers)} 只，样本不对"
 
     key = _prior_low_key()
@@ -756,6 +764,17 @@ def test_new_low_alert_fires_with_correct_wording_on_a_real_qualifying_ticker(
     出来，读的人能自己核对。"""
     from db import pg as real_pg_mod
 
+    # 挑候选有三个约束，缺一个这条测试就会随机红（2026-09-01 真的红过）：
+    #
+    # 1. `having count(*) = 20`：那一轮挑中了 AAC —— 它【总共只有 2 根日线】，
+    #    "此前 20 个交易日的最低价"实际只有 1 根，测试认为它创了新低，而生产
+    #    代码正确地拒绝在这种票上判 20 日新低，于是断言落空。错的是候选，
+    #    不是被测代码。
+    # 2. `r1.date = 最新交易日`：docstring 说的是「今天确实创了新低」，
+    #    不加这条会挑到最后一根 K 线停在几个月前的停牌票。
+    # 3. `order by`：原来是裸 `limit 1`，挑到谁全看数据顺序，
+    #    每次补数据都可能换一只票——本来就是颗定时炸弹。
+    from core import snapshot
     candidates = real_pg_mod.query("""
         with recent as (
           select ticker, low, close, date,
@@ -765,10 +784,14 @@ def test_new_low_alert_fires_with_correct_wording_on_a_real_qualifying_ticker(
         select r1.ticker
         from recent r1
         join (select ticker, min(low) as prior_low from recent
-             where rn between 2 and 21 group by ticker) m on m.ticker = r1.ticker
+             where rn between 2 and 21
+             group by ticker
+             having count(*) = 20) m on m.ticker = r1.ticker
         where r1.rn = 1 and r1.low <= m.prior_low and r1.close > 1
+          and r1.date = %s
+        order by r1.ticker
         limit 1
-    """)
+    """, (snapshot.latest_trading_day("US"),))
     if not candidates:
         pytest.skip("今天没有真实票创 20 交易日新低，测不出这条告警")
     target = candidates[0]["ticker"]
