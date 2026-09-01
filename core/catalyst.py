@@ -53,10 +53,34 @@ MARKET_WIDE_TICKER_COUNT = 7
 #: 实测近 30 天：S 4697 条、M 1981 条、A 1870 条、F 996 条、P 770 条。
 _INSIDER_CODES = {"P": "buy", "S": "sell"}
 
-_NEWS_SQL = """
-select id, title, title_cn, url, published_at, source,
-       sentiment_label, sentiment_score, significant, related_tickers
-from news
+#: 新闻分散在两张表里，两张表都要查。
+#:
+#:   * `news`    —— 美股为主，**不是这个仓库写的**，也不是 tt-data-hub 写的，
+#:                  写它的是另一套系统（带大模型打的情绪分和重要性分级）。
+#:   * `cn_news` —— A股，tt-data-hub 的 `cn_news` 任务写的（2026-09-01 新增）。
+#:
+#: 为什么必须合起来查：实测 `news` 表 82387 条里带 A股代码的只有 218 条
+#: （0.26%），只查它等于 A股没有消息面。两张表的列是刻意对齐的，
+#: 所以这里 `union all` 之后再过滤——**先合并再过滤，参数个数跟原来一样**，
+#: 而且 Postgres 会把条件下推到两个分支各自走索引。
+#:
+#: `id` 两张表各自自增、可能撞号，但全链路没有任何地方拿 id 当去重键
+#: （去重看的是 url 和标题），所以撞了也不影响。
+#: 两张新闻表共用的列清单，写一次防止两边漂移。
+COLS = """id, title, title_cn, url, published_at, source,
+       sentiment_label, sentiment_score, significant, related_tickers"""
+
+_NEWS_UNION = """
+    select {cols}
+    from news
+    union all
+    select {cols}
+    from cn_news
+""".format(cols=COLS)
+
+_NEWS_SQL = f"""
+select {COLS}
+from ({_NEWS_UNION}) n
 where related_tickers && %s::text[]
   and published_at >= now() - make_interval(days => %s)
   and significant = any(%s)
@@ -64,10 +88,9 @@ order by published_at desc
 limit %s
 """
 
-_NEWS_RECENT_SQL = """
-select id, title, title_cn, url, published_at, source,
-       sentiment_label, sentiment_score, significant, related_tickers
-from news
+_NEWS_RECENT_SQL = f"""
+select {COLS}
+from ({_NEWS_UNION}) n
 where published_at >= now() - make_interval(hours => %s)
   and significant = any(%s)
   and (%s::text[] is null or related_tickers && %s::text[])

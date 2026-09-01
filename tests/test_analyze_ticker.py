@@ -301,3 +301,36 @@ def test_news_items_are_flagged_when_they_are_market_wide():
     if not out["news"]:
         pytest.skip("AAPL 近 14 天没有新闻")
     assert all("market_wide" in n for n in out["news"])
+
+
+def test_gap_count_in_the_warning_matches_the_gap_list(monkeypatch):
+    """★ 提示里说的「另有 N 项依据缺失」必须等于 data_gaps 的条数 ★
+
+    缺口分三层：工具层 `gaps`（取数失败、没小时线、没基本面）、评分层
+    `scored["gaps"]`、计划层 `plan["gaps"]`。data_gaps 是三者合并。
+
+    原来触发条件和提示文案只数了工具层那一个，两个后果：
+      1. 列 5 条却说 1 条，用户对不上；
+      2. 更糟——**提示会在数据变好之后失灵**。2026-09-01 真踩到：
+         早上 000001.SZ 工具层缺三四项，条件碰巧成立；下午 A股数据补齐、
+         小时线改走实时之后那些缺口消失，`len(gaps)` 掉到 1，于是
+         「82 分但只用上 45% 评分表」这种最该被警告的结果反而不警告了。
+    """
+    import re
+
+    monkeypatch.setattr(at.scoring, "detect_short_setup", lambda snap: None)
+    monkeypatch.setattr(at.scoring, "detect_mid_setup",
+                        lambda snap, fund: None)
+    monkeypatch.setattr(
+        at.scoring, "score_mid",
+        lambda snap, fund=None, news=None: {
+            "score": 82, "evidence_pct": 45, "reasons": [], "risks": [],
+            "gaps": ["探针缺口 1", "探针缺口 2", "探针缺口 3"]})
+
+    out = run("000001.SZ", horizon="mid")
+    said = [int(m.group(1)) for m in
+            (re.search(r"另有 (\d+) 项依据缺失", r) for r in out["risks"]) if m]
+    assert said, f"没有发出低置信度提示：{out['risks']}"
+    assert said[0] == len(out["data_gaps"]), (
+        f"提示里说缺 {said[0]} 项，data_gaps 实际有 "
+        f"{len(out['data_gaps'])} 条：{out['data_gaps']}")

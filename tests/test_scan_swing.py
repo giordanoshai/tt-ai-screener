@@ -162,15 +162,34 @@ def test_cn_out_of_sync_signal_dates_reported_as_a_gap():
 # ---------------- 修复轮 2：资金流连续化后的并列排序、修 1 的自动化测试 ----------------
 
 
-def test_ties_are_broken_by_volume_not_ticker_code():
-    """同分时要按量能排。按股票代码排的话，先后不带任何交易信息。"""
+def test_ties_are_broken_by_evidence_then_volume_never_by_ticker_code():
+    """同分时的先后必须带交易信息：先看依据足不足，再看量能，**绝不按代码排**。
+
+    排序键是 `(-score, -evidence_pct, -vol_ratio, ticker)`，量能前面还夹着
+    一层「这个分用上了多少评分表」。这一层是有意的，`tools/scan_swing.py`
+    里写了理由：中线满分里基本面占 35 分、相对强度占 20 分，A股这两块经常
+    整块缺失，一个用 45% 评分表打出来的 84 分跟一个用 75% 评分表打出来的
+    84 分不是一个东西。
+
+    这个断言原来漏了中间这一层，一直是靠运气绿的——2026-09-01 把 A股新闻
+    接进消息面之后分数分布变了，当场露出来：601229.SH（依据 75%、量 1.34）
+    排在 920087.BJ（依据 45%、量 1.6）前面。那不是排序坏了，正是设计要的
+    结果。所以这里按三级依次断言，而不是只看量能。
+    """
     out = run(market="CN", horizon="short", scope="full")
     cands = out["candidates"]
     for a, b in zip(cands, cands[1:]):
-        if a["score"] == b["score"]:
-            assert (a["vol_ratio"] or 0) >= (b["vol_ratio"] or 0), (
+        if a["score"] != b["score"]:
+            continue
+        ea, eb = a.get("evidence_pct") or 0, b.get("evidence_pct") or 0
+        if ea != eb:
+            assert ea > eb, (
                 f"{a['ticker']} 和 {b['ticker']} 同分 {a['score']}，"
-                f"但量能 {a['vol_ratio']} < {b['vol_ratio']}，排序没按量能")
+                f"但依据 {ea}% < {eb}%，排序没按依据")
+            continue
+        assert (a["vol_ratio"] or 0) >= (b["vol_ratio"] or 0), (
+            f"{a['ticker']} 和 {b['ticker']} 同分 {a['score']}、依据同为 {ea}%，"
+            f"但量能 {a['vol_ratio']} < {b['vol_ratio']}，排序没按量能")
 
 
 def test_mid_horizon_does_not_report_the_board_gap():

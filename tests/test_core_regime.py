@@ -117,23 +117,37 @@ def test_cn_new_highs_20_window_excludes_today():
     if day is None:
         pytest.skip("库里没有 A股行情")
 
+    # 两个条件都不能少，少一个这条测试就会拿错的期望值去卡正确的代码：
+    #
+    #   * `where date = 当天` —— 不能用「每只票最新的一行」（row_number）。
+    #     停牌的票最新一行是停牌前那天，拿它当「今天创新高」算进来就多了。
+    #     2026-09-01 真踩到：002870.SZ 停牌、没有当天数据，它 8/31 的行被
+    #     算了进去，期望值 246 卡着正确的 245 报错。
+    #
+    #   * `prior_bars = 20` —— 窗口帧不足时 `max() over` 照样给值（只有 3 根
+    #     就拿 3 根的最高价），刚上市的票会被算成创 20 日新高。
+    #     `core/regime.py` 有这个条件，这里也必须有，否则两边算的不是一件事。
     counts = pg.query_one("""
         with recent as (
           select ticker, date, high, close, high_20,
                  max(high) over (partition by ticker order by date
                                  rows between 20 preceding and 1 preceding)
                      as prior_high,
-                 row_number() over (partition by ticker order by date desc) as rn
+                 count(high) over (partition by ticker order by date
+                                   rows between 20 preceding and 1 preceding)
+                     as prior_bars
           from stock_ohlcv_daily
-          where market = 'CN' and date >= %s::date - 60 and date <= %s
+          where market = 'CN' and date > %s::date - 60 and date <= %s
         )
         select
           count(*) filter (where high_20 is not null and close >= high_20)
               as including_today,
-          count(*) filter (where prior_high is not null and high >= prior_high)
+          count(*) filter (where prior_high is not null
+                             and prior_bars = 20
+                             and high >= prior_high)
               as excluding_today
-        from recent where rn = 1
-    """, (day, day))
+        from recent where date = %s
+    """, (day, day, day))
 
     including, excluding = counts["including_today"], counts["excluding_today"]
     if including == excluding:

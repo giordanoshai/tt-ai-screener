@@ -56,6 +56,15 @@ AI_MODEL = os.getenv("AI_MODEL", "")
 # skills.get_lang() 自己读它，这里列出来只是为了让 .env 里的键名有个出处。
 LANG_UI = os.getenv("LANG_UI", "en")
 
+# 自建 AKTools 服务（AKShare 的 HTTP 封装），跑在 tt-data-hub 那台机器上。
+# 这里只用它做一件事：A股小时线的【实时】取数，见 core/akshare.py。
+#
+# 为什么需要：库里的 A股小时线只覆盖活跃池约 150 只，而活跃池是按
+# 「站上 50 日均线 + 放量」挑的，跟「用户想看哪只票」是两回事——
+# 2026-09-01 实测茅台、五粮液、宁德时代、比亚迪库里一根都没有。
+# 没配这个地址也不会坏，只是 A股小时线退回库里那 150 只。
+AKSHARE_BASE_URL = os.getenv("AKSHARE_BASE_URL", "")
+
 # MCP remote server
 MCP_PORT = int(os.getenv("MCP_PORT", "8766"))
 MCP_TOKEN = os.getenv("MCP_TOKEN", "")

@@ -76,11 +76,15 @@ tt-trading-mcp/
     regime.py                 # 市场环境和数据新鲜度（大盘状态、行情陈旧检测）
     cn_signals.py              # A股独立信号：主力资金、龙虎榜、板块排名、涨停情绪
     uw.py                       # Unusual Whales 实时接口客户端（期权异动/警报），带浏览器 UA
+    akshare.py                   # 自建 AKTools 实时客户端。只做 A股小时线，取不到返回空
   tools/
     screening.py         # screen_stocks (parameterized screener, filter required)
     watchlist.py         # list/add/remove watchlist
     positions.py         # list/add/remove positions
     hourly.py            # 小时线计算逻辑，被 analyze_ticker 调用，不再单独暴露为 MCP 工具
+                         # A股走【实时】：库里只覆盖活跃池约 150 只，而活跃池是按
+                         # 「站上 50 日均线 + 放量」挑的，跟「用户想看哪只票」是两回事
+                         # ——实测茅台/五粮液/宁德/比亚迪库里一根都没有。取不到才退回库里
     review_positions.py  # review_positions —— 我手上这几只票该不该动
     scan_swing.py         # scan_swing —— 盘后找值得做的波段机会
     analyze_ticker.py      # analyze_ticker —— 单独一只票的完整体检
@@ -244,6 +248,10 @@ OPENAI_API_KEY=...
 AI_API_BASE=...            # fallback single-model config, only used if models.json is empty
 SENTIMENT_API_BASE=...     # same, for sentiment scoring
 LANG_UI=en                 # en | cn, output language (fixed, not switchable in the UI)
+AKSHARE_BASE_URL=...       # 自建 AKTools（AKShare 的 HTTP 封装），跟 tt-data-hub
+                            # 同一个服务，形如 http://127.0.0.1:8080/api/public。
+                            # 只用于 A股小时线的【实时】取数，见 core/akshare.py。
+                            # 不配也不会坏，只是 A股小时线退回库里那 150 只
 UW_API_TOKEN=...           # Unusual Whales (options flow), optional. 历史遗留键名
                             # UW_T_ENDPOINT / UW_T_KEY 也认，config.py 两套都读
 MCP_PORT=8766
@@ -264,6 +272,7 @@ MCP_ALLOWED_HOSTS=...      # 逗号分隔。MCP SDK 的 Host 白名单默认只�
 | `v_ohlcv_hourly` | Convenience view over the `'1h'` rows. `tools/hourly.py` deliberately queries the base table instead — the view hides `session` and `timeframe`, and Postgres inlines it anyway (identical plan, cost 6.33) |
 | `stock_fundamentals` | Valuation, growth, margins, analyst ratings, earnings dates, insider MSPR, short interest. **Many rows per ticker** (see rule 4 above). Currently **US only** — CN tickers legitimately come back with empty fundamentals |
 | `news` | Articles with AI `sentiment_label` + `sentiment_score`. **No `ticker` column** — tickers live in `related_tickers` (`text[]`, GIN-indexed, so match with `&&`). **No `headline` column** — the title is in `title` |
+| `cn_news` | **A股新闻**，`tt-data-hub` 的 `cn_news` 任务写的（2026-09-01 新增）。列跟 `news` 刻意对齐，`core/catalyst.py` 把两张表 `union all` 起来查——只查 `news` 的话 A股等于没有消息面（实测 82387 条里带 A股代码的只有 218 条，0.26%）。`significant` 是关键词规则打的（High/Medium/Low），**`sentiment_label` 恒为 NULL**，见 tt-data-hub 的 `sql/006_cn_news.sql` |
 | `uw_gex_daily` | Options gamma walls (call/put wall, gamma flip/magnet). Covers only ~40 large caps |
 | `user_watchlist` | User's tracked tickers. Time column is **`created_at`** (not `added_at`); `user_id` is a NOT NULL uuid; unique on `(ticker)`. **Written by this repo** |
 | `user_positions` | `ticker`, `market`, `avg_cost`, `shares`, `currency`, `updated_at`. PK is `ticker` alone. **Written by this repo** |

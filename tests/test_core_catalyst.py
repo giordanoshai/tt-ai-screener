@@ -3,6 +3,7 @@
 import pytest
 
 from core import catalyst, uw
+from db import pg
 
 POSITIONS = ["AMZN", "GOOGL", "NVDA"]
 
@@ -118,3 +119,61 @@ def test_options_flow_live_distinguishes_no_data_from_no_flow():
         assert out["alert_count"] == 0
     finally:
         uw_mod.flow_alerts_many = real
+
+
+class TestNewsCoversBothTables:
+    """★ 新闻分散在两张表里，只查一张等于 A股没有消息面 ★
+
+    * `news`    —— 美股为主，不是这两个仓库写的（另一套系统，带大模型
+                   打的情绪分和重要性分级）。
+    * `cn_news` —— A股，tt-data-hub 的 cn_news 任务写的（2026-09-01 新增）。
+
+    2026-09-01 实测：`news` 表 82387 条里带 A股代码的只有 218 条（0.26%），
+    `uw_news` 8848 条里 0 条。当时对贵州茅台、五粮液、宁德时代、比亚迪
+    查新闻，一条都查不出来。
+    """
+
+    def test_both_tables_are_in_the_sql(self):
+        for sql in (catalyst._NEWS_SQL, catalyst._NEWS_RECENT_SQL):
+            assert "from news" in sql, "美股新闻表丢了"
+            assert "from cn_news" in sql, "A股新闻表没接进来"
+            assert "union all" in sql
+
+    def test_columns_are_identical_on_both_sides(self):
+        """两边列不一致的话 union 直接报错，或者更糟——列错位。"""
+        assert catalyst._NEWS_SQL.count(catalyst.COLS) >= 2
+
+    def test_a_share_news_is_reachable(self):
+        """连真库：从 cn_news 里挑一只真有新闻的票，必须查得出来。"""
+        picked = pg.query(
+            "select related_tickers[1] as ticker from cn_news "
+            "where related_tickers <> '{}' order by published_at desc limit 1")
+        if not picked:
+            pytest.skip("cn_news 还没有数据，先在服务器上跑一次 cn_news 任务")
+        ticker = picked[0]["ticker"]
+        out = catalyst.news_for([ticker], days=30, min_significance="Low")
+        items = out.get(ticker) if isinstance(out, dict) else out
+        assert items, f"{ticker} 在 cn_news 里有新闻，却查不出来"
+
+    def test_us_news_still_works(self):
+        """接 A股不能把美股这条路搞坏。"""
+        picked = pg.query(
+            "select related_tickers[1] as ticker from news "
+            "where related_tickers <> '{}' and significant is not null "
+            "order by published_at desc limit 1")
+        if not picked:
+            pytest.skip("news 表里没有带分级的新闻")
+        ticker = picked[0]["ticker"]
+        out = catalyst.news_for([ticker], days=30, min_significance="Low")
+        items = out.get(ticker) if isinstance(out, dict) else out
+        assert items, f"{ticker} 在 news 里有新闻，却查不出来"
+
+    def test_both_branches_use_an_index(self):
+        """两个分支都必须走 GIN。任何一边退化成全表扫，这个查询就废了。"""
+        plan = "\n".join(
+            list(r.values())[0] for r in
+            pg.query("explain " + catalyst._NEWS_SQL,
+                     (["600519.SH"], 14, ["High", "Medium", "Low"], 20)))
+        assert "Seq Scan on news" not in plan, plan
+        assert "Seq Scan on cn_news" not in plan, plan
+        assert plan.count("Index Scan") >= 2, plan

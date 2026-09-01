@@ -31,6 +31,7 @@ A股新浪给的是结束时刻（只有 10:30/11:30/14:00/15:00 四种），
 import json
 from datetime import datetime, timedelta, timezone
 
+from core import akshare
 from db import pg
 
 # 每个市场的当地时区。做波段的人脑子里的「09:30 开盘」是这个时区的 09:30。
@@ -70,6 +71,37 @@ HOURLY_SQL = """
     order by ts desc
     limit %s
 """
+
+
+def _load_bars(ticker: str, market: str, tz: str, bars: int) -> list[dict]:
+    """取小时线。**A股先走实时接口，拿不到才退回数据库；美股只查库。**
+
+    为什么两个市场不一样：
+
+      * A股。库里的小时线只覆盖【活跃池】（约 150 只），而活跃池的粗筛条件是
+        「站上 50 日均线 + 放量」——那是在挑今天强势的票，跟「用户想看哪只票」
+        完全是两回事。2026-09-01 实测：贵州茅台、五粮液、宁德时代、比亚迪，
+        四只最有名的 A股，库里一根小时线都没有，这一块直接是空的。
+        新浪一次调用给约 1970 根、2~3 秒，而这里最多只要 200 根，
+        所以改成用到谁拉谁，库里那 150 只留着当兜底。
+
+      * 美股。小时线来自 Unusual Whales（付费接口，有频率限制），而且活跃池
+        已经把持仓和自选全收进去了——也就是用户真正会看的票。没有这个缺口。
+
+    返回顺序跟 `HOURLY_SQL` 一致（`order by ts desc`，最新的在前），
+    调用方后面那句 `reversed` 两条路径通用。
+    """
+    if market == "CN":
+        try:
+            live = akshare.hourly(ticker, bars)
+        except Exception:
+            # core/akshare.py 本来就承诺不抛异常，这层是兜底：
+            # 实时那一路出任何问题都只该降级，不该让整个工具失败。
+            live = []
+        if live:
+            # akshare.hourly 给的是正序（最后一根最新），翻成 SQL 的倒序
+            return list(reversed(live))
+    return pg.query(HOURLY_SQL, (tz, ticker, market, bars))
 
 
 # --------------------------------------------------------------- 小工具
@@ -206,12 +238,15 @@ def hourly_setup(ticker: str, bars: int = 60,
         bars = max(MIN_BARS, min(int(bars), MAX_BARS))
         tz = MARKET_TZ[market]
 
-        rows = pg.query(HOURLY_SQL, (tz, ticker, market, bars))
+        rows = _load_bars(ticker, market, tz, bars)
         if not rows:
             return {
                 "error": f"{ticker}（{market}）没有小时线数据。"
-                         "小时线只采活跃池（持仓 + 自选 + 粗筛命中），"
-                         "把它加进自选就会开始采。",
+                         + ("实时接口和数据库都没取到，多半是这只票停牌、"
+                            "退市，或者 AKTools 服务不通。"
+                            if market == "CN" else
+                            "美股小时线只采活跃池（持仓 + 自选 + 粗筛命中），"
+                            "把它加进自选就会开始采。"),
             }
 
         # SQL 是 order by ts desc，翻回正序，最后一根就是最新的

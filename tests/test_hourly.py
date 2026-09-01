@@ -615,3 +615,77 @@ class TestAgainstRealData:
         assert rows, "A股小时线还没进来"
         times = {str(r["t"])[:5] for r in rows}
         assert times <= {"09:30", "10:30", "13:00", "14:00"}, times
+
+
+class TestCnHourlyGoesLiveFirst:
+    """★ A股小时线先走实时，拿不到才退回数据库 ★
+
+    2026-09-01 实测到的问题：库里的 A股小时线只覆盖活跃池（约 150 只），
+    而活跃池的粗筛条件是「站上 50 日均线 + 放量」——那是在挑今天强势的票，
+    跟「用户想看哪只票」完全是两回事。当时贵州茅台、五粮液、宁德时代、
+    比亚迪库里一根小时线都没有，`analyze_ticker` 那一块直接是空的。
+
+    新浪一次调用给约 1970 根、2~3 秒，而这里最多只要 200 根，
+    所以改成用到谁拉谁；库里那 150 只留着当兜底。
+
+    美股不走这条路：它的小时线来自 Unusual Whales（付费接口），
+    而且活跃池已经覆盖了持仓和自选，也就是用户真正会看的票。
+    """
+
+    @staticmethod
+    def _live_bars(n=40, start_close=10.0):
+        base = datetime(2026, 9, 1, 1, 30, tzinfo=timezone.utc)
+        out = []
+        for i in range(n):
+            ts = base + timedelta(hours=i)
+            close = start_close + i * 0.1
+            out.append({
+                "ts": ts, "ts_local": ts.replace(tzinfo=None),
+                "session": "RTH", "market": "CN",
+                "open": close, "high": close + 0.2,
+                "low": close - 0.2, "close": close, "volume": 1000.0,
+            })
+        return out
+
+    def test_cn_uses_live_and_does_not_touch_the_database(self):
+        with patch("core.akshare.hourly", return_value=self._live_bars()) as live, \
+             patch("tools.hourly.pg.query") as query:
+            result = hourly.hourly_setup("600519.SH", bars=30)
+        assert "error" not in result, result
+        assert live.called, "A股应该先走实时接口"
+        assert not query.called, "实时拿到了就不该再查库"
+
+    def test_cn_falls_back_to_the_database_when_live_is_empty(self):
+        rows = bars_from_closes([10 + i * 0.1 for i in range(40)], market="CN")
+        with patch("core.akshare.hourly", return_value=[]) as live, \
+             patch("tools.hourly.pg.query", return_value=rows) as query:
+            result = hourly.hourly_setup("600519.SH", bars=30)
+        assert "error" not in result, result
+        assert live.called and query.called, "实时空了必须退回库里"
+
+    def test_live_failure_does_not_break_the_tool(self):
+        """实时那一路抛异常也不能让工具挂掉——照样退回库里。"""
+        rows = bars_from_closes([10 + i * 0.1 for i in range(40)], market="CN")
+        with patch("core.akshare.hourly", side_effect=RuntimeError("接口挂了")), \
+             patch("tools.hourly.pg.query", return_value=rows):
+            result = hourly.hourly_setup("600519.SH", bars=30)
+        assert "error" not in result, result
+
+    def test_us_never_calls_the_live_interface(self):
+        rows = bars_from_closes([10 + i * 0.1 for i in range(40)], market="US")
+        with patch("core.akshare.hourly") as live, \
+             patch("tools.hourly.pg.query", return_value=rows):
+            result = hourly.hourly_setup("AAPL", bars=30)
+        assert "error" not in result, result
+        assert not live.called, "美股小时线走 UW，不该碰 AKShare"
+
+    def test_error_message_no_longer_blames_the_watchlist_for_cn(self):
+        """两边都空时的提示不能再说「加进自选就会开始采」——
+
+        A股现在是实时拉的，加不加自选都一样；那句话会把人引到错的地方去。
+        """
+        with patch("core.akshare.hourly", return_value=[]), \
+             patch("tools.hourly.pg.query", return_value=[]):
+            result = hourly.hourly_setup("600519.SH", bars=30)
+        assert "error" in result
+        assert "自选" not in result["error"], result["error"]

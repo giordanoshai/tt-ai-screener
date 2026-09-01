@@ -244,11 +244,26 @@ def analyze_ticker(ticker: str, horizon: str = "both") -> str:
         plan = scoring.plan_trade(snap, setup) if setup else None
         risks = list(scored["risks"])
 
+        # 数缺口时必须用**跟 data_gaps 完全同一个集合**，不能只数 `gaps`。
+        #
+        # `gaps` 只装工具层的缺口（取数失败、没小时线、没基本面），评分层的
+        # 缺口在 `scored["gaps"]` 里，计划层的在 `plan["gaps"]` 里，最后
+        # data_gaps 是三者合并。只数第一个有两个后果：
+        #   1. 提示里那句「另有 N 项依据缺失」跟用户眼前看到的 data_gaps
+        #      对不上——列 5 条却说 1 条。
+        #   2. 更糟的是**提示会在数据变好之后失灵**。2026-09-01 真踩到：
+        #      早上 000001.SZ 工具层缺三四项（没小时线、没新闻、行情陈旧），
+        #      条件碰巧成立；下午 A股数据补齐、小时线改走实时接口之后，
+        #      那些缺口消失，`len(gaps)` 掉到 1，于是「82 分但只用上 45%
+        #      评分表」这种最该被警告的结果反而不再警告了。
+        all_gaps = sorted(set(gaps + scored["gaps"]
+                              + (plan["gaps"] if plan else [])))
+
         # 低置信度提示**不挂在 plan 的存在与否上**（评审 C4）。
         # 原来写的是 `if plan and (...)`：没识别出形态时 plan 是 None，
         # 整条提示被跳过——而「没形态 + 缺一堆依据 + 分还不低」恰恰是最该
         # 被警告的那一类结果，它成了唯一拿不到警告的一类。
-        if scored["score"] < 50 or len(gaps) >= 3:
+        if scored["score"] < 50 or len(all_gaps) >= 3:
             plan_note = ("这份计划的价位是按现价和 ATR 机械算出来的。"
                          if plan else "")
             # 依据比例低到一定程度时，`core/scoring` 已经在 risks 里说过
@@ -258,7 +273,7 @@ def analyze_ticker(ticker: str, horizon: str = "both") -> str:
                 else f"（用上了 {scored['evidence_pct']}% 的评分表）")
             risks.append(
                 f"{plan_note}评分 {scored['score']} 分{evidence_note}，"
-                f"另有 {len(gaps)} 项依据缺失"
+                f"另有 {len(all_gaps)} 项依据缺失"
                 + ("——价位精确不等于这笔值得做" if plan
                    else "——依据这么少，这个分本身就该打个问号"))
 
@@ -312,8 +327,9 @@ def analyze_ticker(ticker: str, horizon: str = "both") -> str:
             "risks": risks,
             "plan": plan,
             "warnings": warnings,
-            "data_gaps": sorted(set(gaps + scored["gaps"]
-                                    + (plan["gaps"] if plan else []))),
+            # 就是上面数过的那个集合，别再拼一遍——两处拼法一旦漂移，
+            # 提示里说的条数就会跟这张清单对不上。
+            "data_gaps": all_gaps,
         }, ensure_ascii=False, indent=2, default=str)
 
     except Exception as exc:
