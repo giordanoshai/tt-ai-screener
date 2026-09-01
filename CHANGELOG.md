@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-### [2026-08-31] 部署到服务器：用户级 systemd 服务与部署脚本
+### [2026-09-01] 部署到服务器：用户级 systemd 服务与部署脚本
 
 * **新增 (Added)**: `scripts/tt-mcp.service`——用户级 systemd 服务文件。
   用「用户级」而不是系统级，是为了跟这台服务器上已有的 `sos`、
@@ -10,6 +10,10 @@ All notable changes to this project will be documented in this file.
   （开机自动拉起用户服务），顺带省掉 sudo。
 * **新增 (Added)**: `scripts/deploy.sh`——推当前分支到服务器裸仓库、
   服务器拉取、装依赖、重启服务，最后自动验证首页 200 和错误令牌 401。
+* **修复 (Fixed)**: `requirements.txt` 把 `mcp` 锁到 `<2`。原来写的是
+  `mcp[cli]>=1.0.0`，没有上限。mcp 2.0 把 `FastMCP` 改名成了 `MCPServer`，
+  服务器全新装依赖时拿到 2.1.1，`server.py` 一导入就 `ModuleNotFoundError`，
+  服务起不来；本地锁在 1.27.2 所以测试全绿，完全看不出来。
 
 ### [2026-08-31] 五个交易场景工具上线，MCP 工具从 10 个变 12 个
 

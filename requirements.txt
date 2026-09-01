@@ -1,4 +1,8 @@
-mcp[cli]>=1.0.0
+# 必须锁在 1.x。mcp 2.0 把 FastMCP 改名成了 MCPServer，server.py 里的
+# `from mcp.server.fastmcp import FastMCP` 在 2.x 上直接 ModuleNotFoundError。
+# 2026-09-01 部署到服务器时踩到：本地是 1.27.2，服务器全新装依赖拿到 2.1.1，
+# 服务起不来。要升 2.x 得先按官方迁移指南改 server.py，不是改个版本号的事。
+mcp[cli]>=1.0.0,<2
 psycopg2-binary>=2.9.9
 requests>=2.31.0
 python-dotenv>=1.0.0
