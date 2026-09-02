@@ -148,6 +148,50 @@ python main.py --port 9000  # 换端口
 `python main.py` 起来之后，在 Claude.ai → 设置 → 连接器 → 添加自定义连接器，
 把上面那个 MCP endpoint 地址粘进去。token 首次运行自动生成并写回 `.env`。
 
+局域网内直接用 `http://<服务器 IP>:8766/mcp?token=...` 就行。但 Claude.ai 网页版
+是从公网发请求的，够不着局域网地址，要架一条隧道。本项目实际用的是 Cloudflare
+Tunnel：`tt.smartled.cc` → `localhost:8766`。
+
+#### ⚠️ 放公网时，隧道只能开 `/mcp` 这一个路径
+
+**网页面板的每一个路由都没有鉴权**，而它和 MCP 共用同一个端口。隧道直接指向
+8766 的话，等于把下面这些对全网敞开：
+
+| 路径 | 后果 |
+|---|---|
+| `/api/mcp-url` | **把 MCP 令牌明文交出去** —— 拿到就能调用全部 12 个工具 |
+| `/api/positions` | 持仓明细（成本、股数）|
+| `/analyze/history` | 全部历史分析记录 |
+| `/api/positions/add`、`/ticker/remove` | 改你的持仓 |
+| `/analyze` | 触发 AI 分析，烧你的 API 额度 |
+
+第一条尤其致命：它让 MCP 那层 token 校验**完全失效**，等于门锁挂在门外的钉子上。
+2026-09-02 第一次接公网时就是这么漏的，暴露约 40 分钟。
+
+所以隧道配置必须限定路径，同域名的其余请求一律 404：
+
+```yaml
+  - hostname: tt.smartled.cc
+    path: ^/mcp
+    service: http://localhost:8766
+  # 这条必须【紧跟】在上面那条后面：ingress 从上往下第一个匹配就生效
+  - hostname: tt.smartled.cc
+    service: http_status:404
+```
+
+改完先自测再重启，别直接重启——配置写错会把同一条隧道上的其它域名一起带挂：
+
+```bash
+cloudflared --config <文件> tunnel ingress validate          # 语法
+cloudflared --config <文件> tunnel ingress rule <某个 URL>   # 逐条看命中哪条规则
+```
+
+网页面板就留在局域网访问（`http://192.168.1.38:8766`）。哪天想在外面看面板，
+用 Cloudflare Access 加一层登录，**不要**直接放开这里。
+
+另外记得把域名加进 `.env` 的 `MCP_ALLOWED_HOSTS`，否则 MCP SDK 自带的 Host
+白名单会回 421。
+
 ### 本地（Claude Desktop）
 
 改 `claude_desktop_config.json`：

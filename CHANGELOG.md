@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+### [2026-09-02] MCP 接上公网；堵掉网页面板随隧道一起裸奔的口子
+
+* **新增 (Added)**: MCP 服务通过 Cloudflare Tunnel 接到公网
+  （`tt.smartled.cc` → `localhost:8766`），Claude.ai 网页版从此能调用这 12 个
+  工具。此前隧道只开了 `uw` 和 `pro` 两个域名，8766 完全没有公网入口——
+  服务一直在跑，但从 Claude.ai 那边根本够不着，表现就是「部署完了却一次调用
+  都没有」。域名同时加进 `.env` 的 `MCP_ALLOWED_HOSTS`，否则 MCP SDK 自带的
+  Host 白名单会回 421。
+* **修复 (Fixed)**: **网页面板曾随隧道一起暴露在公网上，约 40 分钟。**
+  面板和 MCP 共用 8766 这一个端口，而面板的 25 个路由一个都没有鉴权，其中
+  `GET /api/mcp-url` 会把 MCP 令牌明文交给任何访问者——**MCP 那层 token 校验
+  因此完全失效**，等于门锁挂在门外。同时敞开的还有 `/api/positions`（持仓成本
+  和股数）、`/analyze/history`（全部历史分析），以及 `/api/positions/add`、
+  `/ticker/remove`、`/analyze` 这些能改数据、烧 AI 额度的写接口。
+  修法是在隧道规则上限定 `path: ^/mcp`，紧跟一条同域名的 `http_status:404`，
+  公网只留 MCP 一个入口；面板回到只能局域网访问。事后轮换了 `MCP_TOKEN`。
+* **修改 (Changed)**: README「四、接到 Claude.ai」、`.env.example` 的
+  `MCP_ALLOWED_HOSTS` 段、`CLAUDE.md` 的 Claude.ai Integration 一节都补上了
+  这条约束和隧道配置样例，并写明改隧道前要先用
+  `cloudflared --config <文件> tunnel ingress validate` 和 `... ingress rule <URL>`
+  自测——配置写错会把同一条隧道上的其它域名一起带挂。
+
 ### [2026-09-01] A股小时线改成按需实时，A股新闻接进消息面
 
 * **新增 (Added)**: `core/akshare.py`——自建 AKTools 的实时客户端，只做一件事：

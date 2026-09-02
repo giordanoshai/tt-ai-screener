@@ -349,6 +349,16 @@ python main.py
 In Claude.ai → Settings → MCP → Add custom integration, paste the MCP endpoint URL.
 Token auto-generates on first run and saves to `.env`.
 
+**公网接入只能开 `/mcp` 一个路径。** 走隧道（本项目用 Cloudflare Tunnel，
+`tt.smartled.cc` → `localhost:8766`）时，隧道规则必须写 `path: ^/mcp`，并在
+紧后面补一条同域名的 `http_status:404`。原因是网页面板跟 MCP 共用这个端口，
+而面板的 25 个路由**一个都没有鉴权**——`/api/mcp-url` 会把 MCP 令牌明文交给
+任何访问者，令牌校验就此失效；`/api/positions` 读持仓，`/api/positions/add`
+和 `/analyze` 还能改数据、烧 AI 额度。2026-09-02 第一次接公网时真的这么漏了，
+暴露约 40 分钟，之后轮换了令牌。网页面板留在局域网访问；要在外面看就用
+Cloudflare Access 加登录，不要放开隧道。域名还要加进 `MCP_ALLOWED_HOSTS`，
+否则 Host 白名单回 421。
+
 ### Local (Claude Desktop)
 
 Add to `claude_desktop_config.json`:
