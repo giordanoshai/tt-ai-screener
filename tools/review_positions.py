@@ -200,21 +200,11 @@ def _shape_news(item: dict) -> dict:
     花一整轮修掉的模式，也顶着项目最硬的规矩：工具只返回算好的结论，
     不把原始表倒给 Claude。
 
-    现在只留结论需要的字段，`tickers` 数组换成一个计数 + 一个
-    `market_wide` 判定（一条新闻挂了几只票是有用的信息，那一长串代码
-    本身不是）。
+    2026-09-03 搬到 `core/catalyst.py::slim_news` 了——`analyze_ticker`
+    缺同一件事，与其抄一份不如共用。这里留个壳子，因为这个模块里
+    到处在按名字用它。
     """
-    tickers = item.get("tickers") or []
-    return {
-        "title": item.get("title"),
-        "url": item.get("url"),
-        "published_at": item.get("published_at"),
-        "sentiment_label": item.get("sentiment_label"),
-        "significant": item.get("significant"),
-        # 这条消息一共挂了几只票，以及够不够多到该当成大盘综述看
-        "ticker_count": len(tickers),
-        "market_wide": catalyst.is_market_wide(item),
-    }
+    return catalyst.slim_news(item)
 
 
 def _one(row: dict, snap: dict | None, stop: dict, earnings: dict | None,
@@ -362,7 +352,7 @@ def review_positions(ticker: str | None = None) -> str:
                                "warnings": [], "data_gaps": [],
                                "message": "没有持仓" if not ticker
                                           else f"持仓里没有 {ticker}"},
-                              ensure_ascii=False, indent=2, default=str)
+                              ensure_ascii=False, default=str)
 
         by_market: dict[str, list[str]] = {}
         for row in rows:
@@ -438,7 +428,7 @@ def review_positions(ticker: str | None = None) -> str:
             "warnings": warnings,
             "data_gaps": sorted({g for p in positions for g in p["data_gaps"]}
                                 | set(source_gaps)),
-        }, ensure_ascii=False, indent=2, default=str)
+        }, ensure_ascii=False, default=str)
 
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)

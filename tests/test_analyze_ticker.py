@@ -39,15 +39,18 @@ def test_cn_ticker_works_and_says_what_is_missing():
 
 def test_unknown_ticker_has_no_hourly_either():
     """假票连日线都没有，走的是最前面「没有行情数据」的提前返回，
-    那条分支把 hourly 硬写成 None——测的是这条路，不是活跃池判断。"""
+    那条分支把 hourly 硬写成 None——测的是这条路，不是小时线本身。"""
     out = run("NOSUCHTICKERXYZ")
     assert out["hourly"] is None
 
 
-def test_hourly_is_none_for_a_ticker_outside_the_active_pool():
-    """小时线只采活跃池。有日线但不在池子里的票，hourly 应该是 None
-    并且在 data_gaps 里说明——原来那条用的假代码连日线都没有，
-    走的是更早的提前返回，这段逻辑一次都没跑到。"""
+def test_hourly_is_none_when_neither_live_nor_the_database_has_it(monkeypatch):
+    """两条路都空的票：`hourly` 应该是 None 并且在 data_gaps 里说明。
+
+    2026-09-03 之前这条测的是「小时线只采活跃池，池子外的票没有」；
+    现在两个市场都先走实时，池子内外一视同仁，所以改成直接把两条路都掐掉——
+    降级路径本身还在，测的就是它。
+    """
     import pytest
     from db import pg
 
@@ -65,9 +68,50 @@ def test_hourly_is_none_for_a_ticker_outside_the_active_pool():
     """)
     if row is None:
         pytest.skip("所有有日线的美股都有小时线，测不出这条")
+    monkeypatch.setattr("core.uw.hourly", lambda *a, **k: [])
     out = run(row["ticker"])
     assert out["hourly"] is None
     assert any("小时线" in g for g in out["data_gaps"])
+
+
+def test_hourly_from_the_database_is_flagged_as_possibly_stale(monkeypatch):
+    """★ 退回库里必须在 data_gaps 里说一声 ★
+
+    上游 2026-09-03 把 `us_hourly` 改成按需跑之后，库里那份美股小时线不再
+    每天更新。退回库里拿到的可能是好几天前的行情，而它算出来的支撑阻力、
+    量比看着跟实时的一模一样——不说出来，用户会拿三天前的点位下单。
+    跟上面期权流那条「取自数据库」的提示是同一个道理。
+    """
+    monkeypatch.setattr("core.uw.hourly", lambda *a, **k: [])   # 逼它退回库里
+    out = run("AAPL")
+    if out["hourly"] is None:
+        import pytest
+        pytest.skip("库里也没有 AAPL 的小时线，这条测不到")
+    assert out["hourly"]["source"] == "db"
+    assert any("小时线取自数据库" in g for g in out["data_gaps"]), out["data_gaps"]
+
+
+def test_hourly_runs_off_the_main_thread(monkeypatch):
+    """★ 小时线必须跟下面那几路实时接口并着跑 ★
+
+    实测（2026-09-03，AAPL）：整只票体检 13.5 秒，而 UW 的 1h 接口单次就要
+    12.9~14.0 秒。串着跑等于直接翻倍到 26 秒，用户一眼能感觉到。
+    这条盯的就是「有没有人把它改回串行」。
+    """
+    import threading
+
+    seen = {}
+    real = at.hourly_mod.hourly_setup
+
+    def spy(*args, **kwargs):
+        seen["thread"] = threading.current_thread()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(at.hourly_mod, "hourly_setup", spy)
+    run("AAPL")
+    assert seen.get("thread") is not None, "小时线压根没被调用"
+    assert seen["thread"] is not threading.main_thread(), \
+        "小时线又串回主线程了，整只票的体检会慢一倍"
 
 
 def test_mid_horizon_never_returns_a_short_tier_setup():

@@ -16,6 +16,11 @@ CLAUDE.md
 tests/*
 !tests/test_*.py
 !tests/__init__.py
+# conftest.py 2026-09-01 建的时候漏在这份放行名单外面，一直没进版本库。
+# 它是「测试里不许打真实行情接口」那道拦截本身——服务器上 deploy.sh 会再跑
+# 一遍测试，而服务器配着真的 AKSHARE_BASE_URL 和 UW 密钥，少了它那几十条
+# 「mock 掉数据库再断言假数据」的用例会先去打真接口，拿回真行情把断言打红。
+!tests/conftest.py
 changelog.md
 
 # 临时工作目录和接口调研笔记，不进版本库。

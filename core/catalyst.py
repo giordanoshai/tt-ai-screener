@@ -175,14 +175,24 @@ def _levels(min_significance: str) -> list[str]:
 def is_market_wide(item_or_count) -> bool:
     """这条新闻是不是「大盘/行业综述」而不是个股专属消息。
 
-    可以直接传一条 `_shape_news()` 出来的新闻（读它的 `tickers`），也可以
-    传一个**过滤前**的原始票数。传票数时必须是过滤前的——一条挂了 13 只
-    票的大盘综述，如果按「过滤后只剩我持仓那 1 只」去数，几乎总是数不到
-    阈值，会被误判成个股专属（`tools/detect_catalysts.py` 模块 docstring
-    里有这个坑的详细说明和专门的回归测试）。
+    可以传一条 `_shape_news()` 出来的新闻（读它的 `tickers` 数组）、一条
+    `slim_news()` 压过的新闻（读它的 `ticker_count`），也可以直接传一个
+    **过滤前**的原始票数。
+
+    传票数时必须是过滤前的——一条挂了 13 只票的大盘综述，如果按「过滤后
+    只剩我持仓那 1 只」去数，几乎总是数不到阈值，会被误判成个股专属
+    （`tools/detect_catalysts.py` 模块 docstring 里有这个坑的详细说明和
+    专门的回归测试）。
+
+    **两种形态都要认**，是因为压过的那条已经没有 `tickers` 数组了：
+    只认数组的话，`len(None or [])` 一路算出 0，压过的新闻会全部被判成
+    「个股专属」——最该被降权的大盘综述反而成了打分依据。
     """
     if isinstance(item_or_count, dict):
-        count = len(item_or_count.get("tickers") or [])
+        if item_or_count.get("ticker_count") is not None:
+            count = item_or_count["ticker_count"]
+        else:
+            count = len(item_or_count.get("tickers") or [])
     else:
         count = item_or_count or 0
     return count >= MARKET_WIDE_TICKER_COUNT
@@ -213,6 +223,43 @@ def _shape_news(row: dict) -> dict:
         "sentiment_score": row.get("sentiment_score"),
         "significant": row.get("significant"),
         "tickers": row.get("related_tickers") or [],
+    }
+
+
+def slim_news(item: dict) -> dict:
+    """一条新闻压成「交出去」的最小形态。
+
+    `_shape_news` 给的是内部用的完整形态（分组要用 `tickers` 数组、
+    双语标题两个都在）。真正交到 Claude 手上的时候，那几个字段是纯浪费：
+
+      * `title_en` 是同一句话的另一个语种，标题已经有一个了；
+      * `tickers` 那一长串代码——**有用的是「这条消息挂了几只票」这个数字**
+        （挂太多说明是大盘综述，不是这只票的专属消息），代码本身没用，
+        而且一条新闻挂在两只票下面时会被整份复制两遍；
+      * `published_at` 精确到微秒带时区，看新闻精确到分钟就够。
+
+    2026-09-03 实测：一条新闻从 422 字符压到 218，`analyze_ticker` 的
+    8 条新闻从 3,377 压到约 1,700。
+
+    这套压法本来只长在 `tools/review_positions.py` 里，`analyze_ticker`
+    没有——同一件事在一个工具里做了、另一个没做。提到这里两边共用。
+    """
+    # 压两次也要得到同样的结果：第二次进来时 `tickers` 已经没了，
+    # 只看数组的话计数会被清零，`market_wide` 跟着翻脸。
+    count = item.get("ticker_count")
+    if count is None:
+        count = len(item.get("tickers") or [])
+    published = item.get("published_at")
+    return {
+        "title": item.get("title"),
+        "url": item.get("url"),
+        # `2026-09-03 02:11:07.238171+00:00` → `2026-09-03 02:11`
+        "published_at": str(published)[:16] if published else None,
+        "sentiment_label": item.get("sentiment_label"),
+        "significant": item.get("significant"),
+        # 这条消息一共挂了几只票，以及够不够多到该当成大盘综述看
+        "ticker_count": count,
+        "market_wide": is_market_wide(count),
     }
 
 

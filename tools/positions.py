@@ -20,9 +20,20 @@ import json
 from collections import defaultdict
 
 from db import pg
+from tools.compact import compact_rows
 
 # 市场 -> 计价货币。持仓表的 currency 列就是按这个填的。
 CURRENCY_BY_MARKET = {"US": "USD", "CN": "CNY"}
+
+#: 交出去之前压小数，见 `tools/compact.py`。
+#:
+#: **`avg_cost` 和 `shares` 故意不在这里**：那是用户自己填进来的数字
+#: （成本价可能是 139.356 这种三位小数），截一刀等于替他改数据。
+#: `pnl_pct` / `pnl_amount` 也不在——SQL 里已经 round 过了。
+_DIGITS = {"close": 2, "rsi_14": 1, "ma_50": 2, "ma_200": 2}
+
+#: `updated_at` 原样是 `2026-09-02 14:08:04.289096+00:00`，只留日期。
+_DATE_ONLY = ("as_of", "updated_at")
 
 # 每只票取它自己最新的一根日线：走 (ticker, date) 主键索引倒扫 limit 1。
 # 持仓一般就几只到几十只，这里是几十次索引查找，比全表求 max(date) 便宜两个数量级。
@@ -105,8 +116,9 @@ def list_positions() -> str:
     """
     try:
         rows = pg.query(LIST_SQL)
-        return json.dumps({"positions": rows, "summary": _summarize(rows)},
-                          ensure_ascii=False, indent=2, default=str)
+        return json.dumps({"positions": compact_rows(rows, _DIGITS, _DATE_ONLY),
+                           "summary": _summarize(rows)},
+                          ensure_ascii=False, default=str)
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
 

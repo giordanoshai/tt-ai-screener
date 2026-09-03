@@ -299,7 +299,11 @@ class TestLatestDateOnly:
                 "where ticker = %s and date = %s and market = %s",
                 (row["ticker"], us_latest_date, "US"))
             assert expected is not None, row["ticker"]
-            assert abs(expected["close"] - row["close"]) < 1e-6, row
+            # 容差是半分钱，不是浮点误差：返回值 2026-09-03 起统一截到
+            # 2 位小数（`tools/compact.py`），库里那份还是
+            # 160.779998779297 这种原始精度。这条测的是「取的是不是
+            # 最新那天的价」，差一天的价格不可能只差半分钱。
+            assert abs(expected["close"] - row["close"]) < 0.005, row
 
 
 # --------------------------------------------------------------------------

@@ -11,12 +11,23 @@ A股换成主力资金、龙虎榜、所属板块强弱。
 「日线定方向、小时线定点位」本来就是一件事的两半，分成两个工具意味着
 用户每次都要连着调两次。所以并进来，`tools/hourly.py` 只留计算逻辑。
 
-**小时线只采活跃池**（持仓 + 自选 + 粗筛命中）。不在池子里的票没有小时线，
-这时 `hourly` 是 None 并在 data_gaps 里写明，不是错误。
+小时线现在**两个市场都走实时**（美股 UW、A股新浪），取不到才退回库里，
+见 `tools/hourly.py::_load_bars`。以前这里写的是「只采活跃池，不在池子里的票
+没有小时线」——2026-09-03 起不再是这样了。
 
 ## 只有一只票，所以走实时
 
-期权流、gamma 墙走实时接口，8~12 秒可以接受。取不到自动退回库里的。
+期权流、gamma 墙走实时接口，取不到自动退回库里的。
+
+## 小时线跟其余几路是并着跑的
+
+实测（2026-09-03，AAPL）：改造前整只票体检 13.5 秒；而 UW 的 1h 接口单次
+就要 12.9~14.0 秒——串着跑等于直接翻倍到 26 秒，用户一眼能感觉到。
+所以小时线一进函数就丢进后台线程，等下面那几路实时接口都跑完再收结果，
+两段等待重叠掉，总时长基本还是原来的量级。
+
+线程安全上没有共享状态：`db/pg.py` 每次查询都新开连接，
+`core/uw.py` 只发 HTTP，两边都不碰模块级可变对象。
 
 ## 每一路取数各自 try/except（评审 C2）
 
@@ -40,9 +51,11 @@ A股换成主力资金、龙虎榜、所属板块强弱。
 **分最高、依据最少的那一类结果恰好是唯一拿不到警告的**。现在提示跟
 `plan` 存不存在解耦。
 """
+import concurrent.futures
 import json
 
-from core import catalyst, cn_signals, fundamental, regime, scoring, snapshot
+from core import (catalyst, cn_signals, fundamental, options, regime,
+                  scoring, snapshot)
 from tools import hourly as hourly_mod
 
 HORIZONS = ("short", "mid", "both")
@@ -52,10 +65,55 @@ _CN_SUFFIXES = (".SH", ".SZ", ".BJ")
 #: 新闻拉几条。挑「不是大盘综述」的第一条拿去打分（评审 I3）。
 NEWS_LIMIT = 8
 
+#: 国会交易明细最多列几条。
+#:
+#: 2026-09-03 实测：AAPL 近一年 11 条、1,898 字符，占整只票体检的 21%——
+#: 比小时线整块还大，而它只是个加分项。11 条里大部分是不同议员各买了
+#: 一两万美元的同质记录，真正有用的是「一年里买了几笔卖了几笔」这个方向，
+#: 外加最近几笔具体是谁。所以改成一个汇总 + 最近三条明细。
+CONGRESS_DETAIL = 3
+
 
 def _round2(value):
     """价格类数字只保留 2 位小数交出去（同 `tools/watch_positions.py`）。"""
     return None if value is None else round(float(value), 2)
+
+
+def _congress_summary(rows: list[dict]) -> dict | None:
+    """国会交易压成一个方向 + 最近几笔。理由见 `CONGRESS_DETAIL`。
+
+    买卖方向是这堆记录里唯一称得上信号的东西：十一笔全是买，和十一笔
+    全是卖，含义完全相反；而「第七笔是哪位议员买的」没人会看。
+    """
+    if not rows:
+        return None
+
+    # `buy_count + sell_count` **可能小于 count**，这是故意的。
+    # 2026-09-03 查库，`txn_type` 实际有这些值：Sell 464、Buy 450、
+    # **salo 51**、Exchange 6，外加两条明显是脏数据的长字符串。
+    # `salo` 认不出是买是卖（拼写变体还是别的什么，上游没说），
+    # 硬归到任何一边都是编数据；`Exchange` 本来就不是买卖。
+    # 所以两边都不算，让 count 和两个分项的差额自己说话。
+    buys = sells = 0
+    for row in rows:
+        kind = str(row.get("txn_type") or "").strip().lower()
+        if kind.startswith("buy"):
+            buys += 1
+        elif kind.startswith(("sell", "sale")):
+            sells += 1
+
+    return {
+        "count": len(rows),
+        "buy_count": buys,
+        "sell_count": sells,
+        "latest": str(rows[0].get("transaction_date"))[:10] if rows else None,
+        "recent": [{
+            "date": str(r.get("transaction_date"))[:10],
+            "member": r.get("member"),
+            "txn_type": r.get("txn_type"),
+            "amounts": r.get("amounts"),
+        } for r in rows[:CONGRESS_DETAIL]],
+    }
 
 
 def _freshness_warnings(market: str, fresh: dict) -> list[str]:
@@ -132,18 +190,19 @@ def analyze_ticker(ticker: str, horizon: str = "both") -> str:
                 "congress": None, "cn": None, "setup": None, "plan": None,
                 "error": f"{ticker}（{market}）在库里没有日线数据",
                 "warnings": [], "data_gaps": ["没有行情数据"],
-            }, ensure_ascii=False, indent=2, default=str)
+            }, ensure_ascii=False, default=str)
 
         if snap["stale"]:
             gaps.append(f"行情已经 {snap['days_since_bar']} 天没更新")
 
-        # ---- 小时线：只有活跃池才有 ----
-        hourly = _try("小时线",
-                      lambda: hourly_mod.hourly_setup(ticker, bars=60,
-                                                      market=market), None)
-        if hourly is None or hourly.get("error"):
-            gaps.append("这只票没有小时线数据（小时线只采持仓+自选+粗筛命中的票）")
-            hourly = None
+        # ---- 小时线：丢进后台，跟下面那几路实时接口并着跑（见模块注释）----
+        # shutdown(wait=False) 只是说「不会再往里塞任务了」，已经提交的照跑完；
+        # 线程干完自己退出，所以不用 with 块把整个函数体缩进一层。
+        hourly_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hourly")
+        hourly_task = hourly_pool.submit(
+            hourly_mod.hourly_setup, ticker, 60, market)
+        hourly_pool.shutdown(wait=False)
 
         # ---- 基本面：只有中线档才展开 ----
         fund = None
@@ -161,10 +220,10 @@ def analyze_ticker(ticker: str, horizon: str = "both") -> str:
                     lambda: catalyst.news_for(
                         [ticker], days=14, min_significance="Low",
                         per_ticker=NEWS_LIMIT).get(ticker, []), [])
-        # 每条新闻标一下是不是大盘综述——挂了很多只票的那种说的是「今天
-        # 大盘怎么样」，不是这只票的专属消息（评审 I3）
-        news = [dict(item, market_wide=catalyst.is_market_wide(item))
-                for item in news]
+        # 压成最小形态：去掉英文标题副本和那串票代码数组，顺带标出是不是
+        # 大盘综述——挂了很多只票的那种说的是「今天大盘怎么样」，不是这只
+        # 票的专属消息（评审 I3）。压法和实测数据见 `catalyst.slim_news`
+        news = [catalyst.slim_news(item) for item in news]
         if not news:
             gaps.append("近 14 天没有相关新闻")
 
@@ -173,25 +232,45 @@ def analyze_ticker(ticker: str, horizon: str = "both") -> str:
                                                       market).get(ticker), None)
 
         flow = gamma = insider = congress = cn = None
+        iv = opt_volume = oi = None
         if market == "US":
+            # ---- 期权的另外三块（2026-09-03 补）----
+            # 原来这里只有「大单往哪个方向砸了多少钱」和伽马墙。少了三样
+            # 做期权的人一定会先问的东西，而数据其实一直躺在库里没人读：
+            #   * 期权现在贵不贵（IV 排名）——同一个判断，期权贵的时候
+            #     该卖、便宜的时候该买，方向正好相反；
+            #   * 今天的期权量是平时的几倍；
+            #   * **未平仓量涨了没有**——成交量大可能只是有人在平仓了结，
+            #     未平仓合约数涨了才说明真有新的钱押进来。
+            # 三张表都是每天几百只的覆盖面，取不到是常态，不写进 data_gaps
+            # 刷屏，缺了就是缺了。
+            iv = _try("隐含波动率",
+                      lambda: options.iv_snapshot([ticker]).get(ticker), None)
+            opt_volume = _try("期权量能",
+                              lambda: options.flow_volume([ticker]).get(ticker),
+                              None)
+            oi = _try("未平仓变化", lambda: options.oi_builds(ticker), []) or None
             flow = _try("期权异动",
                         lambda: catalyst.options_flow_live([ticker]).get(ticker),
                         None)
             if flow and flow.get("source") == "db":
                 gaps.append("期权数据取自数据库（实时接口没取到），一天只更新两次")
-            # gamma 墙是加分项，只覆盖约 40 只大盘股，缺了不致命——
+            # gamma 墙是加分项，覆盖面有限，缺了不致命——
             # 它更不该有本事把整只票的体检干掉（评审 C2）
             gamma = _try("gamma 墙",
                          lambda: catalyst.gamma_walls([ticker]).get(ticker),
                          None)
             if gamma is None:
-                gaps.append("没有 gamma 墙数据（只覆盖约 40 只大盘股）")
+                # 覆盖面 2026-09-02 从 41 只扩到了约 220 只（上游修掉了传给 UW
+                # 的日期用北京时间算的错），但离全市场还很远，说清楚是多少
+                gaps.append("没有 gamma 墙数据（只覆盖约 220 只大盘股）")
             insider = _try("内部人交易",
                            lambda: catalyst.insider_for(
                                [ticker], days=180).get(ticker), None)
-            congress = _try("国会交易",
-                            lambda: catalyst.congress_for(
-                                [ticker], days=365).get(ticker, []), [])
+            congress = _congress_summary(_try(
+                "国会交易",
+                lambda: catalyst.congress_for([ticker], days=365).get(ticker, []),
+                []))
         else:
             # 板块缺失不在这里 append——score_short_cn 在真正用得上板块的时候
             # 自己会写进 gaps。两处都报的话，同一件事会在清单里出现两遍
@@ -219,6 +298,18 @@ def analyze_ticker(ticker: str, horizon: str = "both") -> str:
         fresh = _try(f"{market} 行情新鲜度",
                      lambda: regime.freshness(market), None)
         warnings = _freshness_warnings(market, fresh) if fresh else []
+
+        # ---- 收上面那个后台任务：小时线 ----
+        # 到这里前面几路实时接口都跑完了，小时线多半也早就回来了
+        hourly = _try("小时线", hourly_task.result, None)
+        if hourly is None or hourly.get("error"):
+            gaps.append("没取到这只票的小时线（实时接口和库里都没有）")
+            hourly = None
+        elif hourly.get("source") == "db":
+            # 跟上面期权流那条提示同一个道理：数据不是假的，只是可能过期了。
+            # 美股这条尤其要说——上游 2026-09-03 起不再每天采小时线，
+            # 库里那份会一天比一天旧
+            gaps.append("小时线取自数据库（实时接口没取到），可能不是最新行情")
 
         # ---- 形态和交易计划 ----
         # 打分用的那条新闻要挑「不是大盘综述」的第一条（评审 I3）
@@ -311,6 +402,11 @@ def analyze_ticker(ticker: str, horizon: str = "both") -> str:
             "fundamental": fund,
             "news": news,
             "flow": flow,
+            # 期权贵不贵、今天的量是平时几倍、有没有人在建新仓。
+            # 三块都只有美股有——UW 不做 A股（见 `core/options.py`）
+            "iv": iv,
+            "options_volume": opt_volume,
+            "oi_builds": oi,
             "gamma": gamma,
             "earnings": earnings,
             "insider": insider,
@@ -330,7 +426,7 @@ def analyze_ticker(ticker: str, horizon: str = "both") -> str:
             # 就是上面数过的那个集合，别再拼一遍——两处拼法一旦漂移，
             # 提示里说的条数就会跟这张清单对不上。
             "data_gaps": all_gaps,
-        }, ensure_ascii=False, indent=2, default=str)
+        }, ensure_ascii=False, default=str)
 
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)

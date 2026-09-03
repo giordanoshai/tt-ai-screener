@@ -45,7 +45,7 @@
 | `stock_ohlcv_min` | 2000 万行 / 7.9 GB | **小时线和分钟线挤在同一张表**，用 `timeframe` 列分（`'1h'` / `'1m'`） | 查询漏掉 `timeframe = '1h'` 就会撞上 2000 万行分钟线，是灾难。`ts` 是这根 K 线的**开始**时间，`timestamptz`，显示前要转 `America/New_York` 或 `Asia/Shanghai`。美股行还带 `session`（`RTH` 盘中 / `ETH` 盘前盘后） |
 | `stock_fundamentals` | 2.9 万行 | 估值、增长、利润率、分析师评级、财报日、内部人交易情绪 (MSPR)、做空比例 | **一只票有很多行**（主键是 `(ticker, updated_at)`），必须用 `distinct on (ticker) ... order by ticker, updated_at desc` 去重。目前**只有美股**，A 股拿到空的是正常的 |
 | `news` | 8.0 万行 | 新闻正文 + AI 打的情绪标签和分数 | **没有 `ticker` 列**，相关代码在 `related_tickers`（`text[]`，建了 GIN 索引，用 `&&` 匹配）；**没有 `headline` 列**，标题在 `title` |
-| `uw_gex_daily` | 425 行 | 期权 gamma 墙（看涨墙 / 看跌墙 / gamma 翻转点 / 磁吸位） | 只覆盖约 40 只大盘股 |
+| `uw_gex_daily` | 425 行 | 期权 gamma 墙（看涨墙 / 看跌墙 / gamma 翻转点 / 磁吸位） | 2026-09-02 起约 220 只（此前只有 41 只，上游修掉了日期传参的错） |
 | `ticker_over20b` | 2130 行 | 市值 20 亿美元以上的股票池 | 板块信息缺失时当兜底数据源用 |
 | `ingest_runlog` | — | 采集端每次跑批的结果 | 判断数据新鲜度用 |
 | `v_ohlcv_hourly` | 视图 | `stock_ohlcv_min` 里 `'1h'` 那部分 | `tools/hourly.py` 故意不用它 —— 视图把 `session` 和 `timeframe` 藏起来了，而 Postgres 反正会把它展开成一模一样的执行计划 |

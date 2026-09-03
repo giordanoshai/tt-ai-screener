@@ -21,14 +21,34 @@ ATR 库里已经算好了，查一次 0.1 秒；换成实时要调 2000 多次�
 
 这个模块的任何函数**都不抛异常**。取不到就返回 None，调用方据此走降级并在
 `data_gaps` 里写明这一路是缺的。一个外部接口慢，不该让整个工具失败。
+
+## 小时线为什么也搬到这里来了（2026-09-03）
+
+`tt-data-hub` 那边把 `us_hourly` 从每天定时改成了按需跑（`--tickers AAPL,TSLA`），
+crontab 里 09:40 那行撤掉了。理由是 UW 的 1h 接口一次就给整个 3M 窗口，
+随时拉随时有完整历史，不靠每天跑来攒——那边每天写 8 万行里 98% 是拿同样的
+旧数据覆盖自己。
+
+对本仓库的后果是：**库里的美股小时线从此不再自己更新**，会一天比一天旧。
+所以这边改成跟 A股同一个规矩——用到谁拉谁，库里那批留着当兜底。
+顺带补上了另一个老缺口：库里只有活跃池那 247 只票有小时线，池子外的票
+（用户随口问的任何一只）本来就一根都没有。
 """
 import concurrent.futures
+import datetime
 import json
+import math
 import urllib.error
 import urllib.parse
 import urllib.request
 
 import config
+
+try:
+    from zoneinfo import ZoneInfo
+    _NY_TZ = ZoneInfo("America/New_York")
+except Exception:      # 机器上没装 tzdata。ts_local 留空，不影响别的字段
+    _NY_TZ = None
 
 #: 不带这个头会被 Cloudflare 403。见模块注释。
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -41,6 +61,29 @@ MAX_WORKERS = 6
 #: 期权合约代码（OCC 格式）里，股票代码之后就是 6 位到期日。
 #: NVDA261002P00190000 -> NVDA
 _OCC_TAIL_LEN = 15
+
+#: K 线接口的窗口。UW 的 timeframe 是档位制（1M/3M/6M/YTD/1Y/2Y/3Y/5Y），
+#: 没有「刚好 N 根」这一档。
+#:
+#: 取 3M 的两个依据，都是 2026-09-03 拿 AAPL 实测的：
+#:   * 1M 档只有 **138 根**盘中线，撑不起 `tools/hourly.py` 的 MAX_BARS=200；
+#:     3M 档有 390 根，留足了假期和停牌缺根的余量。
+#:   * 换小窗口省不到时间——1M 档 12.9 秒、3M 档 14.0 秒，耗时几乎全是
+#:     代理那边的固定开销，跟传多少行没什么关系。所以也别为了「快一点」
+#:     改回 1M，只会换来一条永远算不出来的 200 小时均线。
+#: 同样别往上加档：更大的窗口纯粹多传数据，这里最多只用 200 根。
+#: `tt-data-hub` 的 `hub/jobs/us_hourly.py` 用的是同一个档位。
+OHLC_WINDOW = "3M"
+
+#: K 线响应里 `market_time` 的三种取值：r=盘中、pr=盘前、po=盘后。
+#: 只要盘中那一档——`tt-data-hub` 写进库里的也只有这一档（那边 session
+#: 一律记成 'RTH'），两条路口径必须一致，不然实时和库里给出来的
+#: 「最近 60 根」根本不是同一段行情。
+REGULAR_SESSION = "r"
+
+#: 拉 K 线的超时。实测单次 12.9~14.0 秒，贴着默认的 20 秒——一次网络抖动
+#: 就整条失败退回库里，而库里可能根本没有这只票。所以单独给足余量。
+OHLC_TIMEOUT = max(config.UW_TIMEOUT, 30.0)
 
 
 def available() -> bool:
@@ -56,6 +99,17 @@ def _to_float(value, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _fetch(request: urllib.request.Request, timeout: float):
+    """真正发请求的那一层。异常照抛，由 `get()` 统一吞掉。
+
+    单独抽出来只为一件事：测试里能整体换掉。跑测试的机器上配着真密钥，
+    不拦的话每个用例都会静悄悄地发真实请求，结果随线上行情变化——
+    同一份代码今天绿明天红。见 `tests/conftest.py`。
+    """
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read())
 
 
 def get(path: str, params: dict | None = None,
@@ -74,9 +128,7 @@ def get(path: str, params: dict | None = None,
         "User-Agent": BROWSER_UA,   # 少了这行就是 403，见模块注释
     })
     try:
-        with urllib.request.urlopen(
-                request, timeout=timeout or config.UW_TIMEOUT) as response:
-            payload = json.loads(response.read())
+        payload = _fetch(request, timeout or config.UW_TIMEOUT)
     except Exception:
         return None
 
@@ -113,6 +165,108 @@ def flow_alerts_many(tickers: list[str],
     paths = {f"/api/stock/{t}/flow-alerts?limit={limit}": t for t in tickers}
     raw = get_many(list(paths))
     return {paths[path]: rows for path, rows in raw.items()}
+
+
+# --------------------------------------------------------------- 小时线
+
+
+def _bar_price(value):
+    """转成正的有限浮点数，转不成返回 None。
+
+    UW 把价格全用字符串返回（`"324.74"`），所以不能直接拿来算。
+    必须挡住 NaN：`float('nan')` 既不是假值、也不满足 `<= 0`，
+    `if not x or x <= 0` 这种写法会放它过去，一路算进均线。
+    """
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    return num if math.isfinite(num) and num > 0 else None
+
+
+def _bar_volume(value) -> float:
+    """成交量。取不到当 0——量能是加分项，缺了不该把整根 K 线丢掉。"""
+    volume = _to_float(value)
+    return volume if math.isfinite(volume) else 0.0
+
+
+def parse_ohlc_1h(payload) -> list[dict]:
+    """把 UW 的 1h 响应转成**跟库里那条 SQL 一样形状**的行。纯函数。
+
+    形状要对齐 `tools/hourly.py::HOURLY_SQL`：ts / ts_local / session /
+    open / high / low / close / volume / market。对不齐的话调用方就得为
+    「实时」和「库里」写两套解析。跟 `core/akshare.py::parse_minute_60`
+    是同一个约定。
+
+    三件保命的事：
+      1. **只留盘中那一档。** 2026-09-03 实测 AAPL 的 3M 档 1040 行里，
+         盘中 390 行、盘前 390 行、盘后 260 行——盘前盘后照单全收的话，
+         「最近 60 根」有一半是夜里那几根几千手的稀量线，均线、量比、
+         支撑阻力全被带偏。库里也只存盘中这一档。
+      2. 四个价格一起校验，缺一个就整根丢掉——不能拿 None 去算均线。
+      3. 按时间戳去重，重复的留最后一条。
+
+    `ts` 直接用响应里的 `start_time`，它本来就是这根 K 线【开始】的时刻
+    （A股那边新浪给的是结束时刻，要减一根，这里不用）。错一根的话
+    所有点位整体错一格。
+    """
+    by_ts: dict[datetime.datetime, dict] = {}
+
+    for raw in payload or []:
+        if not isinstance(raw, dict) or raw.get("market_time") != REGULAR_SESSION:
+            continue
+        prices = {name: _bar_price(raw.get(name))
+                  for name in ("open", "high", "low", "close")}
+        if any(value is None for value in prices.values()):
+            continue
+        try:
+            ts = datetime.datetime.fromisoformat(
+                str(raw.get("start_time", "")).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.timezone.utc)
+
+        by_ts[ts] = {
+            "ts": ts,
+            # 库里那列是 `ts at time zone 'America/New_York'`，出来不带时区。
+            # 机器上没装 tzdata 时给 None，`tools/hourly.py::_fmt_ts`
+            # 会退回显示 UTC 的 ts——差几个小时，但不至于整个工具挂掉
+            "ts_local": (ts.astimezone(_NY_TZ).replace(tzinfo=None)
+                         if _NY_TZ else None),
+            "session": "RTH",     # 只留了盘中，采集侧写进库里的也是 RTH
+            "market": "US",
+            # total_volume 那个字段的数值是错的（tt-data-hub 早就踩过），
+            # 只用 volume
+            "volume": _bar_volume(raw.get("volume")),
+            **prices,
+        }
+
+    return sorted(by_ts.values(), key=lambda row: row["ts"])
+
+
+def hourly(ticker: str, bars: int = 60) -> list[dict]:
+    """一只美股最近 `bars` 根小时线，正序（最后一根最新）。
+
+    取不到就返回空列表，**不抛异常**——调用方据此退回数据库。
+    """
+    if not available():
+        return []
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        return []
+    if ticker.startswith("^"):
+        # 指数代码喂给 UW 的【股票】接口一律 422（^VIX 拉小时线、拉伽马墙
+        # 都是这个下场）。tt-data-hub 2026-09-03 才因为自选里的 ^VIX 每天
+        # 各报一条永远不会自愈的警报，在源头把它挡出了活跃池。这里同样在
+        # 发请求之前挡掉：明知要 422 还去等十几秒，只是白白拖慢工具。
+        return []
+
+    rows = get(f"/api/stock/{ticker}/ohlc/1h", {"timeframe": OHLC_WINDOW},
+               timeout=OHLC_TIMEOUT)
+    if not rows:
+        return []
+    return parse_ohlc_1h(rows)[-max(int(bars), 1):]
 
 
 def alerts(limit: int = 100) -> list[dict] | None:

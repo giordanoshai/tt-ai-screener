@@ -696,7 +696,7 @@ def watch_positions(hours: int = 24) -> str:
                                "data_gaps": [], "alert_count": 0,
                                "returned_count": 0, "truncated": False,
                                "message": "没有持仓，没什么可盯的"},
-                              ensure_ascii=False, indent=2)
+                              ensure_ascii=False)
 
         by_market: dict[str, list[str]] = {}
         for row in rows:
@@ -1163,7 +1163,7 @@ def watch_positions(hours: int = 24) -> str:
             "warnings": warnings,
             "data_gaps": sorted(set(gaps)),
             "message": message,
-        }, ensure_ascii=False, indent=2, default=str)
+        }, ensure_ascii=False, default=str)
 
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)

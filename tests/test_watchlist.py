@@ -333,3 +333,75 @@ class TestUpstreamDataNotReadyYet:
         us_latest = pg.query_one(
             "select max(date) as d from stock_ohlcv_daily where market = 'US'")["d"]
         assert cn_latest is not None and us_latest is not None
+
+
+# ---------------------------------------------------------------- 交出去的体积
+
+
+class TestPayloadIsCompact:
+    """★ 这个工具一度是 12 个工具里最费 token 的一个 ★
+
+    2026-09-03 实测：155 只自选一次返回 66,672 字符（约 22,000 token），
+    比第二名的 `scan_swing` 还大三倍。而里面真正的信息量并没有那么大——
+    浪费在没截断的小数（1,224 个 `142.229995727539` 这种，白占 11,310 字符）、
+    精确到微秒的时间戳，和 `indent=2` 的缩进上。压完 42,001 字符，省 38%。
+
+    下面几条盯着这三件事，别让它涨回去。
+    """
+
+    @staticmethod
+    def _rows():
+        rows = json.loads(watchlist.list_watchlist())
+        if not rows:
+            pytest.skip("自选池是空的")
+        return rows
+
+    def test_prices_are_rounded(self):
+        """`"close": 142.229995727539` 这种一个字段就白占 10 个字符。"""
+        for row in self._rows():
+            for field in ("close", "ma_20", "ma_50", "ma_200",
+                          "pct_chg", "vol_ratio"):
+                value = row.get(field)
+                if value is not None:
+                    assert round(value, 2) == value, f"{row['ticker']}.{field}={value}"
+
+    def test_rsi_keeps_one_decimal(self):
+        """RSI 是 0~100 的刻度，小数点后一位足够看。"""
+        for row in self._rows():
+            if row.get("rsi_14") is not None:
+                assert round(row["rsi_14"], 1) == row["rsi_14"]
+
+    def test_timestamps_are_date_only(self):
+        """原来是 `2026-08-29 10:30:31.444795+00:00`——看自选不需要知道微秒。"""
+        for row in self._rows():
+            for field in ("date", "created_at"):
+                value = row.get(field)
+                if value is not None:
+                    assert len(str(value)) == 10, f"{field}={value}"
+
+    def test_json_is_not_pretty_printed(self):
+        """缩进对 Claude 没有任何价值，却占了 14% 的体积。"""
+        raw = watchlist.list_watchlist()
+        assert "\n" not in raw, "又打开缩进了"
+
+    def test_empty_fields_are_kept_as_null(self):
+        """★ 故意不省略空字段 ★
+
+        省了只有 1%（155 行里空值总共 19 个），代价却是返回体的形状随数据
+        变化——有指标的票 13 个字段、没指标的 7 个，调用方每读一个字段
+        都得先判断在不在。所以保留 null，形状恒定。
+        """
+        rows = self._rows()
+        keys = {frozenset(r) for r in rows}
+        assert len(keys) == 1, f"每行的字段集合不一样了：{len(keys)} 种"
+
+    def test_payload_stays_under_the_budget(self):
+        """整体预算。155 只压完 42,001 字符；留到 60,000 是给自选变多的余量。
+
+        真涨过头的话不该靠放宽这条线解决，该去掉 company_name 那种大字段
+        或者分页——先看一眼是不是又有哪个字段没截小数。
+        """
+        raw = watchlist.list_watchlist()
+        count = len(json.loads(raw))
+        assert len(raw) < 60_000, f"{count} 只票占了 {len(raw)} 字符"
+        assert len(raw) / max(count, 1) < 320, "平均每只票的字符数涨上去了"

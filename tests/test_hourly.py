@@ -617,23 +617,27 @@ class TestAgainstRealData:
         assert times <= {"09:30", "10:30", "13:00", "14:00"}, times
 
 
-class TestCnHourlyGoesLiveFirst:
-    """★ A股小时线先走实时，拿不到才退回数据库 ★
+class TestHourlyGoesLiveFirst:
+    """★ 两个市场都是先走实时，拿不到才退回数据库 ★
 
-    2026-09-01 实测到的问题：库里的 A股小时线只覆盖活跃池（约 150 只），
+    **A股（2026-09-01 改的）**：库里的 A股小时线只覆盖活跃池（约 150 只），
     而活跃池的粗筛条件是「站上 50 日均线 + 放量」——那是在挑今天强势的票，
     跟「用户想看哪只票」完全是两回事。当时贵州茅台、五粮液、宁德时代、
     比亚迪库里一根小时线都没有，`analyze_ticker` 那一块直接是空的。
+    新浪一次调用给约 1970 根、2~3 秒，而这里最多只要 200 根。
 
-    新浪一次调用给约 1970 根、2~3 秒，而这里最多只要 200 根，
-    所以改成用到谁拉谁；库里那 150 只留着当兜底。
+    **美股（2026-09-03 改的）**：`tt-data-hub` 把 `us_hourly` 从每天定时改成了
+    按需跑，crontab 里 09:40 那行撤掉了——库里那份美股小时线从此不再自己更新，
+    会一天比一天旧。同一天顺带发现覆盖面也是缺的：库里只有活跃池那 247 只票
+    有小时线，池子外的票一根都没有，跟 A股当时的毛病一模一样。
+    UW 的 1h 接口一次给整个 3M 窗口、约 13 秒。
 
-    美股不走这条路：它的小时线来自 Unusual Whales（付费接口），
-    而且活跃池已经覆盖了持仓和自选，也就是用户真正会看的票。
+    退回库里那条路留着当兜底，但**必须让调用方知道拿到的是旧数据**——
+    所以还要盯住 `source` 字段和结论里那句提示。
     """
 
     @staticmethod
-    def _live_bars(n=40, start_close=10.0):
+    def _live_bars(n=40, start_close=10.0, market="CN"):
         base = datetime(2026, 9, 1, 1, 30, tzinfo=timezone.utc)
         out = []
         for i in range(n):
@@ -641,7 +645,7 @@ class TestCnHourlyGoesLiveFirst:
             close = start_close + i * 0.1
             out.append({
                 "ts": ts, "ts_local": ts.replace(tzinfo=None),
-                "session": "RTH", "market": "CN",
+                "session": "RTH", "market": market,
                 "open": close, "high": close + 0.2,
                 "low": close - 0.2, "close": close, "volume": 1000.0,
             })
@@ -671,21 +675,116 @@ class TestCnHourlyGoesLiveFirst:
             result = hourly.hourly_setup("600519.SH", bars=30)
         assert "error" not in result, result
 
-    def test_us_never_calls_the_live_interface(self):
+    def test_us_uses_uw_live_and_does_not_touch_the_database(self):
+        with patch("core.uw.hourly",
+                   return_value=self._live_bars(market="US")) as live, \
+             patch("tools.hourly.pg.query") as query:
+            result = hourly.hourly_setup("AAPL", bars=30)
+        assert "error" not in result, result
+        assert live.called, "美股应该先走 UW 实时接口"
+        assert not query.called, "实时拿到了就不该再查库"
+
+    def test_us_falls_back_to_the_database_when_live_is_empty(self):
         rows = bars_from_closes([10 + i * 0.1 for i in range(40)], market="US")
-        with patch("core.akshare.hourly") as live, \
+        with patch("core.uw.hourly", return_value=[]) as live, \
+             patch("tools.hourly.pg.query", return_value=rows) as query:
+            result = hourly.hourly_setup("AAPL", bars=30)
+        assert "error" not in result, result
+        assert live.called and query.called, "实时空了必须退回库里"
+
+    def test_us_live_failure_does_not_break_the_tool(self):
+        rows = bars_from_closes([10 + i * 0.1 for i in range(40)], market="US")
+        with patch("core.uw.hourly", side_effect=RuntimeError("UW 挂了")), \
              patch("tools.hourly.pg.query", return_value=rows):
             result = hourly.hourly_setup("AAPL", bars=30)
         assert "error" not in result, result
-        assert not live.called, "美股小时线走 UW，不该碰 AKShare"
 
-    def test_error_message_no_longer_blames_the_watchlist_for_cn(self):
-        """两边都空时的提示不能再说「加进自选就会开始采」——
+    def test_each_market_calls_only_its_own_live_interface(self):
+        """两条实时路不许串台：美股走 UW、A股走新浪。"""
+        rows = bars_from_closes([10 + i * 0.1 for i in range(40)], market="US")
+        with patch("core.akshare.hourly") as sina, \
+             patch("core.uw.hourly", return_value=[]), \
+             patch("tools.hourly.pg.query", return_value=rows):
+            hourly.hourly_setup("AAPL", bars=30)
+        assert not sina.called, "美股不该碰 AKShare"
 
-        A股现在是实时拉的，加不加自选都一样；那句话会把人引到错的地方去。
+        rows = bars_from_closes([10 + i * 0.1 for i in range(40)], market="CN")
+        with patch("core.uw.hourly") as unusual_whales, \
+             patch("core.akshare.hourly", return_value=[]), \
+             patch("tools.hourly.pg.query", return_value=rows):
+            hourly.hourly_setup("600519.SH", bars=30)
+        assert not unusual_whales.called, "A股不该碰 UW"
+
+    def test_error_message_no_longer_blames_the_watchlist(self):
+        """两边都空时的提示不能再说「加进自选就会开始采」。
+
+        两个市场现在都是实时拉的，加不加自选都一样；
+        那句话会把人引到错的地方去（美股那句还多错一层：上游的定时任务
+        2026-09-03 已经撤了，加进自选也不会有人去采）。
         """
         with patch("core.akshare.hourly", return_value=[]), \
+             patch("core.uw.hourly", return_value=[]), \
              patch("tools.hourly.pg.query", return_value=[]):
+            cn = hourly.hourly_setup("600519.SH", bars=30)
+            us = hourly.hourly_setup("AAPL", bars=30)
+        for result in (cn, us):
+            assert "error" in result
+            assert "自选" not in result["error"], result["error"]
+
+
+class TestDataSourceIsReported:
+    """★ 拿到的这批 K 线是实时的还是从库里翻出来的，必须说清楚 ★
+
+    上游 2026-09-03 把美股小时线改成按需采集之后，库里那份不再每天更新。
+    退回库里拿到的可能是好几天前的行情，而旧行情算出来的支撑阻力、量比
+    看着跟实时的一模一样——不标出来，没有任何人分得清。
+    """
+
+    @staticmethod
+    def _live_bars(market):
+        base = datetime(2026, 9, 1, 1, 30, tzinfo=timezone.utc)
+        return [{
+            "ts": base + timedelta(hours=i),
+            "ts_local": (base + timedelta(hours=i)).replace(tzinfo=None),
+            "session": "RTH", "market": market,
+            "open": 10.0 + i * 0.1, "high": 10.3 + i * 0.1,
+            "low": 9.8 + i * 0.1, "close": 10.0 + i * 0.1, "volume": 1000.0,
+        } for i in range(40)]
+
+    def test_live_us_is_tagged_uw_live(self):
+        with patch("core.uw.hourly", return_value=self._live_bars("US")), \
+             patch("tools.hourly.pg.query"):
+            result = hourly.hourly_setup("AAPL", bars=30)
+        assert result["source"] == "uw_live"
+
+    def test_live_cn_is_tagged_akshare_live(self):
+        with patch("core.akshare.hourly", return_value=self._live_bars("CN")), \
+             patch("tools.hourly.pg.query"):
             result = hourly.hourly_setup("600519.SH", bars=30)
-        assert "error" in result
-        assert "自选" not in result["error"], result["error"]
+        assert result["source"] == "akshare_live"
+
+    def test_database_fallback_is_tagged_db(self):
+        rows = bars_from_closes([10 + i * 0.1 for i in range(40)], market="US")
+        with patch("core.uw.hourly", return_value=[]), \
+             patch("tools.hourly.pg.query", return_value=rows):
+            result = hourly.hourly_setup("AAPL", bars=30)
+        assert result["source"] == "db"
+
+    def test_database_fallback_says_so_in_the_signals(self):
+        """光有一个 source 字段不够——结论那几句话也得说出来。
+
+        Claude 读的是 signals 和 summary，一个它不认识的字段值
+        很容易就被当成噪音跳过去了。
+        """
+        rows = bars_from_closes([10 + i * 0.1 for i in range(40)], market="US")
+        with patch("core.uw.hourly", return_value=[]), \
+             patch("tools.hourly.pg.query", return_value=rows):
+            result = hourly.hourly_setup("AAPL", bars=30)
+        assert any("库里" in line for line in result["signals"]), result["signals"]
+
+    def test_live_data_does_not_get_the_stale_warning(self):
+        """实时拿到的就别再说「可能不是最新行情」，那是噪音。"""
+        with patch("core.uw.hourly", return_value=self._live_bars("US")), \
+             patch("tools.hourly.pg.query"):
+            result = hourly.hourly_setup("AAPL", bars=30)
+        assert not any("库里" in line for line in result["signals"])

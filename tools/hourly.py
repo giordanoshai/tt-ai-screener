@@ -4,7 +4,13 @@
 日线告诉你「这只票值不值得做」，小时线告诉你「今天这个价能不能进、
 止损放哪、上面压着什么」。这个模块只干后半件事。
 
-## 这张表的三个坑（每一条都能把查询搞砸）
+## 数据从哪来：先实时，拿不到才查库
+
+两个市场都是「用到谁拉谁」——美股走 Unusual Whales、A股走新浪的 60 分钟线，
+两边都取不到才退回下面这张表。返回体里的 **`source` 字段标着这一次走的哪条路**
+（`uw_live` / `akshare_live` / `db`），理由和实测数据见 `_load_bars` 的注释。
+
+## 这张表的三个坑（退回库里那条路上，每一条都能把查询搞砸）
 
 1. **小时线跟分钟线挤在同一张表 `stock_ohlcv_min` 里**，靠 `timeframe` 列区分：
    小时线是 `'1h'`，分钟线是 `'1m'` / `'5m'`。2026-08 实测分钟线有 2000 万行、
@@ -31,7 +37,7 @@ A股新浪给的是结束时刻（只有 10:30/11:30/14:00/15:00 四种），
 import json
 from datetime import datetime, timedelta, timezone
 
-from core import akshare
+from core import akshare, uw
 from db import pg
 
 # 每个市场的当地时区。做波段的人脑子里的「09:30 开盘」是这个时区的 09:30。
@@ -73,35 +79,55 @@ HOURLY_SQL = """
 """
 
 
-def _load_bars(ticker: str, market: str, tz: str, bars: int) -> list[dict]:
-    """取小时线。**A股先走实时接口，拿不到才退回数据库；美股只查库。**
+#: 每个市场的实时小时线接口。两个市场现在是同一个规矩：**先实时，
+#: 拿不到才退回数据库**。两个模块的 `hourly()` 都承诺「取不到返回空列表、
+#: 不抛异常」，都返回正序（最后一根最新）。
+#:
+#: 存的是**模块**不是函数：存函数的话这里在导入时就把 `uw.hourly` 绑死了，
+#: 测试里 `patch("core.uw.hourly")` 会换不掉它——桩没生效，用例却照样绿。
+_LIVE_SOURCE = {
+    "CN": ("akshare_live", akshare),
+    "US": ("uw_live", uw),
+}
 
-    为什么两个市场不一样：
 
-      * A股。库里的小时线只覆盖【活跃池】（约 150 只），而活跃池的粗筛条件是
-        「站上 50 日均线 + 放量」——那是在挑今天强势的票，跟「用户想看哪只票」
-        完全是两回事。2026-09-01 实测：贵州茅台、五粮液、宁德时代、比亚迪，
-        四只最有名的 A股，库里一根小时线都没有，这一块直接是空的。
-        新浪一次调用给约 1970 根、2~3 秒，而这里最多只要 200 根，
-        所以改成用到谁拉谁，库里那 150 只留着当兜底。
+def _load_bars(ticker: str, market: str, tz: str,
+               bars: int) -> tuple[list[dict], str]:
+    """取小时线。**先走实时接口，拿不到才退回数据库。** 返回 (行, 数据来源)。
 
-      * 美股。小时线来自 Unusual Whales（付费接口，有频率限制），而且活跃池
-        已经把持仓和自选全收进去了——也就是用户真正会看的票。没有这个缺口。
+    两个市场都这么走，但走到这一步的理由不太一样：
+
+      * A股（2026-09-01 改的）。库里的小时线只覆盖【活跃池】（约 150 只），
+        而活跃池的粗筛条件是「站上 50 日均线 + 放量」——那是在挑今天强势的票，
+        跟「用户想看哪只票」完全是两回事。当时实测贵州茅台、五粮液、宁德时代、
+        比亚迪，四只最有名的 A股，库里一根小时线都没有。新浪一次调用给约
+        1970 根、2~3 秒，而这里最多只要 200 根。
+
+      * 美股（2026-09-03 改的）。`tt-data-hub` 把 `us_hourly` 从每天定时改成了
+        按需跑，crontab 里 09:40 那行撤掉了——**库里的美股小时线从此不再自己
+        更新**，会一天比一天旧。同一天顺带发现覆盖面也是缺的：库里只有活跃池
+        那 247 只票有小时线，池子外的票一根都没有，跟 A股当时的毛病一模一样。
+        UW 的 1h 接口一次给整个 3M 窗口（390 根盘中线）、约 13 秒。
+
+    退回数据库这条路留着，是因为实时那头随时可能不通（没配密钥、代理挂了、
+    超时），库里的旧数据总比什么都没有强——但**必须让调用方知道这是旧的**，
+    所以来源要一路带出去，见 `hourly_setup` 里的 `source` 字段。
 
     返回顺序跟 `HOURLY_SQL` 一致（`order by ts desc`，最新的在前），
     调用方后面那句 `reversed` 两条路径通用。
     """
-    if market == "CN":
+    source, live_module = _LIVE_SOURCE.get(market, (None, None))
+    if live_module is not None:
         try:
-            live = akshare.hourly(ticker, bars)
+            live = live_module.hourly(ticker, bars)
         except Exception:
-            # core/akshare.py 本来就承诺不抛异常，这层是兜底：
+            # core/akshare.py 和 core/uw.py 本来就承诺不抛异常，这层是兜底：
             # 实时那一路出任何问题都只该降级，不该让整个工具失败。
             live = []
         if live:
-            # akshare.hourly 给的是正序（最后一根最新），翻成 SQL 的倒序
-            return list(reversed(live))
-    return pg.query(HOURLY_SQL, (tz, ticker, market, bars))
+            # 两个实时接口给的都是正序（最后一根最新），翻成 SQL 的倒序
+            return list(reversed(live)), source
+    return pg.query(HOURLY_SQL, (tz, ticker, market, bars)), "db"
 
 
 # --------------------------------------------------------------- 小工具
@@ -238,15 +264,14 @@ def hourly_setup(ticker: str, bars: int = 60,
         bars = max(MIN_BARS, min(int(bars), MAX_BARS))
         tz = MARKET_TZ[market]
 
-        rows = _load_bars(ticker, market, tz, bars)
+        rows, source = _load_bars(ticker, market, tz, bars)
         if not rows:
             return {
                 "error": f"{ticker}（{market}）没有小时线数据。"
-                         + ("实时接口和数据库都没取到，多半是这只票停牌、"
-                            "退市，或者 AKTools 服务不通。"
-                            if market == "CN" else
-                            "美股小时线只采活跃池（持仓 + 自选 + 粗筛命中），"
-                            "把它加进自选就会开始采。"),
+                         "实时接口和数据库都没取到，多半是这只票停牌、退市，"
+                         + ("或者 AKTools 服务不通。" if market == "CN" else
+                            "是指数代码（UW 的股票接口不收 ^ 开头的），"
+                            "或者 UW 那边没配密钥 / 不通。"),
             }
 
         # SQL 是 order by ts desc，翻回正序，最后一根就是最新的
@@ -318,6 +343,11 @@ def hourly_setup(ticker: str, bars: int = 60,
             "bars_used": n,
             "sessions": sessions,
             "last_bar_complete": last_bar_complete,
+            # 这批 K 线是实时拉的还是从库里翻出来的。**必须交出去**：
+            # 库里的美股小时线自 2026-09-03 起不再每天更新（上游改成了按需），
+            # 退回库里拿到的可能是好几天前的行情，而拿旧行情算出来的支撑阻力
+            # 看着跟新的一模一样，不标出来没人分得清
+            "source": source,
             "period": {
                 "from": _fmt_ts(rows[0]),
                 "to": _fmt_ts(rows[-1]),
@@ -374,7 +404,7 @@ def get_hourly_setup(ticker: str, bars: int = 60,
                      market: str | None = None) -> str:
     """（保留给现有测试和网页面板用；MCP 那边已经并进 analyze_ticker）"""
     return json.dumps(hourly_setup(ticker, bars, market),
-                      ensure_ascii=False, indent=2, default=str)
+                      ensure_ascii=False, default=str)
 
 
 # --------------------------------------------------------------- 结论
@@ -431,6 +461,13 @@ def _signals(r: dict) -> list[str]:
             out.append(f"小时线 RSI {rsi}，超买（涨得太急）")
         elif rsi <= 30:
             out.append(f"小时线 RSI {rsi}，超卖（跌得太狠）")
+
+    if r.get("source") == "db":
+        # 上游 2026-09-03 把美股小时线改成按需采集之后，库里那份不再每天
+        # 更新。退回库里时如果不说一声，一批三天前的 K 线算出来的支撑阻力
+        # 看着跟实时的一模一样——这条提示就是把这件事写在脸上。
+        out.append(f"这批小时线是从库里翻出来的（实时接口没取到），"
+                   f"最后一根停在 {r['period']['to']}，可能不是最新行情")
 
     if not r["last_bar_complete"]:
         out.append("最后一根小时线还没走完，量和收盘价都还会变")

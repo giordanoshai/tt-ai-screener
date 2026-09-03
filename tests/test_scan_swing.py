@@ -274,12 +274,16 @@ def test_every_cn_data_source_can_fail_without_killing_the_scan(monkeypatch):
 
 # ================ 评审 I1：打分用的期权流和贴出来的证据必须是同一个 ================
 
-def test_scoring_flow_and_live_flow_are_kept_apart_and_labelled():
+def test_scoring_flow_and_live_flow_are_kept_apart_and_labelled(live_uw):
     """评分依据（库里 5 天的归档）和后补的实时期权流不能挤在同一个键上。
 
     真实事故：NVDA 的 reasons 写「期权资金偏空（净 −10%）」，旁边
     `flow.net_premium` 却是净 −43.7%；S 的 reasons 写「大致平衡」
     （归档 +1.6%），旁边 `flow` 是 −15.1%。读的人会以为算错了。
+
+    这条要**真的实时数据**才测得出「两份数字对不上」，所以用 `live_uw`
+    解除 conftest 的默认拦截（2026-09-03 加那道拦截时这条当场红了：
+    实时那份退化成一份零值，跟归档那份比出来处处相等）。
     """
     import pytest
 

@@ -22,9 +22,9 @@ This is the canonical list of tools this server exposes (12 tools). Each tool ma
 | Tool | Params | Description |
 |---|---|---|
 | `review_positions` | `ticker=None` | 我手上这几只票现在什么情况，该不该动。给每只持仓算盈亏、技术面位置、止损该放哪、有没有跌破、几天后财报、近期重大消息、期权/资金流向（A股换成主力资金和龙虎榜），**按需要动手的紧急程度排序**（跌破止损排最前，只是涨得多的排后面）。汇总按币种分开，不填 `ticker` 就看全部持仓 |
-| `scan_swing` | `market='US'`, `horizon='short'`, `scope='pool'`, `limit=15` | 盘后扫一遍，找值得做的波段机会。每只入选票给形态和理由、买入区间、按 ATR 算的止损、2倍/3倍风险距离的目标价。`horizon`: `short` 短波段（3天~2周）/ `mid` 中线（2周~2月）/ `both`。`scope`: `pool` 持仓+自选 / `full` 全市场（建议每天盘后跑 pool，周一周四跑 full）。`limit` 上限 30 |
-| `analyze_ticker` | `ticker`(required), `horizon='both'` | 单独一只票的完整体检：日线趋势 + 小时线买卖点位（原 `get_hourly_setup` 并入这里）、基本面（仅中线档展开）、近两周新闻情绪、期权资金流向、gamma 墙、财报日、内部人买卖；A股换成主力资金、龙虎榜、板块强弱。走实时接口，取不到自动退回数据库缓存 |
-| `detect_catalysts` | `scope='positions'`, `hours=24`, `min_significance='Medium'` | 最近出了什么事，跟我的票有没有关系，股价反应过了没有（已经涨完的利好是风险，纹丝不动的利好才是机会）。一条新闻只算一个事件，不按命中的票数重复扇出；会标出是不是「大盘综述」并降低排序优先级。`scope`: `positions`/`watchlist`/`market` |
+| `scan_swing` | `market='US'`, `horizon='short'`, `scope='pool'`, `limit=15` | 盘后扫一遍，找值得做的波段机会。每只入选票给形态和理由、买入区间、按 ATR 算的止损、2倍/3倍风险距离的目标价。`horizon`: `short` 短波段（3天~2周）/ `mid` 中线（2周~2月）/ `both`。`scope`: `pool` 持仓+自选 / `full` 全市场（建议每天盘后跑 pool，周一周四跑 full）。`limit` 上限 30。美股入选的票另带 IV 排名和期权量比——同样看多的判断，期权贵的时候该用正股进 |
+| `analyze_ticker` | `ticker`(required), `horizon='both'` | 单独一只票的完整体检：日线趋势 + 小时线买卖点位（原 `get_hourly_setup` 并入这里）、基本面（仅中线档展开）、近两周新闻情绪、期权资金流向、**期权贵不贵（IV 排名）+ 期权量比 + 未平仓量变化**、gamma 墙、财报日、内部人买卖、国会交易（汇总 + 最近三笔）；A股换成主力资金、龙虎榜、板块强弱。走实时接口，取不到自动退回数据库缓存 |
+| `detect_catalysts` | `scope='positions'`, `hours=24`, `min_significance='Medium'` | 最近出了什么事，跟我的票有没有关系，股价反应过了没有（已经涨完的利好是风险，纹丝不动的利好才是机会）。一条新闻只算一个事件，不按命中的票数重复扇出；会标出是不是「大盘综述」并降低排序优先级。`scope`: `positions`/`watchlist`/`market`。另附一条大盘背景：全市场高管近 5 天是在买还是在卖 |
 | `watch_positions` | `hours=24` | 持仓上有没有需要立刻处理的信号：价格触发（跌破均线/止损、创20日新低）、财报临近、期权异动、突发消息，外加 UW 实时警报命中持仓的部分。**没事就说没事**，不制造噪音；同一只票的多笔期权异动合并成一条，不按笔数刷屏 |
 
 ### Screening
@@ -48,8 +48,9 @@ This is the canonical list of tools this server exposes (12 tools). Each tool ma
 
 **下线的三个工具**：`analyze_watchlist`（被 `scan_swing(scope="pool")` 取代，函数已删除）、
 `analyze_positions`（被 `review_positions` 取代，函数已删除）、`get_hourly_setup`
-（逻辑并入 `analyze_ticker`，函数还在 `tools/hourly.py` 里，网页面板和测试仍在用，
-只是不再单独注册成 MCP 工具）。
+（逻辑并入 `analyze_ticker`，`get_hourly_setup` 这个 JSON 包装函数还在
+`tools/hourly.py` 里，只有测试在用了——2026-09-03 查过，网页面板一处都没引用，
+早先这里写「网页面板仍在用」是过期的）。
 
 ---
 
@@ -75,16 +76,27 @@ tt-trading-mcp/
     fundamental.py           # 基本面取数，只有中线档才该调它（短线禁用，见下方「短线禁用字段」）
     regime.py                 # 市场环境和数据新鲜度（大盘状态、行情陈旧检测）
     cn_signals.py              # A股独立信号：主力资金、龙虎榜、板块排名、涨停情绪
-    uw.py                       # Unusual Whales 实时接口客户端（期权异动/警报），带浏览器 UA
+    options.py                  # 期权和资金面：期权贵不贵（IV 排名）、期权量比、
+                                 # 未平仓量变化（谁在建新仓）、全市场内部人买卖。
+                                 # 只有美股（UW 不做 A股），覆盖面每天四五百只
+    uw.py                       # Unusual Whales 实时接口客户端（期权异动/警报/美股小时线），
+                                 # 带浏览器 UA。小时线用 3M 档，只留盘中那一档，取不到返回空
     akshare.py                   # 自建 AKTools 实时客户端。只做 A股小时线，取不到返回空
   tools/
+    compact.py           # 交出去之前压一压：小数按字段截断、时间只留日期。
+                         # 量级混着放，加字段前先确认是百分点还是小数
     screening.py         # screen_stocks (parameterized screener, filter required)
     watchlist.py         # list/add/remove watchlist
     positions.py         # list/add/remove positions
     hourly.py            # 小时线计算逻辑，被 analyze_ticker 调用，不再单独暴露为 MCP 工具
-                         # A股走【实时】：库里只覆盖活跃池约 150 只，而活跃池是按
+                         # 【两个市场都走实时】，取不到才退回库里，返回体带 source 字段
+                         # 标明走的哪条路（uw_live / akshare_live / db）
+                         # A股（2026-09-01）：库里只覆盖活跃池约 150 只，而活跃池是按
                          # 「站上 50 日均线 + 放量」挑的，跟「用户想看哪只票」是两回事
-                         # ——实测茅台/五粮液/宁德/比亚迪库里一根都没有。取不到才退回库里
+                         # ——实测茅台/五粮液/宁德/比亚迪库里一根都没有
+                         # 美股（2026-09-03）：tt-data-hub 把 us_hourly 改成按需跑、
+                         # 撤了 09:40 的定时，库里那份从此不再自己更新，会一天比一天旧；
+                         # 覆盖面同样只有活跃池那 247 只
     review_positions.py  # review_positions —— 我手上这几只票该不该动
     scan_swing.py         # scan_swing —— 盘后找值得做的波段机会
     analyze_ticker.py      # analyze_ticker —— 单独一只票的完整体检
@@ -252,8 +264,10 @@ AKSHARE_BASE_URL=...       # 自建 AKTools（AKShare 的 HTTP 封装），跟 t
                             # 同一个服务，形如 http://127.0.0.1:8080/api/public。
                             # 只用于 A股小时线的【实时】取数，见 core/akshare.py。
                             # 不配也不会坏，只是 A股小时线退回库里那 150 只
-UW_API_TOKEN=...           # Unusual Whales (options flow), optional. 历史遗留键名
-                            # UW_T_ENDPOINT / UW_T_KEY 也认，config.py 两套都读
+UW_API_TOKEN=...           # Unusual Whales（期权异动 + 美股小时线）。历史遗留键名
+                            # UW_T_ENDPOINT / UW_T_KEY 也认，config.py 两套都读。
+                            # 不配也不会坏，但美股小时线会退回库里那 247 只，
+                            # 而那份数据自 2026-09-03 起不再每天更新（上游改成了按需）
 MCP_PORT=8766
 MCP_TOKEN=...              # auto-generated on first run
 MCP_ALLOWED_HOSTS=...      # 逗号分隔。MCP SDK 的 Host 白名单默认只放行
@@ -273,7 +287,11 @@ MCP_ALLOWED_HOSTS=...      # 逗号分隔。MCP SDK 的 Host 白名单默认只�
 | `stock_fundamentals` | Valuation, growth, margins, analyst ratings, earnings dates, insider MSPR, short interest. **Many rows per ticker** (see rule 4 above). Currently **US only** — CN tickers legitimately come back with empty fundamentals |
 | `news` | Articles with AI `sentiment_label` + `sentiment_score`. **No `ticker` column** — tickers live in `related_tickers` (`text[]`, GIN-indexed, so match with `&&`). **No `headline` column** — the title is in `title` |
 | `cn_news` | **A股新闻**，`tt-data-hub` 的 `cn_news` 任务写的（2026-09-01 新增）。列跟 `news` 刻意对齐，`core/catalyst.py` 把两张表 `union all` 起来查——只查 `news` 的话 A股等于没有消息面（实测 82387 条里带 A股代码的只有 218 条，0.26%）。`significant` 是关键词规则打的（High/Medium/Low），**`sentiment_label` 恒为 NULL**，见 tt-data-hub 的 `sql/006_cn_news.sql` |
-| `uw_gex_daily` | Options gamma walls (call/put wall, gamma flip/magnet). Covers only ~40 large caps |
+| `uw_screener_daily` | UW 每日筛选快照，每天 500 只，一个 `payload` jsonb。**IV 排名**（期权现在贵不贵，0~100）、30 天隐含波动率、财报预期波动（`implied_move` 是**美元金额**不是百分比）、板块、市值。2026-09-03 起由 `core/options.py` 读 |
+| `uw_options_volume_daily` | 整只票的期权成交量、溢价、未平仓量，还有 3/7/30 日均量，每天 410 只。用来算「今天的期权量是平时几倍」 |
+| `uw_oi_change_daily` | 逐个合约的未平仓量变化，每天 410 只、每只 50 个合约。**区分「新建仓」和「平仓了结」的唯一数据**——成交量大可能只是有人跑路，未平仓涨了才是真有人押新的。`oi_change` 是**倍数**（2.99 = 涨到原来的 2.99 倍） |
+| `uw_market_ibs_daily` | 全市场内部人买卖的每日汇总，一天一行、`payload` 里带 500 天历史。`sells_notional` 是**负数**，比大小前先取绝对值 |
+| `uw_gex_daily` | Options gamma walls (call/put wall, gamma flip/magnet). Coverage jumped from ~41 tickers to **~218** on 2026-09-02, when `tt-data-hub` stopped passing a Beijing-local `date` to the UW endpoint (measured 2026-09-03: 41/day through 09-01, 218 on 09-02). Still nowhere near the whole market |
 | `user_watchlist` | User's tracked tickers. Time column is **`created_at`** (not `added_at`); `user_id` is a NOT NULL uuid; unique on `(ticker)`. **Written by this repo** |
 | `user_positions` | `ticker`, `market`, `avg_cost`, `shares`, `currency`, `updated_at`. PK is `ticker` alone. **Written by this repo** |
 | `analysis_history` | `id`, `created_at`, `skill`, `tickers` (comma-joined), `ticker_count`, `context_json`, `analysis_text`, `model`. Owned and **written by this repo** — see `sql/001_analysis_history.sql` |
@@ -282,15 +300,27 @@ Three tables that the old DuckDB had and Postgres deliberately does **not**:
 `ai_models`, `skill_prompts`, `app_settings`. They are now `config/models.json`,
 `config/skill_prompts.json`, and (for language) a plain env var. Do not re-create them.
 
-### UW 实时接口的两个坑
+### UW 实时接口的四个坑
 
 1. **必须带浏览器 User-Agent**，否则 Cloudflare 直接 403（Error 1010）。
    跟 token 无关，换任何鉴权写法都救不了。
 2. **`/api/alerts` 的 `symbol` 是期权合约代码**（`NVDA261002P00190000`），
    不是股票代码，标的在 `meta.underlying_symbol` 里。
+3. **指数代码喂给 `/api/stock/...` 一律 422**（`^VIX` 拉小时线、拉伽马墙都是
+   这个下场）。`core/uw.py` 在发请求之前就挡掉 `^` 开头的代码——明知要失败还
+   去等十几秒只是白白拖慢工具。`tt-data-hub` 2026-09-03 也把它挡出了活跃池。
+4. **`/api/stock/{票}/ohlc/1h` 的窗口是档位制**（1M/3M/6M/YTD/1Y/…），
+   没有「刚好 N 根」这一档，而且**响应里混着盘前盘后**——`market_time` 分
+   `r`（盘中）/ `pr`（盘前）/ `po`（盘后），只留 `r` 才跟库里的口径一致。
+   实测 AAPL：1M 档只有 138 根盘中线（撑不起 200 小时均线），3M 档 390 根；
+   两档耗时几乎一样（12.9 秒 vs 14.0 秒，开销全在代理那头），所以固定用 3M。
 
 `.env` 里的键名是 `UW_T_ENDPOINT` / `UW_T_KEY`（历史遗留），
 `config.py` 两个名字都认。
+
+**测试里默认打不通 UW。** `tests/conftest.py` 把 `core.uw._fetch` 换成了抛异常的
+桩（跟 AKShare 同一个待遇）——不拦的话，配了真密钥的机器上每个用例都会静悄悄
+发真实请求，拿回真行情把断言打红。真要联网冒烟的用例加一个 `live_uw` fixture。
 
 ### A 股缺个股 → 行业的映射
 

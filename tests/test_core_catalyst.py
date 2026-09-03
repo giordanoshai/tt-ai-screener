@@ -177,3 +177,86 @@ class TestNewsCoversBothTables:
         assert "Seq Scan on news" not in plan, plan
         assert "Seq Scan on cn_news" not in plan, plan
         assert plan.count("Index Scan") >= 2, plan
+
+
+# ---------------- 交出去之前把新闻压小 ----------------
+
+def _raw_news_item(n_tickers=2):
+    """一条 `_shape_news()` 出来的完整形态。"""
+    return {
+        "title": "英伟达财报超预期",
+        "title_en": "Nvidia beats on earnings",
+        "url": "https://example.com/a-fairly-long-news-url-goes-here",
+        "published_at": "2026-09-03 02:11:07.238171+00:00",
+        "source": "yahoo_finance",
+        "sentiment_label": "Positive",
+        "sentiment_score": 0.8,
+        "significant": "High",
+        "tickers": [f"T{i}" for i in range(n_tickers)],
+    }
+
+
+def test_slim_news_drops_the_english_title_copy_and_the_ticker_array():
+    """两个字段是纯浪费：英文标题是同一句话的另一个语种，
+    而那串票代码有用的只是「挂了几只」这个数字。"""
+    out = catalyst.slim_news(_raw_news_item())
+    assert "title_en" not in out
+    assert "tickers" not in out
+    assert out["ticker_count"] == 2
+    assert out["title"] == "英伟达财报超预期"
+
+
+def test_slim_news_cuts_the_timestamp_to_the_minute():
+    out = catalyst.slim_news(_raw_news_item())
+    assert out["published_at"] == "2026-09-03 02:11"
+
+
+def test_slim_news_keeps_what_the_scorer_reads():
+    """`core/scoring.py` 打分只读这两个字段，压掉任何一个都会让消息面归零。"""
+    out = catalyst.slim_news(_raw_news_item())
+    assert out["sentiment_label"] == "Positive"
+    assert out["significant"] == "High"
+
+
+def test_slim_news_marks_market_wide_stories():
+    wide = catalyst.slim_news(
+        _raw_news_item(n_tickers=catalyst.MARKET_WIDE_TICKER_COUNT))
+    narrow = catalyst.slim_news(_raw_news_item(n_tickers=1))
+    assert wide["market_wide"] is True
+    assert narrow["market_wide"] is False
+
+
+def test_is_market_wide_reads_a_slimmed_item():
+    """★ 压过的新闻也必须判得出来 ★
+
+    压完就没有 `tickers` 数组了。只认数组的话 `len(None or [])` 一路算出 0，
+    **压过的新闻会全部被判成「个股专属」**——最该降权的大盘综述反而成了
+    打分依据，正是评审 I3 修过的那个老毛病。
+    """
+    slim = catalyst.slim_news(
+        _raw_news_item(n_tickers=catalyst.MARKET_WIDE_TICKER_COUNT))
+    assert catalyst.is_market_wide(slim) is True
+    assert catalyst.first_stock_specific([slim]) is None
+
+
+def test_slim_news_is_idempotent():
+    """压两次结果一样——第二次进来时数组已经没了，得认 ticker_count。"""
+    once = catalyst.slim_news(
+        _raw_news_item(n_tickers=catalyst.MARKET_WIDE_TICKER_COUNT))
+    twice = catalyst.slim_news(once)
+    assert twice == once
+    assert twice["market_wide"] is True
+
+
+def test_slim_news_is_much_smaller():
+    """体积护栏：别把删掉的字段又加回来。
+
+    线上那批真新闻实测是 422 → 218 字符（压掉 48%）。上面这个合成样本
+    压掉 30%，比例没那么夸张，因为它的标题是短中文、url 短、只挂了两只票——
+    真新闻的英文标题和那串票代码都长得多。所以这条按合成样本的量级卡 20%，
+    卡的是「有没有人把字段加回去」，不是精确的压缩率。
+    """
+    import json
+    raw = _raw_news_item()
+    assert (len(json.dumps(catalyst.slim_news(raw), ensure_ascii=False))
+            < len(json.dumps(raw, ensure_ascii=False)) * 0.8)

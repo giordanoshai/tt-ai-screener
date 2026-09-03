@@ -44,6 +44,7 @@ import re
 
 from core import snapshot
 from db import pg
+from tools.compact import compact_rows
 
 VALID_MARKETS = ("US", "CN")
 
@@ -99,6 +100,17 @@ _PCT_POINT_FIELDS = (
     "dist_ma20_pct", "dist_ma200_pct", "atr_pct",
     "revenue_growth_yoy", "earnings_growth_yoy", "gross_margin",
 )
+
+#: 交出去之前截小数，见 `tools/compact.py`。2026-09-03 实测：不截的话
+#: 一次 20 只候选里有 139 个 `25.2679996490479` 这种数字，白占 1,411 字符，
+#: 占这个工具返回体的 9%。
+#:
+#: 只列这七个是**故意的**：`_PCT_POINT_FIELDS` 那几个上面刚 round 过 2 位，
+#: 再截一遍是白做；而 `pe_ratio`、`market_cap` 这些直接来自
+#: `stock_fundamentals`，量级各不相同，没确认过之前不往这里加
+#: （量级的坑见 CLAUDE.md 里「比率字段的单位约定」那一节）。
+_DIGITS = {"close": 2, "pct_chg": 2, "rsi_14": 1, "vol_ratio": 2,
+           "ma_20": 2, "ma_50": 2, "ma_200": 2}
 
 
 #: 长线排序里，两个增长项各自的封顶值。**这是库里的量级，不是返回值的量级。**
@@ -360,7 +372,7 @@ def screen_stocks(
             "sector_source": "无（这批结果没有行业分类）",
             "candidates": [],
             "note": f"{market} 市场的日线表还没有任何数据",
-        }, ensure_ascii=False, indent=2)
+        }, ensure_ascii=False)
 
     # 第二段：最新交易日当常量传进去做等值比较
     try:
@@ -412,9 +424,9 @@ def screen_stocks(
         "as_of": as_of.isoformat() if as_of else None,
         "count": len(rows),
         "sector_source": _sector_source_note(from_meta, from_fallback),
-        "candidates": rows,
+        "candidates": compact_rows(rows, _DIGITS),
     }
-    return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    return json.dumps(result, ensure_ascii=False, default=str)
 
 
 def _sector_source_note(from_meta: int, from_fallback: int) -> str:

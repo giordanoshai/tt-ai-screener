@@ -46,7 +46,7 @@ reasons 写「期权资金偏空（净 −10%）」，旁边 `flow.net_premium` 
 """
 import json
 
-from core import (catalyst, cn_signals, fundamental, regime, scoring,
+from core import (catalyst, cn_signals, fundamental, options, regime, scoring,
                   snapshot)
 from db import pg
 
@@ -322,6 +322,26 @@ def scan_swing(market: str = "US", horizon: str = "short",
                         flow, window="实时接口（取不到时退回库里的，看 source）",
                         used_for_score=False)
 
+        # ---- 7. 给最终入选的票补「期权现在贵不贵 + 今天的量是平时几倍」----
+        # 只对入选的这十几只、两次数据库查询，不走外部接口。
+        # 做波段的人拿它决定**用正股进还是用期权进**：IV 排名 80 以上时
+        # 买期权是在付一年里最高的价，同样看多的判断该改成买正股。
+        # 这两张表每天只覆盖四五百只，取不到的票就没有这几个字段。
+        if market == "US" and rows:
+            final_codes = [r["ticker"] for r in rows]
+            iv = _try("隐含波动率",
+                      lambda: options.iv_snapshot(final_codes), {})
+            opt_vol = _try("期权量能",
+                           lambda: options.flow_volume(final_codes), {})
+            for row in rows:
+                one = iv.get(row["ticker"])
+                if one:
+                    row["iv_rank"] = one["iv_rank"]
+                    row["implied_move_pct"] = one["implied_move_pct"]
+                one = opt_vol.get(row["ticker"])
+                if one:
+                    row["options_volume_vs_30d"] = one["volume_vs_30d"]
+
         fresh = _try(f"{market} 行情新鲜度",
                      lambda: regime.freshness(market), None)
         warnings = _freshness_warnings(market, fresh) if fresh else []
@@ -350,7 +370,7 @@ def scan_swing(market: str = "US", horizon: str = "short",
                            lambda: regime.get(market), None),
             "warnings": warnings,
             "data_gaps": sorted(set(gaps)),
-        }, ensure_ascii=False, indent=2, default=str)
+        }, ensure_ascii=False, default=str)
 
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)

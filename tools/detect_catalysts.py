@@ -73,7 +73,7 @@ min_significance="Low"`）按票扇出后是 254 KB、377 条事件、只有 239
 """
 import json
 
-from core import catalyst, regime, snapshot
+from core import catalyst, options, regime, snapshot
 from db import pg
 
 SCOPES = ("positions", "watchlist", "market")
@@ -266,7 +266,7 @@ def detect_catalysts(scope: str = "positions", hours: int = 24,
                                "truncated": False, "warnings": [],
                                "data_gaps": [],
                                "message": "持仓和自选都是空的，没什么可看的"},
-                              ensure_ascii=False, indent=2)
+                              ensure_ascii=False)
 
         wanted = sorted(filter_set) if filter_set else None
         gaps: list[str] = []
@@ -384,10 +384,21 @@ def detect_catalysts(scope: str = "positions", hours: int = 24,
                        f"{'持仓' if scope == 'positions' else '关注范围内'}"
                        f"没有达到 {min_significance} 级别的消息")
 
+        # 全市场的高管在买还是在卖。单看一只票噪音太大（高管卖股票可能只是
+        # 要交税），几百笔合起来才看得出风向，所以放在这里当一条大盘背景，
+        # 不挂到具体某只票下面。2026-09-03 补上——这张表天天在写，
+        # 而本仓库此前一行都没读过。
+        try:
+            insider_tide = options.insider_tide()
+        except Exception as exc:
+            insider_tide = None
+            gaps.append(f"全市场内部人买卖拉取失败：{exc}")
+
         return json.dumps({
             "scope": scope,
             "hours": hours,
             "min_significance": min_significance,
+            "market_insider": insider_tide,
             "events": returned,
             "event_count": event_count,
             "returned_count": len(returned),
@@ -395,7 +406,7 @@ def detect_catalysts(scope: str = "positions", hours: int = 24,
             "warnings": warnings,
             "data_gaps": sorted(set(gaps)),
             "message": message,
-        }, ensure_ascii=False, indent=2, default=str)
+        }, ensure_ascii=False, default=str)
 
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)

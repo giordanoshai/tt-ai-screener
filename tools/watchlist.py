@@ -17,6 +17,20 @@ import json
 
 import config
 from db import pg
+from tools.compact import compact_rows
+
+# 这个工具一度是 12 个里最费 token 的一个：2026-09-03 实测 155 只自选
+# 一次返回 66,672 字符（约 22,000 token），比第二名还大三倍。压完 42,001，
+# 省 38%。省下的全是格式，信息一点没少——怎么压、为什么这么压，
+# 见 `tools/compact.py`。
+
+#: 每个数字字段保留几位小数。**逐个字段写**，量级的坑见 `tools/compact.py`。
+#: 这七个都是价格或百分点（`pct_chg` 是 2.61 表示涨 2.61%），所以都能截 2 位。
+_DIGITS = {"close": 2, "pct_chg": 2, "rsi_14": 1, "ma_20": 2,
+           "ma_50": 2, "ma_200": 2, "vol_ratio": 2}
+
+#: 只留日期的那两列。`created_at` 是 timestamptz，`date` 是 date。
+_DATE_ONLY = ("date", "created_at")
 
 
 # 自选池的行情快照。三层左连接，所以票即使没有基本信息、没有行情，
@@ -62,10 +76,15 @@ _LIST_SQL = """
 
 
 def list_watchlist() -> str:
-    """列出自选池里全部股票，带最新价、当日涨跌和关键技术指标。"""
+    """列出自选池里全部股票，带最新价、当日涨跌和关键技术指标。
+
+    价格和均线保留 2 位小数、RSI 保留 1 位，时间只到天。
+    某只票当天没有行情时，对应字段是 null（票本身照样在列表里）。
+    """
     try:
         rows = pg.query(_LIST_SQL)
-        return json.dumps(rows, ensure_ascii=False, indent=2, default=str)
+        return json.dumps(compact_rows(rows, _DIGITS, _DATE_ONLY),
+                          ensure_ascii=False, default=str)
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
