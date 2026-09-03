@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+### [2026-09-03] 部署改走 GitHub，不再走本机裸仓库
+
+用户把 GitHub 仓库私有化并在服务器上配了持久凭据之后，部署通道从
+「本地 → 本机裸仓库 → 服务器」改成「本地 → GitHub → 服务器」。
+
+* **修改 (Changed)**: `scripts/deploy.sh` 推 `origin`（GitHub）而不是 `server`
+  （裸仓库），服务器那边 `git remote set-url origin` 指到 GitHub 再 fetch。
+  脚本里每次都校正一遍 origin——这台机器上的仓库历史上指过裸仓库，
+  **指错了拉到的是一份过期代码而且不会报错**（tt-data-hub 2026-09-02
+  就因为 origin 指着一个 `/tmp` 里的临时打包文件，差点把服务器退回一个月前）。
+* **修复 (Fixed)**: 服务器上 `git remote` 已经改好。凭据是
+  `credential.helper=store`（token 在 `~/.git-credentials`，权限 600），
+  HTTPS 拉私有仓库不用交互。**SSH 那条路不通**：服务器 known_hosts 里
+  没有 github.com，`git@github.com:` 形式报 Host key verification failed。
+* **保留**: 本机的 `server` remote 和服务器上的裸仓库都留着当后备，
+  日常不再用。
+
 ### [2026-09-03] 省掉三成 token；四张天天在写、这边一行没读过的表接上了
 
 起因是两个问题：「省 token 还有别的地方吗」和「工具齐不齐，别有了数据没工具」。
