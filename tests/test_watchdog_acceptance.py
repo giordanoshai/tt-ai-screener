@@ -123,41 +123,55 @@ def _support_bar(day, close, volume=8e7):
 
 
 def _support_bars():
-    """构造一份**算得出支撑位**的日线：
+    """构造一份**算得出支撑位**的日线，且真的会触发 1.2% 合并阈值。
 
-    * 前 90 天铺平在 `_SUPPORT_BASE`（跟现价一样）——这些天会被
+    * 前 110 天铺平在 `_SUPPORT_BASE`（跟现价一样）——这些天会被
       `compute()` 的方向过滤器天然滤掉（支撑要求价格严格低于现价，
       等于现价的不算），起「垫场」作用，不产生干扰。
-    * 后 40 天是真正的戏肉：两个靠得很近的低点（85.00 和 85.90，
-      相差 1.06%，在 1.2% 合并阈值以内——应该被合并成一个）+
-      一个离得更远的独立低点（81.00，相差 6.05%——应该单独留下）。
+    * 后 25 天（正好等于 `levels.NEAR_WIN`，所以整段尾巴都落在
+      `compute()` 的「近档」窗口里，不用去操心「远档」那道
+      `FAR_MIN_TOUCHES`——历史至少被测试过 2 次——的门槛）是真正的
+      戏肉，三个局部低点：
+        - D1 = 85.50（第 6 天）
+        - D2 = 86.30（第 14 天），跟 D1 只差 0.94%，在 1.2% 合并
+          阈值以内——**这两个是不同的数字**，靠得近才应该被合并，
+          不是同一个数字在两个尺度上重复算出来
+        - D3 = 80.00（第 20 天），离 D2 有 7.9%，在阈值以外——
+          应该单独留下
     * 最后一天收回 `_SUPPORT_BASE`，也就是当前价。
 
-    这份数据是先用脚本跑过 `levels.compute()` 验证过的：算出来
-    正是「85.90 + 81.00」两档，跟下面测试里断言的一致。
+    **踩过的坑，写下来防止后人重犯**：这份数据的第一版把两个近似价位
+    放在 40 天长的尾巴里、间隔 6 天（第 10、16 天），本意是让它们都
+    进「近档」（`compute()` 用 `bars[-25:]` 取近档窗口）。但 40 天尾巴
+    只有最后 25 天落在近档窗口里，第 10 天被切在窗口外，于是那两个
+    近似价位里有一个从未进入候选名单，最终真正合并掉的是「近档」和
+    「中档」两个尺度各自独立算出的**同一个数字**（差距 0%，不是
+    1.06%）——测试断言的结果没错，但注释说的「1.2% 以内合并」这件事
+    根本没发生。复查（见 `task-7-report.md`）用
+    `core.levels.local_extremes()` / `touch_count()` 逐步跑过一遍
+    验证到这一点。现在把尾巴缩到正好 25 天，两个近似价位就都稳稳落在
+    近档窗口里，不用再跟远档的历史测试次数门槛打交道。
     """
     start = datetime.date(2026, 1, 1)
+    pad_days = 110
     bars = [_support_bar(start + datetime.timedelta(days=i), _SUPPORT_BASE)
-            for i in range(90)]
+            for i in range(pad_days)]
 
-    day0 = start + datetime.timedelta(days=len(bars))
-    closes = [_SUPPORT_BASE] * 40
-    # 低点组一：两个局部低点，价格靠得很近 → 应该被合并成一个
-    closes[10] = 85.00
-    closes[16] = 85.90
-    # 低点组二：一个独立低点，离组一够远 → 应该单独留下
-    closes[24] = 81.00
-    # 给两组低点搭个像样的坡，让它们经得起前后两天不低于它的局部低点判定
-    ramp = {
-        8: 87.5, 9: 86.2, 11: 86.3, 12: 87.0,
-        14: 87.5, 15: 86.5, 17: 86.6, 18: 87.3,
-        22: 84.0, 23: 82.5, 25: 82.6, 26: 84.0,
+    day0 = start + datetime.timedelta(days=pad_days)
+    tail_days = 25                          # == levels.NEAR_WIN
+    closes = [_SUPPORT_BASE] * tail_days
+    overrides = {
+        4: 87.5, 5: 86.5,
+        6: 85.50,           # D1：近档局部低点
+        7: 86.0, 8: 87.0, 9: 87.5, 10: 88.0, 11: 87.5, 12: 87.0, 13: 86.5,
+        14: 86.30,          # D2：近档局部低点，跟 D1 差 0.94%（应合并）
+        15: 86.8, 16: 87.5, 17: 88.0, 18: 86.0, 19: 83.0,
+        20: 80.00,          # D3：独立低点，跟 D2 差 7.9%（不该合并）
+        21: 82.0, 22: 85.0, 23: 88.0,
     }
-    for i, v in ramp.items():
+    for i, v in overrides.items():
         closes[i] = v
-    # 27 天之后一路走平回到现价，直到最后一天
-    for i in range(27, 40):
-        closes[i] = _SUPPORT_BASE
+    closes[tail_days - 1] = _SUPPORT_BASE   # 最后一天回到现价
 
     bars += [_support_bar(day0 + datetime.timedelta(days=i), c)
              for i, c in enumerate(closes)]
@@ -177,15 +191,22 @@ def test_support_levels_are_sorted_from_near_to_far():
 
 
 def test_support_levels_within_merge_band_are_combined():
-    """挨得太近（1.2% 以内）的支撑位被合并成一个。
+    """挨得太近（1.2% 以内）的支撑位被合并成一个，且合并的是两个不同的数字。
 
-    85.00 和 85.90 只差 1.06%，在合并阈值以内，应该只剩一个
-    （留下离现价更近的 85.90，85.00 被吞掉）。81.00 离 85.90 有 6.05%，
-    在阈值以外，应该单独留下。
+    `_support_bars()` 里的 D1=85.50 和 D2=86.30 只差 0.94%，在 1.2%
+    合并阈值以内，应该只剩一个（留下离现价更近的 86.30，85.50 被
+    吞掉）；D3=80.00 离 86.30 有 7.9%，在阈值以外，应该单独留下。
+
+    **这条测试真的在守 1.2% 这道边界**——复查时验证过：把
+    `core.levels.MERGE_BAND` 从 0.012 临时改成 0.0001 再跑一遍
+    `levels.compute()`，D1/D2 不再合并，输出变成 `[86.3, 85.5]`，
+    这条断言会失败；改回 0.012 后重新变回 `[86.3, 80.0]`，断言通过。
+    验证用的是一次性脚本（不进版本库），`core/levels.py` 本身没有
+    被这次验证改动过。
     """
     lv = levels.compute(_support_bars(), warn_dist=0.01)
     prices = [round(item["price"], 2) for item in lv["support"]]
-    assert prices == [85.90, 81.0], "实际算出来的支撑位是 %r" % prices
+    assert prices == [86.30, 80.0], "实际算出来的支撑位是 %r" % prices
 
 
 def test_support_warn_line_sits_above_the_price():
