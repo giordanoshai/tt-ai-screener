@@ -219,3 +219,43 @@ class TestGetBothMarkets:
             got = quotes.get({"CN": ["601138.SH"], "US": ["AAPL"]})
         assert "AAPL" in got
         assert "601138.SH" not in got
+
+
+class TestDataDate:
+    """报价要带上「这是哪一天的数据」。
+
+    2026-09-04 首次上线撞到的：盘前 UW 还没有当天的分钟线，取到的是前一天
+    收盘那批，于是推出去两条「假突破」——内容全对（ORCL 确实在 9/3 冲到
+    156.77 撞了 156.22 又跌回 154.38），但那是昨天收盘时发生的事，在盘前
+    看到会以为正在发生。下游要能看出时点，才能在文案里标明。
+    """
+
+    def test_us_quote_carries_the_latest_trading_date(self):
+        with patch.object(quotes.uw, "available", return_value=True), \
+             patch.object(quotes.uw, "get_many",
+                          return_value={
+                              "/api/stock/AAPL/ohlc/1m": UW_BARS_MULTIDAY}):
+            got = quotes.us_quotes(["AAPL"])
+        assert got["AAPL"]["as_of"] == "2026-09-03", (
+            "要的是最新那个美东交易日，不是数组里最早的 09-02")
+
+    def test_as_of_is_none_when_no_date_can_be_parsed(self):
+        """解析不出日期时给 None——宁可不标时点，也不能标错。"""
+        bad = [dict(b, start_time="不是时间") for b in UW_BARS_MULTIDAY]
+        with patch.object(quotes.uw, "available", return_value=True), \
+             patch.object(quotes.uw, "get_many",
+                          return_value={"/api/stock/AAPL/ohlc/1m": bad}):
+            got = quotes.us_quotes(["AAPL"])
+        assert got["AAPL"]["as_of"] is None
+
+    def test_cn_quote_carries_beijing_today(self):
+        """A股快照没有日期字段，但它只在交易时段被调用，必然是北京当天。"""
+        import datetime
+        from core import session as session_mod
+        expect = datetime.datetime.now(datetime.timezone.utc).astimezone(
+            session_mod.CN_TZ).date().isoformat()
+        with patch.object(quotes.akshare, "available", return_value=True), \
+             patch.object(quotes.akshare, "spot_snapshot",
+                          return_value=[SINA_ROW]):
+            got = quotes.cn_quotes(["601138.SH"])
+        assert got["601138.SH"]["as_of"] == expect

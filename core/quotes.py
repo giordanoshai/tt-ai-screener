@@ -69,6 +69,12 @@ def cn_quotes(tickers: list[str]) -> dict[str, dict]:
 
     # 走 akshare 模块的公开函数，不越层去调它的私有 `_get`：超时该给多少
     # （快照 60 秒、小时线 20 秒）是那个模块自己的事，这里不该知道。
+    # 新浪快照给的是「此刻」的行情，返回里没有日期字段。这个函数只在
+    # A股交易时段被调用（watchdog 先判时段再分流），所以数据必然是北京
+    # 当天的——把这个日期标出来，下游才能判断该不该在推送里注明时点。
+    as_of = datetime.datetime.now(datetime.timezone.utc).astimezone(
+        session.CN_TZ).date().isoformat()
+
     try:
         rows = akshare.spot_snapshot()
     except Exception as exc:
@@ -85,7 +91,7 @@ def cn_quotes(tickers: list[str]) -> dict[str, dict]:
         ticker = wanted.get(code)
         if not ticker:
             continue
-        quote = {"session": "cn", "source": "akshare"}
+        quote = {"session": "cn", "source": "akshare", "as_of": as_of}
         for cn_key, key in _SINA_FIELDS.items():
             quote[key] = _f(row.get(cn_key))
         if quote.get("last"):
@@ -192,6 +198,11 @@ def us_quotes(tickers: list[str]) -> dict[str, dict]:
             "volume": _f(newest.get("total_volume")) or 0.0,
             "session": newest.get("market_time") or "r",
             "source": "uw",
+            # 这批数据对应的**美东交易日**。盘前 UW 往往还没有当天的分钟线，
+            # 取到的是前一天收盘那批——下游必须能看出这一点，否则推出去的
+            # 「假突破」会被当成正在发生的事。解析不出日期时给 None，
+            # 下游据此不做时点标注（宁可不标，不能标错）。
+            "as_of": latest_us_date.isoformat() if latest_us_date else None,
         }
     return out
 

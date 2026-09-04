@@ -318,7 +318,7 @@ def run_once(state: dict, now_utc: datetime.datetime | None = None) -> list[dict
         for alert in got:
             if not _within_daily_cap(state, ticker, today):
                 continue          # 撞到保险丝，今天这只票不再打扰
-            ok = notify.send(notify.format_alert(alert, row))
+            ok = notify.send(notify.format_alert(alert, row, today))
             if not ok:
                 # 推送真的失败了（代理挂了、token 失效……）。这时候
                 # alerts.evaluate() 已经把这条报警计入冷却、

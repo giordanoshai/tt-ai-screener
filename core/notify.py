@@ -61,8 +61,14 @@ def _pct(a: float, b: float) -> float:
     return (a - b) / b * 100 if b else 0.0
 
 
-def format_alert(alert: dict, position: dict | None) -> str:
-    """把一条报警拼成推送文案。"""
+def format_alert(alert: dict, position: dict | None,
+                 today: str | None = None) -> str:
+    """把一条报警拼成推送文案。
+
+    `today` 是这只票所属市场的「今天」（`YYYY-MM-DD`，美股按美东算、
+    A股按北京算）。给了它，且报价里的 `as_of` 跟它对不上时，文案会
+    多一行说明这是哪天的数据——见下面那段注释。
+    """
     quote = alert.get("quote") or {}
     last = quote.get("last") or 0.0
     price = alert["price"]
@@ -91,6 +97,16 @@ def format_alert(alert: dict, position: dict | None) -> str:
         low = quote.get("low") or last
         lines.append("跌破 %.2f（%s），现价 %.2f，最低到过 %.2f" % (
             price, alert["label"], last, low))
+
+    # 数据不是「今天」的，必须说清楚。2026-09-04 首次上线就撞到了：
+    # 盘前 UW 还没有当天的分钟线，取到的是前一天收盘那批，于是推出去两条
+    # 「假突破」——内容全对（ORCL 确实在 9/3 冲到 156.77 撞了 156.22 又跌
+    # 回 154.38），但那是昨天收盘时发生的事，在盘前看到会以为正在发生。
+    # 信息本身有价值，不该压掉；但不标明时点就是误导。
+    as_of = quote.get("as_of")
+    if today and as_of and as_of != today:
+        lines.append("⏰ 这是 %s 收盘时的情况，不是刚刚发生"
+                     % as_of[5:].replace("-", "/"))
 
     if position and position.get("avg_cost"):
         cost = float(position["avg_cost"])

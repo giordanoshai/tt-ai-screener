@@ -195,3 +195,48 @@ class TestTitle:
         """手机通知栏经常只显示第一行，票代码必须在里面。"""
         head = notify.format_alert(_alert(), POSITION).split("\n")[0]
         assert "601138.SH" in head
+
+
+class TestDataDateNotice:
+    """数据不是「今天」的时候，文案必须说清楚。
+
+    盘前 UW 常常还没有当天的分钟线，取到的是前一天收盘那批。那条信息本身
+    有价值（持仓的票撞了坎没过去），不该压掉；但不标明时点就是误导——
+    用户会以为正在发生。
+    """
+
+    def _with_as_of(self, as_of):
+        alert = _alert()
+        alert["quote"] = dict(alert["quote"], as_of=as_of)
+        return alert
+
+    def test_stale_data_gets_a_timestamp_line(self):
+        text = notify.format_alert(
+            self._with_as_of("2026-09-03"), POSITION, today="2026-09-04")
+        assert "09/03" in text, text
+        assert "不是刚刚发生" in text, text
+
+    def test_same_day_data_gets_no_extra_line(self):
+        text = notify.format_alert(
+            self._with_as_of("2026-09-04"), POSITION, today="2026-09-04")
+        assert "不是刚刚发生" not in text
+
+    def test_without_today_it_stays_quiet(self):
+        """没传「今天」就不判断——不能凭空猜今天是哪天，那要时区。"""
+        text = notify.format_alert(self._with_as_of("2026-09-03"), POSITION)
+        assert "不是刚刚发生" not in text
+
+    def test_missing_as_of_stays_quiet(self):
+        """报价里没有 as_of（日期解析不出来）时不标注。"""
+        text = notify.format_alert(
+            self._with_as_of(None), POSITION, today="2026-09-04")
+        assert "不是刚刚发生" not in text
+
+    def test_the_notice_sits_before_the_position_line(self):
+        """读的顺序是：什么事 → 细节 → 什么时候的 → 我手上有多少。"""
+        text = notify.format_alert(
+            self._with_as_of("2026-09-03"), POSITION, today="2026-09-04")
+        lines = text.split("\n")
+        when = next(i for i, ln in enumerate(lines) if "不是刚刚发生" in ln)
+        held = next(i for i, ln in enumerate(lines) if "持仓" in ln)
+        assert when < held, "时点说明应该排在持仓那行之前：\n%s" % text
