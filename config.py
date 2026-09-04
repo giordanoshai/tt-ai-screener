@@ -70,12 +70,17 @@ AKSHARE_BASE_URL = os.getenv("AKSHARE_BASE_URL", "")
 # Telegram 机器人是复用用户已有的那个，token 和 chat id 得自己填进 .env——
 # 代码不猜、也不去别的项目里找。没配就直接报错退出，不静默不推送：
 # 一个「以为在盯盘、其实什么都没发」的进程比没有更糟。
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+# 键名两套都认，跟上面 UW 那段同一个道理：.env 里现成的是
+# TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / TELEGRAM_PROXY（别处也在用），
+# 而这套代码里写的是 TG_*。2026-09-04 首次冒烟就栽在这上面——config
+# 读到空字符串，`notify.available()` 返回 False，进程起来直接报错退出。
+# 不逼用户改 .env（那三个键可能别的脚本也在读），这里认两套，TG_* 优先。
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID", "")
 
 # 服务器在国内，Telegram 要走代理。形如 http://127.0.0.1:7890。
 # 留空表示直连。
-TG_PROXY = os.getenv("TG_PROXY", "")
+TG_PROXY = os.getenv("TG_PROXY") or os.getenv("TELEGRAM_PROXY", "")
 
 # 每轮间隔（秒）。一轮实测：A股快照 15 秒 + 美股 6 只并发 14 秒，
 # 60 秒绰绰有余。

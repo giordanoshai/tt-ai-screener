@@ -67,9 +67,18 @@ class TestFormat:
 
 
 class TestSend:
+    """发送路径的测试。
+
+    每条都必须把 `config.TG_PROXY` 一起 patch 掉——否则测试会读到运行这台
+    机器上的真实代理配置，别人换个代理就能把测试弄红。2026-09-04 真的发生
+    过：本机配置从裸地址改成 SOCKS 地址之后，`test_send_calls_post_once`
+    立刻红了。红得有道理（SOCKS 确实发不出去），但那不是这条用例想测的东西。
+    """
+
     def test_send_calls_post_once(self):
         with patch.object(config, "TG_BOT_TOKEN", "T"), \
              patch.object(config, "TG_CHAT_ID", "C"), \
+             patch.object(config, "TG_PROXY", ""), \
              patch.object(notify, "_post", return_value={"ok": True}) as spy:
             assert notify.send("hi") is True
         assert spy.call_count == 1
@@ -83,5 +92,106 @@ class TestSend:
         """推送失败不能把盯盘进程搞挂——下一轮还要继续跑。"""
         with patch.object(config, "TG_BOT_TOKEN", "T"), \
              patch.object(config, "TG_CHAT_ID", "C"), \
+             patch.object(config, "TG_PROXY", ""), \
              patch.object(notify, "_post", side_effect=RuntimeError("boom")):
             assert notify.send("hi") is False
+
+
+class TestProxyNormalization:
+    """代理地址的规范化。
+
+    下面两种配错都是 2026-09-04 首次真实冒烟踩到的，共同点是**静默失败**——
+    推送发不出去，但只表现为超时后返回 False，谁都看不出真正的原因。
+    """
+
+    def test_empty_means_direct_connection(self):
+        """空值是合法配置，表示直连。"""
+        assert notify.normalize_proxy("") == ""
+        assert notify.normalize_proxy(None) == ""
+        assert notify.normalize_proxy("   ") == ""
+
+    def test_bare_host_port_gets_http_prefix(self):
+        """没写协议头时，urllib 会把冒号前的 `127.0.0.1` 当成协议名去解析，
+        代理配置直接失效、退化成直连。补一个 http:// 才认得。"""
+        assert notify.normalize_proxy("127.0.0.1:7890") == "http://127.0.0.1:7890"
+
+    def test_existing_scheme_is_left_alone(self):
+        assert notify.normalize_proxy(
+            "http://127.0.0.1:1081") == "http://127.0.0.1:1081"
+
+    def test_socks_is_rejected_not_silently_ignored(self):
+        """**Python 标准库不支持 SOCKS**，`ProxyHandler` 只认 HTTP/HTTPS。
+        必须返回 None 让调用方明确报错，不能假装能用。"""
+        assert notify.normalize_proxy("socks5://127.0.0.1:1080") is None
+        assert notify.normalize_proxy("socks4://127.0.0.1:1080") is None
+        assert notify.normalize_proxy("SOCKS5://127.0.0.1:1080") is None
+
+    def test_send_refuses_socks_and_explains_why(self, capsys):
+        """配了 SOCKS 时绝不能静默走直连——那会超时十几秒然后返回 False，
+        看日志完全不知道该改什么。必须一行说清。"""
+        with patch.object(config, "TG_BOT_TOKEN", "T"), \
+             patch.object(config, "TG_CHAT_ID", "C"), \
+             patch.object(config, "TG_PROXY", "socks5://127.0.0.1:1080"), \
+             patch.object(notify, "_post") as spy:
+            assert notify.send("hi") is False
+        spy.assert_not_called(), "配了 SOCKS 就不该再去发请求"
+        err = capsys.readouterr().err
+        assert "SOCKS" in err and "HTTP" in err
+
+    def test_send_hands_post_the_normalized_address(self):
+        """裸地址补上 http:// 之后才交给发请求那一层。"""
+        with patch.object(config, "TG_BOT_TOKEN", "T"), \
+             patch.object(config, "TG_CHAT_ID", "C"), \
+             patch.object(config, "TG_PROXY", "127.0.0.1:1081"), \
+             patch.object(notify, "_post", return_value={"ok": True}) as spy:
+            assert notify.send("hi") is True
+        assert spy.call_args[0][2] == "http://127.0.0.1:1081"
+
+    def test_send_failure_now_says_which_route_it_tried(self, capsys):
+        """失败日志要说清是直连还是经代理——这是排查的第一个分岔口。"""
+        with patch.object(config, "TG_BOT_TOKEN", "T"), \
+             patch.object(config, "TG_CHAT_ID", "C"), \
+             patch.object(config, "TG_PROXY", "127.0.0.1:1081"), \
+             patch.object(notify, "_post", side_effect=RuntimeError("boom")):
+            assert notify.send("hi") is False
+        assert "http://127.0.0.1:1081" in capsys.readouterr().err
+
+
+class TestTitle:
+    """推送标题的格式。
+
+    这个 Telegram 机器人是跟别的系统共用的（交易执行那套发出来的是
+    「【SOS】✅ 已买入 · SLV …」），所以盯盘发的每一条都必须带自己的来源
+    标识，否则手机上几个系统的通知混在一起没法看。
+    """
+
+    def test_every_alert_carries_the_source_prefix(self):
+        for kind in ("接近预警", "有效突破", "假突破", "跌破"):
+            text = notify.format_alert(_alert(kind=kind), POSITION)
+            assert text.startswith(notify.PREFIX), (
+                "%s 这一类的推送没带来源标识：%s" % (kind, text.split("\n")[0]))
+
+    def test_each_kind_gets_a_distinct_icon(self):
+        """四类信号四个图标——扫一眼就知道是好事还是坏事，不用读完整句。"""
+        icons = {}
+        for kind in ("接近预警", "有效突破", "假突破", "跌破"):
+            head = notify.format_alert(
+                _alert(kind=kind), POSITION).split("\n")[0]
+            icons[kind] = head[len(notify.PREFIX):].split(" ")[0]
+        assert len(set(icons.values())) == 4, (
+            "四类信号的图标应该各不相同，实际是 %r" % icons)
+
+    def test_title_helper_shape(self):
+        assert notify.title("🟢", "已启动") == "【盯盘】🟢 已启动"
+
+    def test_session_tag_still_shows_after_the_title(self):
+        """盘前盘后的标记不能被标题挤掉——那是信号成色的提示。"""
+        head = notify.format_alert(
+            _alert(session="po"), POSITION).split("\n")[0]
+        assert head.startswith(notify.PREFIX)
+        assert "盘后" in head
+
+    def test_ticker_is_in_the_first_line(self):
+        """手机通知栏经常只显示第一行，票代码必须在里面。"""
+        head = notify.format_alert(_alert(), POSITION).split("\n")[0]
+        assert "601138.SH" in head

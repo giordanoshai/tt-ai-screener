@@ -18,10 +18,26 @@
 而盯盘提醒的全部价值就在于「不用再查」。
 """
 import json
+import sys
 import urllib.parse
 import urllib.request
 
 import config
+
+#: 推送标题的来源标识。这个 Telegram 机器人是跟别的系统共用的
+#: （交易执行那套发出来的是「【SOS】✅ 已买入 · …」），所以每条消息
+#: 开头必须能一眼认出是谁发的，否则手机上几个系统的通知混在一起没法看。
+PREFIX = "【盯盘】"
+
+#: 每类信号配一个图标，扫一眼就知道是好事还是坏事，不用读完整句。
+#: 挑的是语义最直白的几个：对勾=成了、红叉=没成、下三角=跌了、
+#: 黄牌=还没到但快了。
+_KIND_ICON = {
+    "接近预警": "⚠️",
+    "有效突破": "✅",
+    "假突破": "❌",
+    "跌破": "🔻",
+}
 
 #: 时段代号 → 给人看的说法。盘前盘后要标出来，
 #: 那时候流动性差（盘前只占全天成交量 1%~2%），信号成色不一样。
@@ -52,7 +68,8 @@ def format_alert(alert: dict, position: dict | None) -> str:
     price = alert["price"]
     kind = alert["kind"]
 
-    head = "%s · %s" % (alert["ticker"], _KIND_LINE.get(kind, kind))
+    head = title(_KIND_ICON.get(kind, "•"),
+                 "%s · %s" % (_KIND_LINE.get(kind, kind), alert["ticker"]))
     tag = _SESSION_LABEL.get(quote.get("session") or "")
     if tag:
         head += "  [%s]" % tag
@@ -90,6 +107,51 @@ def format_alert(alert: dict, position: dict | None) -> str:
     return "\n".join(lines)
 
 
+def title(icon: str, headline: str) -> str:
+    """拼推送的第一行：`【盯盘】<图标> <说什么事>`。
+
+    统一从这里出，是为了让盯盘发的每一条——报警、启动通知、故障告警——
+    在手机上长一个样、一眼认得出来源。
+    """
+    return "%s%s %s" % (PREFIX, icon, headline)
+
+
+def _warn(message: str) -> None:
+    """往 stderr 写一行。
+
+    用 `print(..., file=...)` 而不是 `sys.stderr.write`，省掉手写换行——
+    少一个容易写错的地方。推送这条路上的每一次失败都必须留痕：
+    盯盘进程最糟的失败模式就是「在跑，但什么都没发出去」。
+    """
+    print(message, file=sys.stderr)
+
+
+def normalize_proxy(proxy: str):
+    """把配置里的代理地址规范成 urllib 认得的样子。
+
+    返回 `""` 表示直连（合法配置），返回 `None` 表示**这个代理根本用不了**，
+    调用方必须明确报错，不能假装直连。
+
+    两种配错要在这里挡住，都是 2026-09-04 首次冒烟真实踩到的：
+
+    1. **没写协议头**（`127.0.0.1:7890`）。urllib 会把冒号前面的
+       `127.0.0.1` 当成协议名去解析，代理配置直接失效、退化成直连，
+       然后连 Telegram 超时。补一个 `http://` 就好。
+
+    2. **SOCKS 代理**（`socks5://…`）。**Python 标准库不支持 SOCKS**，
+       `urllib.request.ProxyHandler` 只认 HTTP/HTTPS 代理。配了也是白配，
+       表现跟第一种一样是静默超时。这里直接挡下并说清原因——多数代理软件
+       同时开着 HTTP 端口，换一个端口就行，不值得为此引入新依赖。
+    """
+    text = (proxy or "").strip()
+    if not text:
+        return ""                       # 空 = 直连，合法
+    scheme = text.split("://", 1)[0].lower() if "://" in text else ""
+    if scheme.startswith("socks"):
+        return None                     # 标准库用不了，交给调用方报错
+    return text if scheme else "http://" + text
+
+
 def _post(url: str, data: bytes, proxy: str):
     """真正发请求的那一层。异常照抛，由 `send()` 吞掉。
 
@@ -118,8 +180,19 @@ def send(text: str) -> bool:
         "text": text,
         "disable_web_page_preview": "true",
     }).encode("utf-8")
+    proxy = normalize_proxy(config.TG_PROXY)
+    if proxy is None:
+        # 配了 SOCKS 代理。不能静默走直连——那会超时十几秒然后返回 False，
+        # 看日志完全不知道该改什么。说清楚，让人一眼看出问题在哪。
+        _warn("推送发不出去：TG_PROXY 配的是 SOCKS 代理（%s），"
+              "而 Python 标准库的 urllib 只支持 HTTP/HTTPS 代理。"
+              "请改配代理软件的 HTTP 端口（多数软件两个端口同时开着）。"
+              % config.TG_PROXY)
+        return False
     try:
-        _post(url, data, config.TG_PROXY)
+        _post(url, data, proxy)
         return True
-    except Exception:
+    except Exception as exc:
+        _warn("推送失败（%s）：%r" % (
+            "经代理 " + proxy if proxy else "直连", exc))
         return False

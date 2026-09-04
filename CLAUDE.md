@@ -278,7 +278,16 @@ AKSHARE_BASE_URL=...       # 自建 AKTools（AKShare 的 HTTP 封装），跟 t
                             # 不配也不会坏，只是 A股小时线退回库里那 150 只
 TG_BOT_TOKEN=...           # 盯盘推送用的 Telegram 机器人（复用已有的那个）
 TG_CHAT_ID=...             # 推给谁
-TG_PROXY=...               # 服务器在国内，Telegram 要走代理，形如 http://127.0.0.1:7890
+                            # 这两个键【TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+                            # 也认】，config.py 两套都读、TG_* 优先。跟 UW 那对
+                            # 历史遗留键名同一个处理方式，不用改已有配置
+TG_PROXY=...               # Telegram 要走代理（TELEGRAM_PROXY 也认）。
+                            # 【必须是 HTTP 代理，不能是 SOCKS】——Python 标准库的
+                            # urllib 只支持 HTTP/HTTPS 代理。配 socks5:// 会被
+                            # core/notify.py 挡下并明确报错，不会静默超时。
+                            # 多数代理软件 HTTP 和 SOCKS 两个端口同时开着
+                            # （实测本机 1080 两种协议都听、服务器 HTTP 在 1081），
+                            # 换个端口就行。不写协议头的裸地址会自动补 http://
 WATCHDOG_INTERVAL=60       # 盯盘每轮间隔秒数
 WATCHDOG_WARN_DIST=0.01    # 预警线距关键位多远（小数），默认提前 1%
 WATCHDOG_PREMARKET=1       # 美股盘前要不要盯，默认要

@@ -228,10 +228,10 @@ def _track_quote_failures(state: dict, wanted: dict, quote_map: dict,
         label = _market_label(market)
         _log(now_utc, "%s 连续 %d 轮一只报价都没拿到，已告警"
              % (label, QUOTE_FAIL_ALERT_ROUNDS))
-        notify.send(
-            "盯盘告警：%s 连续 %d 轮一只报价都拿不到。\n"
-            "进程还活着，但这个市场实际上已经没在盯了。"
-            % (label, QUOTE_FAIL_ALERT_ROUNDS))
+        notify.send(notify.title(
+            "🔴", "%s 连续 %d 轮一只报价都拿不到" % (
+                label, QUOTE_FAIL_ALERT_ROUNDS))
+            + "\n进程还活着，但这个市场实际上已经没在盯了。")
 
 
 def _us_session_of(quote: dict, active: list[str]) -> str:
@@ -367,11 +367,11 @@ def startup_notice() -> str:
     try:
         positions = load_positions() or []
     except Exception as exc:
-        return "盯盘已启动，但读不到持仓：%r" % (exc,)
+        return notify.title("🟡", "已启动，但读不到持仓：%r" % (exc,))
     cn = sum(1 for r in positions
              if (r.get("market") or "US").upper() == "CN")
-    return "盯盘已启动，当前盯 %d 只（A股 %d / 美股 %d）" % (
-        len(positions), cn, len(positions) - cn)
+    return notify.title("🟢", "已启动，当前盯 %d 只（A股 %d / 美股 %d）" % (
+        len(positions), cn, len(positions) - cn))
 
 
 def main() -> None:

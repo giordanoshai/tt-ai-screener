@@ -315,4 +315,7 @@ class TestObservability:
     def test_startup_notice_survives_a_dead_database(self):
         """读不到持仓也要发得出去——这条消息的价值就在于「它活着」。"""
         with patch("watchdog.pg.query", side_effect=RuntimeError("库连不上")):
-            assert "盯盘已启动" in watchdog.startup_notice()
+            text = watchdog.startup_notice()
+        assert text.startswith("【盯盘】"), "要带来源标识，实际：%s" % text
+        assert "已启动" in text
+        assert "读不到持仓" in text, "还要说清为什么报不出票数：%s" % text
