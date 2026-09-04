@@ -232,7 +232,32 @@ def run_once(state: dict, now_utc: datetime.datetime | None = None) -> list[dict
         for alert in got:
             if not _within_daily_cap(state, ticker, today):
                 continue          # 撞到保险丝，今天这只票不再打扰
-            notify.send(notify.format_alert(alert, row))
+            ok = notify.send(notify.format_alert(alert, row))
+            if not ok:
+                # 推送真的失败了（代理挂了、token 失效……）。这时候
+                # alerts.evaluate() 已经把这条报警计入冷却、
+                # _within_daily_cap() 也已经把配额记掉了——如果就这么
+                # 算了，就变成「已经进了 5 天冷却、占了今日配额，但
+                # 用户手机上什么都没有」，恰好是 config.py 里点名要
+                # 避免的「以为在盯盘、其实什么都没发」。所以推送失败
+                # 必须把这两笔记录都撤销，让下一轮能重试。
+                #
+                # key 的拼法必须跟 core/alerts.py 的 _key() 保持一致
+                # （"%s|%.2f" % (ticker, price)）——那是私有函数，
+                # 不 import，这里按同样格式在本地拼一次。
+                key = "%s|%.2f" % (ticker, alert["price"])
+                bucket = "warned" if alert["kind"] == "接近预警" else "fired"
+                state.setdefault(bucket, {}).pop(key, None)
+                daily = state.setdefault("daily", {})
+                if daily.get("total", 0) > 0:
+                    daily["total"] -= 1
+                by_ticker = daily.setdefault("by_ticker", {})
+                if by_ticker.get(ticker, 0) > 0:
+                    by_ticker[ticker] -= 1
+                sys.stderr.write(
+                    "推送失败，已撤销冷却和配额，下一轮重试：%s %s %.2f\n" % (
+                        ticker, alert["kind"], alert["price"]))
+                continue          # 失败的不进 fired，避免主循环把它当成功打印
             fired.append(alert)
 
     return fired

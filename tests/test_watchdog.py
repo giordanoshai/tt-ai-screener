@@ -138,6 +138,66 @@ class TestRunOnce:
         assert [a["kind"] for a in out] == ["假突破"]
         assert spy_send.call_count == 1
 
+    def test_daily_cap_blocks_before_send(self):
+        """保险丝必须挡在推送之前——这是集成测试兜底，纯函数
+        `_within_daily_cap` 本身已经在 TestDailyCap 测过，这里测的是
+        「顺序」：以后谁重构把两行位置换了，这条测试要能红。"""
+        state = watchdog.empty_state()
+        state["prev_last"]["601138.SH"] = 63.20
+        state["ticks"]["601138.SH|64.84"] = 1
+        bars = [{"date": datetime.date(2026, 9, 3), "open": 63.0,
+                 "high": 63.99, "low": 62.3, "close": 63.20,
+                 "volume": 9e7}]
+        quote = {"601138.SH": {"last": 63.55, "high": 65.30, "low": 63.30,
+                               "open": 63.84, "prev_close": 63.20,
+                               "volume": 6e7, "session": "cn",
+                               "source": "test"}}
+        fake_levels = {"resistance": [{"price": 64.84,
+                                       "label": "近期高收08-31",
+                                       "side": "resistance",
+                                       "warn_line": 64.19}],
+                       "support": []}
+        with patch("watchdog.pg.query", return_value=POSITIONS[:1]), \
+             patch("watchdog.load_bars", return_value=bars), \
+             patch("watchdog.levels.compute", return_value=fake_levels), \
+             patch("watchdog.quotes.get", return_value=quote), \
+             patch("watchdog._within_daily_cap", return_value=False), \
+             patch("watchdog.notify.send", return_value=True) as spy_send:
+            out = watchdog.run_once(state, _utc("2026-09-04 02:00"))
+        assert out == []
+        spy_send.assert_not_called()
+
+    def test_send_failure_is_not_silently_swallowed(self):
+        """推送失败不能被吞掉：不能出现在返回列表里，也不能占掉
+        冷却和配额——不然用户手机上什么都没有，但系统以为已经报过了，
+        下一轮不会重试。这正是 config.py 里点名要避免的
+        「以为在盯盘、其实什么都没发」。"""
+        state = watchdog.empty_state()
+        state["prev_last"]["601138.SH"] = 63.20
+        state["ticks"]["601138.SH|64.84"] = 1
+        bars = [{"date": datetime.date(2026, 9, 3), "open": 63.0,
+                 "high": 63.99, "low": 62.3, "close": 63.20,
+                 "volume": 9e7}]
+        quote = {"601138.SH": {"last": 63.55, "high": 65.30, "low": 63.30,
+                               "open": 63.84, "prev_close": 63.20,
+                               "volume": 6e7, "session": "cn",
+                               "source": "test"}}
+        fake_levels = {"resistance": [{"price": 64.84,
+                                       "label": "近期高收08-31",
+                                       "side": "resistance",
+                                       "warn_line": 64.19}],
+                       "support": []}
+        with patch("watchdog.pg.query", return_value=POSITIONS[:1]), \
+             patch("watchdog.load_bars", return_value=bars), \
+             patch("watchdog.levels.compute", return_value=fake_levels), \
+             patch("watchdog.quotes.get", return_value=quote), \
+             patch("watchdog.notify.send", return_value=False):
+            out = watchdog.run_once(state, _utc("2026-09-04 02:00"))
+        assert out == []
+        assert "601138.SH|64.84" not in state["fired"], "冷却记录必须撤销，下一轮才能重试"
+        assert state["daily"]["total"] == 0, "配额必须撤销"
+        assert state["daily"]["by_ticker"].get("601138.SH", 0) == 0
+
 
 class TestDailyCap:
     """保险丝：不是用来调节奏的，是防止算法出 bug 时把手机炸掉。"""
