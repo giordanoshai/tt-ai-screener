@@ -23,7 +23,7 @@ SINA_ROW = {
     "成交量": 61502500.0, "成交额": 3957047234.0, "时间戳": "11:30:00",
 }
 
-#: UW 1 分钟线的真实返回形状，**倒序**：第一行最新
+#: UW 1 分钟线的真实返回形状，**倒序**：第一行最新，同一交易日
 UW_BARS = [
     {"close": "327.70", "high": "327.9", "low": "327.5", "open": "327.6",
      "start_time": "2026-09-03T23:59:00Z", "volume": 716,
@@ -34,6 +34,25 @@ UW_BARS = [
     {"close": "324.85", "high": "325.0", "low": "324.0", "open": "324.2",
      "start_time": "2026-09-03T13:29:00Z", "volume": 8400,
      "total_volume": 450000, "market_time": "pr"},
+]
+
+#: UW 多日数据（跨越多个美东交易日）。
+#: 美东 2026-09-02 最后一根 + 美东 2026-09-03 所有根
+#: 注意：UW 返回倒序，第一行是最新的
+#: UTC 20:00 (美东 16:00，09-03 最晚) vs UTC 13:30 (美东 09:30，09-03 最早)
+UW_BARS_MULTIDAY = [
+    # 美东 2026-09-03 的数据（最新交易日最晚根）
+    {"close": "330.81", "high": "330.81", "low": "323.35", "open": "327.20",
+     "start_time": "2026-09-03T20:00:00Z", "volume": 1000,
+     "total_volume": 1000000, "market_time": "r"},
+    # 美东 2026-09-03 的数据（最新交易日最早根 - 应该被用于 open）
+    {"close": "328.40", "high": "328.40", "low": "323.53", "open": "324.62",
+     "start_time": "2026-09-03T13:30:00Z", "volume": 800,
+     "total_volume": 800000, "market_time": "r"},
+    # 美东 2026-09-02 的数据（前一个交易日，high/low/open 不应该用这个）
+    {"close": "317.15", "high": "317.15", "low": "316.71", "open": "316.90",
+     "start_time": "2026-09-02T23:50:00Z", "volume": 600,
+     "total_volume": 600000, "market_time": "r"},
 ]
 
 
@@ -85,15 +104,40 @@ class TestUsQuotes:
         assert got["AAPL"]["last"] == 327.70
         assert got["AAPL"]["session"] == "po"
 
-    def test_high_low_span_the_whole_day(self):
-        """当天最高最低要扫过所有分钟线，不能只看最新那一根——
-        「假突破」的判定要用当天盘中最高价。"""
+    def test_high_low_span_latest_trading_day(self):
+        """当天（最新交易日）最高最低要扫过所有分钟线，不能只看最新那一根——
+        「假突破」的判定要用当天盘中最高价。这条用单交易日数据测试。"""
         with patch.object(quotes.uw, "available", return_value=True), \
              patch.object(quotes.uw, "get_many",
                           return_value={"/api/stock/AAPL/ohlc/1m": UW_BARS}):
             got = quotes.us_quotes(["AAPL"])
         assert got["AAPL"]["high"] == 328.5
         assert got["AAPL"]["low"] == 324.0
+
+    def test_high_low_open_only_from_latest_trading_day(self):
+        """高低价和开盘价只反映最新交易日的数据，不跨日。
+
+        UW 返回的数据可能跨越多个美东交易日，但 high/low/open
+        只应该反映最新（最后）那一个交易日的值。
+
+        多日数据中：
+        - 美东 2026-09-02：high 317.15, low 316.71, open 316.90
+        - 美东 2026-09-03（最新）：high 330.81, low 323.35, open 324.62
+
+        正确答案应该是最新日的值，不是扫全部得出的 high 330.81, low 316.71。
+        """
+        with patch.object(quotes.uw, "available", return_value=True), \
+             patch.object(quotes.uw, "get_many",
+                          return_value={"/api/stock/AAPL/ohlc/1m": UW_BARS_MULTIDAY}):
+            got = quotes.us_quotes(["AAPL"])
+        # high 应该是最新交易日的最高价，不是全部数据的 330.81（碰巧相同）
+        assert got["AAPL"]["high"] == 330.81
+        # low 应该是最新交易日的最低价 323.35，不是全部数据的 316.71
+        assert got["AAPL"]["low"] == 323.35, \
+            "跨日数据中只用最新交易日，low 应该是 323.35 而非前一天的 316.71"
+        # open 应该是最新交易日最早那根的开盘价 324.62，不是全部数据末尾的 316.90
+        assert got["AAPL"]["open"] == 324.62, \
+            "open 应该是最新交易日最早那根的开盘价 324.62，不是 316.90"
 
     def test_none_payload_is_skipped(self):
         with patch.object(quotes.uw, "available", return_value=True), \

@@ -29,9 +29,10 @@ UW **没有「当前价」接口**——`/info`、`/quote`、`/price`、`/spot`
 `tests/conftest.py` 默认把底层取数换成抛异常的桩，正是靠这条约定
 才不会把所有测试打红。
 """
+import datetime
 import math
 
-from core import akshare, uw
+from core import akshare, session, uw
 
 #: 新浪快照里我们要的字段 → 统一结构的键名。
 _SINA_FIELDS = {
@@ -86,8 +87,25 @@ def cn_quotes(tickers: list[str]) -> dict[str, dict]:
     return out
 
 
+def _parse_utc_time(ts_str):
+    """把 ISO 8601 UTC 时间解析成 datetime.datetime（带 UTC 时区）。
+
+    接受 "2026-09-03T23:59:00Z" 这样的格式。
+    解析失败返回 None。
+    """
+    try:
+        # fromisoformat 不认 Z 后缀，先改成 +00:00
+        normalized = ts_str.replace("Z", "+00:00") if ts_str.endswith("Z") else ts_str
+        return datetime.datetime.fromisoformat(normalized)
+    except (ValueError, AttributeError):
+        return None
+
+
 def us_quotes(tickers: list[str]) -> dict[str, dict]:
-    """美股实时价。并发拉 1 分钟线，取最新一根当现价。"""
+    """美股实时价。并发拉 1 分钟线，取最新一根当现价。
+
+    高低价、开盘价只反映**最新交易日**（美东日期）的数据，不跨日。
+    """
     if not tickers or not uw.available():
         return {}
     # 指数代码喂给 /api/stock/... 一律 422，发出去只是白等十几秒
@@ -110,14 +128,45 @@ def us_quotes(tickers: list[str]) -> dict[str, dict]:
         last = _f(newest.get("close"))
         if not last:
             continue
-        highs = [h for h in (_f(r.get("high")) for r in rows) if h]
-        lows = [l for l in (_f(r.get("low")) for r in rows) if l]
+
+        # 按美东日期分组，只保留最新的一天
+        # 因为冬令时会跨 UTC 午夜，不能用 UTC 日期分组
+        rows_by_us_date = {}
+        latest_us_date = None
+        for row in rows:
+            utc_time = _parse_utc_time(row.get("start_time"))
+            if not utc_time:
+                continue
+            # 转换到美东时间（根据那一天的夏冬令时）
+            us_tz = session._us_tz(utc_time.date())
+            us_time = utc_time.astimezone(us_tz)
+            us_date = us_time.date()
+            if us_date not in rows_by_us_date:
+                rows_by_us_date[us_date] = []
+            rows_by_us_date[us_date].append(row)
+            if latest_us_date is None or us_date > latest_us_date:
+                latest_us_date = us_date
+
+        # 只用最新交易日的数据
+        if not latest_us_date or latest_us_date not in rows_by_us_date:
+            # 没有日期信息，就用全部行的兜底策略
+            latest_rows = rows
+        else:
+            latest_rows = rows_by_us_date[latest_us_date]
+
+        highs = [h for h in (_f(r.get("high")) for r in latest_rows) if h]
+        lows = [l for l in (_f(r.get("low")) for r in latest_rows) if l]
+        # open 是最新交易日最早（列表末尾）那根的开盘价
+        latest_open = None
+        if latest_rows:
+            latest_open = _f(latest_rows[-1].get("open"))
+
         out[ticker] = {
             "last": last,
-            # 当天最高最低要扫过所有分钟线——「假突破」判定要用盘中最高价
+            # 当天（最新交易日）最高最低扫过所有分钟线——「假突破」判定要用盘中最高价
             "high": max(highs) if highs else last,
             "low": min(lows) if lows else last,
-            "open": _f(rows[-1].get("open")) or last,
+            "open": latest_open or last,
             "prev_close": None,            # 分钟线里没有昨收，本功能用不到
             "volume": _f(newest.get("total_volume")) or 0.0,
             "session": newest.get("market_time") or "r",
