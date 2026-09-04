@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+### [2026-09-04] 盯盘关键位提醒：设计与可行性验证
+
+用户持有的 601138 当天冲到 65.30 又跌回 63.55，撞的是 8/31 的收盘高点
+64.84，但没有任何东西在盘中盯着，等他发现已经回落了。现有
+`watch_positions` 只报「已经发生」的事，而且必须用户开口才跑。
+
+* **新增 (Added)**: 设计文档
+  `docs/superpowers/specs/2026-09-04-盯盘关键位提醒-design.md`——
+  一个独立的盯盘守护进程，每分钟从 `user_positions` 读持仓、取实时价、
+  跟当天关键位比对，触发就推 Telegram。不新建数据库表，
+  「只写三张表」的规矩不破。
+* **验证 (Verified)**: 关键位算法在 601138 近 45 个交易日上回放了三版。
+  **第一版用「最高价」找位，漏掉了 09-04 这次**——8/28 那根冲到 66.69
+  又全吐回来的长上影线，把下面真正的阻力 64.84、64.50 全盖住了。
+  改用**收盘价**找位后抓到了（插针不算数，收得住才算数）。
+  再叠加「只推要动手的三类（假突破/有效突破/跌破）+ 同一个位 5 天内
+  不重复」，报警从 45 次降到 18 次、从 73% 的交易日在响降到 31%。
+* **记录 (Noted)**: 探测中发现两个属于 tt-data-hub 的问题，**修在那边**：
+  1. AKTools（地址见 `.env` 的 `AKSHARE_BASE_URL`）上**东方财富源整个挂了**，
+     所有 `_em` 后缀接口返回 500（`stock_zh_a_spot_em`、
+     `stock_bid_ask_em`、`stock_zh_a_hist_min_em`、`stock_zh_index_spot_em`）；
+     新浪源全部正常，`core/akshare.py` 用的正是新浪的
+     `stock_zh_a_minute`，**没受影响**。
+  2. 美股日线 2026-09-03 **只采到 106 只**，其他日子都是 2,094 只，
+     那一趟明显没跑完。
+* **记录 (Noted)**: 三个实时取数的坑，写进设计文档备查：
+  新浪小时线**对当天盘中只给成交量不给价格**（OHLC 全是 None），
+  所以 A 股盯盘只能走全市场快照；UW **没有「当前价」接口**
+  （`/info` `/quote` `/price` `/spot` 全返回 None），只能取 1 分钟线的
+  最新一根，且 **UW 返回的是倒序**（第一行最新）。
+
 ### [2026-09-03] 部署改走 GitHub，不再走本机裸仓库
 
 用户把 GitHub 仓库私有化并在服务器上配了持久凭据之后，部署通道从
@@ -275,7 +306,7 @@ All notable changes to this project will be documented in this file.
      401）。新增 `NormalizeMcpPath` 把裸路径改写成带斜杠的，对客户端透明。
 * **新增 (Added)**: `MCP_ALLOWED_HOSTS` 环境变量。MCP SDK 自带防 DNS 重绑定的
   Host 白名单，默认只放行 `127.0.0.1`/`localhost`/`[::1]`——**局域网直连
-  `192.168.1.38:8766` 和走 Cloudflare Tunnel 的 `mcp.你的域名` 默认都是
+  `（内网地址，见 .env）` 和走 Cloudflare Tunnel 的 `mcp.你的域名` 默认都是
   421**。没做成关掉防护，而是做成可配置的。
 * **新增 (Added)**: `tests/test_main.py` 的 `TestCombinedAppServesMCP`——
   真正起一次「网页 + MCP 同端口」的组合应用，跑一次完整 MCP 握手。
@@ -625,7 +656,7 @@ Tunnel）尚未开始；另外 `web/app.py` 里有一套跟 MCP 工具完全平�
 * **新增 (Added)**: 设计文档 [`docs/superpowers/specs/2026-08-28-统一数据层设计.md`](file:///d:/Dev_project/Python_Project/tt-trading-mcp/docs/superpowers/specs/2026-08-28-%E7%BB%9F%E4%B8%80%E6%95%B0%E6%8D%AE%E5%B1%82%E8%AE%BE%E8%AE%A1.md)。核心内容：把散在四个项目里的采集合并成独立的命令行采集程序 `tt-data-hub`（唯一写库角色），`tt-trading-mcp` 退化为只读消费端；A股经 AKShare 并入现有表（`market='CN'`，代码格式 `600519.SH`）；新增小时线层，只采「持仓 + 自选 + 粗筛命中」的活跃池约 400 只，复用 `stock_ohlcv_min` 的 `timeframe='1h'`。含建表 SQL、任务清单、定时排期、14 步不断档切换顺序与验收清单。
 * **新增 (Added)**: 实测确认 A股数据源可用性 —— 那台 AKShare 服务（AKTools 1.18.64）的**东方财富源全部返回 500**，方案改为只用新浪源：日线 `stock_zh_a_daily`、小时线 `stock_zh_a_minute`（单次 1970 根覆盖两年）、全市场快照 `stock_zh_a_spot`、市值 `stock_zh_a_gdhs`、财务 `stock_financial_abstract`。
 * **修复 (Fixed)**: 定位到一个**现存数据故障**并写入修复方案 —— `stock_ohlcv_daily` 只写最新一天、从不回刷历史，导致拆股后新旧价格断裂。库内 2026 年有 115 处，KLAC（1拆10）、CRWD（1拆4）、MNST（1拆2）、MQ（4合1）等大票的均线、20/55日新高、ATR 目前全部失真。方案新增 `us_splits` 任务（UW 拆股日历为主 + 全库跳空体检兜底）并要求上线前做一次全量修复。
-* **修改 (Changed)**: 纠正上一版架构文档的两处事实偏差 —— ① Supabase 是自建在局域网 `192.168.1.38`，不在云端，故 MCP 部署需配 Cloudflare Tunnel；② `stocks_meta` 实际只有 7 列，**没有 sector/industry/market**，`screen_stocks` 的板块筛选参数迁移后会直接失效，方案增加 `meta_refresh` 任务补齐。
+* **修改 (Changed)**: 纠正上一版架构文档的两处事实偏差 —— ① Supabase 是自建在局域网 `（内网地址，见 .env）`，不在云端，故 MCP 部署需配 Cloudflare Tunnel；② `stocks_meta` 实际只有 7 列，**没有 sector/industry/market**，`screen_stocks` 的板块筛选参数迁移后会直接失效，方案增加 `meta_refresh` 任务补齐。
 
 ### [2026-08-28] Supabase (PostgreSQL) 资产梳理与 Unusual Whales 全量融合架构落地
 * **新增 (Added)**: 创建架构设计文档 [`docs/supabase_uw_integration_architecture.md`](file:///d:/Dev_project/Python_Project/tt-trading-mcp/docs/supabase_uw_integration_architecture.md)，系统梳理 Supabase 中 9 张核心资产表（274 万行技术面行情、3 万条基本面、8000+ 条 UW 结构化新闻流、2500 笔真实交易记录），并设计由单机 DuckDB 往 Supabase (PostgreSQL) 中央数据库的平滑迁移与融合蓝图。
