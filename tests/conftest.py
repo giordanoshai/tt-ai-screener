@@ -32,6 +32,16 @@ mock 掉 `pg.query` 然后断言「查库时传的市场是 CN」，而实时那
 `test_get_bad_path_returns_none_not_raise` 那条回归测试仍然在测真行为。
 需要真联网的冒烟用例加一个 `live_uw` fixture 就能解除拦截。
 
+## 2026-09-04 起也拦 Telegram 推送
+
+盯盘守护进程（watchdog.py）新增之后，测试机的 `.env` 里配的是**真的**
+`TG_BOT_TOKEN` / `TG_CHAT_ID`——复用用户已有的机器人。`tests/test_watchdog.py`
+会真的走到 `core.notify.send`，一条测试没打桩，就是每跑一次测试给用户
+手机发一条真消息。跟 AKShare / UW 同一个道理：拦的是 `core.notify._post`
+（真正发 HTTP 请求的那一层），不是 `send()`——`send()` 承诺「任何失败都
+返回 False，不抛异常」，桩抛异常正好走它自己的降级分支，行为跟没配置
+Telegram 时一致，不污染任何断言。
+
 **数据库不拦。** 这个仓库的测试本来就是冲着真 Postgres 跑的（只读账号），
 那是有意的设计，不是疏漏。
 """
@@ -44,7 +54,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core import akshare, uw  # noqa: E402  （必须等 sys.path 补好之后再导）
+from core import akshare, notify, uw  # noqa: E402  （必须等 sys.path 补好之后再导）
 
 #: 拦截之前的真身，`live_uw` fixture 用它放行。
 _REAL_UW_FETCH = uw._fetch
@@ -52,7 +62,8 @@ _REAL_UW_FETCH = uw._fetch
 
 @pytest.fixture(autouse=True)
 def _no_live_market_data(monkeypatch):
-    """默认不让测试发真实的行情请求（新浪 + UW）。理由见模块注释。"""
+    """默认不让测试发真实的行情请求（新浪 + UW）、也不让它推真实的
+    Telegram 消息。理由见模块注释。"""
     def blocked(name):
         def stub(*args, **kwargs):
             raise RuntimeError(
@@ -61,6 +72,7 @@ def _no_live_market_data(monkeypatch):
 
     monkeypatch.setattr(akshare, "_get", blocked("AKShare"))
     monkeypatch.setattr(uw, "_fetch", blocked("Unusual Whales"))
+    monkeypatch.setattr(notify, "_post", blocked("Telegram"))
 
 
 @pytest.fixture
