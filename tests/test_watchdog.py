@@ -241,3 +241,78 @@ class TestState:
         path = tmp_path / "bad.json"
         path.write_text("{ not json", encoding="utf-8")
         assert watchdog.load_state(str(path)) == watchdog.empty_state()
+
+
+class TestTodayPerMarket:
+    """「今天」按市场分别算，不能两个市场都用北京日期。
+
+    北京零点正好是美东中午 12:00（夏令时），落在美股常规时段的正中间。
+    都用北京日期的话，每天盘中会发生两件事：每日配额闸原地清零（一只
+    美股上午 4 条、下午再 4 条，实际上限翻倍），关键位缓存也被清空重算。
+    """
+
+    def test_us_today_is_still_yesterday_just_after_beijing_midnight(self):
+        # UTC 2026-09-04 16:05 = 北京 09-05 00:05 = 美东 09-04 12:05（夏令时）
+        now = _utc("2026-09-04 16:05")
+        assert now.astimezone(
+            watchdog.session_mod.CN_TZ).date().isoformat() == "2026-09-05"
+        assert watchdog._today_for("US", now) == "2026-09-04", \
+            "北京跨了零点，美股还在同一个交易日的正中间"
+
+    def test_cn_today_is_the_beijing_date(self):
+        assert watchdog._today_for("CN", _utc("2026-09-04 02:00")) == "2026-09-04"
+
+
+class TestObservability:
+    """这个功能最典型的故障是「进程还在、但什么都没在看」。
+
+    光看进程在不在完全分辨不出来，所以每轮留一行日志、连续取不到报价
+    要主动告警、启动时报到一次。
+    """
+
+    def test_writes_one_summary_line_per_round(self, capsys):
+        state = watchdog.empty_state()
+        with patch("watchdog.pg.query", return_value=POSITIONS[:1]), \
+             patch("watchdog.quotes.get", return_value={}):
+            watchdog.run_once(state, _utc("2026-09-04 02:00"))
+        err = capsys.readouterr().err
+        assert "持仓 1" in err and "报价 0" in err
+
+    def test_position_read_failure_is_logged(self, capsys):
+        state = watchdog.empty_state()
+        with patch("watchdog.pg.query", side_effect=RuntimeError("库连不上")):
+            assert watchdog.run_once(state, _utc("2026-09-04 02:00")) == []
+        assert "读持仓失败" in capsys.readouterr().err
+
+    def test_quote_failure_alerts_after_ten_rounds(self):
+        """连续 10 轮一只报价都拿不到，推一条 Telegram 告警，然后清零。"""
+        state = watchdog.empty_state()
+        now = _utc("2026-09-04 02:00")
+        with patch("watchdog.notify.send", return_value=True) as spy:
+            for _ in range(watchdog.QUOTE_FAIL_ALERT_ROUNDS - 1):
+                watchdog._track_quote_failures(
+                    state, {"CN": ["601138.SH"]}, {}, now)
+            spy.assert_not_called()
+            watchdog._track_quote_failures(
+                state, {"CN": ["601138.SH"]}, {}, now)
+            assert spy.call_count == 1
+        assert state["quote_fail"]["CN"] == 0, "告警完要清零，不能每轮刷一条"
+
+    def test_counter_resets_once_quotes_come_back(self):
+        state = watchdog.empty_state()
+        now = _utc("2026-09-04 02:00")
+        watchdog._track_quote_failures(state, {"CN": ["601138.SH"]}, {}, now)
+        watchdog._track_quote_failures(
+            state, {"CN": ["601138.SH"]}, {"601138.SH": {"last": 63.5}}, now)
+        assert "CN" not in state["quote_fail"]
+
+    def test_startup_notice_counts_each_market(self):
+        with patch("watchdog.pg.query", return_value=POSITIONS):
+            text = watchdog.startup_notice()
+        for token in ("2 只", "A股 1", "美股 1"):
+            assert token in text, "启动通知里缺了 %s：%s" % (token, text)
+
+    def test_startup_notice_survives_a_dead_database(self):
+        """读不到持仓也要发得出去——这条消息的价值就在于「它活着」。"""
+        with patch("watchdog.pg.query", side_effect=RuntimeError("库连不上")):
+            assert "盯盘已启动" in watchdog.startup_notice()

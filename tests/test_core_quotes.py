@@ -80,6 +80,19 @@ class TestCnQuotes:
         assert called == "stock_zh_a_spot"
         assert not called.endswith("_em"), "东财源在这台 AKTools 上全是 500"
 
+    def test_goes_through_the_public_snapshot_helper(self):
+        """走 akshare 的公开函数，不越层调它的私有 `_get`。
+
+        超时该给多少（快照 60 秒、小时线 20 秒）是那个模块自己的事，
+        取数方不该知道，也不该替它决定。
+        """
+        with patch.object(quotes.akshare, "available", return_value=True), \
+             patch.object(quotes.akshare, "spot_snapshot",
+                          return_value=[SINA_ROW]) as spy:
+            got = quotes.cn_quotes(["601138.SH"])
+        spy.assert_called_once()
+        assert "601138.SH" in got
+
     def test_ticker_not_in_snapshot_is_absent(self):
         with patch.object(quotes.akshare, "available", return_value=True), \
              patch.object(quotes.akshare, "_get", return_value=[SINA_ROW]):
@@ -138,6 +151,47 @@ class TestUsQuotes:
         # open 应该是最新交易日最早那根的开盘价 324.62，不是全部数据末尾的 316.90
         assert got["AAPL"]["open"] == 324.62, \
             "open 应该是最新交易日最早那根的开盘价 324.62，不是 316.90"
+
+    def test_unparsable_times_fall_back_to_the_newest_bar_only(self):
+        """所有 start_time 都解析不出来时，只用最新那一根算 high/low。
+
+        以前这里回退成「扫全部原始行」，后果很隐蔽：假如哪天上游把
+        `start_time` 换成时间戳整数、或者改了字段名，「当天最高价」就会
+        静悄悄变成「一个月最高价」。而「假突破」的判定条件正是
+        「当天最高价越过关键位、现价又跌回下方」——一个月最高价几乎必然
+        高于任何一道近档阻力，于是每只美股持仓每天都会误报假突破。
+
+        下面两根线的 start_time 都是坏的，一根 high=101、一根 high=300，
+        属于不同日子。正确答案是 101（最新那根），不是 300。
+        """
+        broken = [
+            {"close": "100.0", "high": "101.0", "low": "99.0", "open": "99.5",
+             "start_time": 1789000000, "volume": 10,      # 整数，不是 ISO 字符串
+             "total_volume": 1000, "market_time": "r"},
+            {"close": "290.0", "high": "300.0", "low": "280.0", "open": "285.0",
+             "start_time": None, "volume": 20,
+             "total_volume": 2000, "market_time": "r"},
+        ]
+        with patch.object(quotes.uw, "available", return_value=True), \
+             patch.object(quotes.uw, "get_many",
+                          return_value={"/api/stock/AAPL/ohlc/1m": broken}):
+            got = quotes.us_quotes(["AAPL"])
+        assert got["AAPL"]["high"] == 101.0, \
+            "解析不出日期时只能用最新那一根，不能把一个月最高价当成当天最高价"
+        assert got["AAPL"]["low"] == 99.0
+        assert got["AAPL"]["open"] == 99.5
+
+    def test_uses_the_longer_ohlc_timeout(self):
+        """拉 K 线实测单次 12.9~14.0 秒，贴着默认的 20 秒。
+
+        `core/uw.py` 专门为此定了 OHLC_TIMEOUT（至少 30 秒），
+        这个仓库已经吃过一次「贴着超时、一抖动就整条失败」的亏。
+        """
+        with patch.object(quotes.uw, "available", return_value=True), \
+             patch.object(quotes.uw, "get_many", return_value={}) as spy:
+            quotes.us_quotes(["AAPL"])
+        assert spy.call_args.kwargs.get("timeout") == quotes.uw.OHLC_TIMEOUT
+        assert quotes.uw.OHLC_TIMEOUT >= 30.0
 
     def test_none_payload_is_skipped(self):
         with patch.object(quotes.uw, "available", return_value=True), \

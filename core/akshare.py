@@ -34,6 +34,7 @@ tt-data-hub 的 `hub/sources/akshare.py::parse_minute_60` 是同一套换算。
 import datetime
 import json
 import math
+import sys
 import urllib.parse
 import urllib.request
 
@@ -48,8 +49,15 @@ BAR_MINUTES_60 = 60
 #: 北京时间。A股没有夏令时，固定 +8。
 CN_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
-#: 超时。单次调用本身要 2~3 秒，给足但不能让对话干等。
+#: 小时线的超时。单次调用本身要 2~3 秒，给足但不能让对话干等。
 TIMEOUT_SECONDS = 20
+
+#: 全市场快照（`stock_zh_a_spot`）的超时，比小时线宽得多，故意的。
+#: 实测这个接口一趟拉回 5555 只要 15 秒——20 秒只剩 5 秒余量，而这台
+#: AKTools 跟 tt-data-hub 的采集任务是同一个服务，采集跑起来的时候会
+#: 明显更慢。超时了就是空列表，盯盘那头 A股静悄悄地不再被盯，
+#: 所以宁可多等也别为省几十秒把整条路弄哑。
+SPOT_TIMEOUT_SECONDS = 60
 
 
 def available() -> bool:
@@ -69,15 +77,43 @@ def to_sina(ticker: str) -> str | None:
     return f"{prefix}{code}"
 
 
-def _get(func: str, params: dict):
-    """调一个 AKShare 函数。网络层的异常照抛，由 `hourly()` 统一吞掉。"""
+def _get(func: str, params: dict, timeout: float | None = None):
+    """调一个 AKShare 函数。网络层的异常照抛，由公开函数统一吞掉。
+
+    `timeout` 不传就沿用 `TIMEOUT_SECONDS`（按小时线定的 20 秒），
+    这样 `hourly()` 的行为一个字都没变；慢接口自己传一个更大的值。
+    """
     url = (f"{config.AKSHARE_BASE_URL.rstrip('/')}/{func}"
            f"?{urllib.parse.urlencode(params)}")
     # AKTools 是局域网里的自建服务，显式绕开代理——本机装着用户级
     # HTTP_PROXY，不绕开的话 urllib 会拿它去连局域网地址，报莫名其妙的 503。
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(url, timeout=TIMEOUT_SECONDS) as resp:
+    with opener.open(url, timeout=timeout or TIMEOUT_SECONDS) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def spot_snapshot() -> list[dict]:
+    """A股全市场实时快照，一趟拿回约 5555 只。取不到返回空列表，不抛异常。
+
+    盯盘（`core/quotes.py`）靠它取实时价：**盯 1 只和盯 5000 只是同一个
+    请求**，所以不按票拉。
+
+    只能走新浪的 `stock_zh_a_spot`：2026-09-04 实测这台 AKTools 上所有
+    `_em`（东方财富）后缀接口全部 500。也不能改用小时线——新浪的小时线
+    对当天盘中那几根只给成交量、不给价格。
+
+    失败时会往 stderr 写一行。**这条日志是有意加的**：盯盘进程失败后
+    只是返回空，看上去一切正常，不出声的话「AKTools 慢了 5 秒 → A股
+    从此不再被盯」这种事没有任何迹象。
+    """
+    if not available():
+        return []
+    try:
+        rows = _get("stock_zh_a_spot", {}, timeout=SPOT_TIMEOUT_SECONDS)
+    except Exception as exc:
+        sys.stderr.write("A股全市场快照取不到（AKTools）：%r\n" % (exc,))
+        return []
+    return rows if isinstance(rows, list) else []
 
 
 def _price(value):

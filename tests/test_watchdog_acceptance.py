@@ -81,11 +81,17 @@ def test_the_whole_day_produces_exactly_two_alerts():
 
 
 def test_no_repeat_while_hovering_near_the_warn_line():
-    """验收标准 7：在预警线附近震荡不重复报。"""
+    """验收标准 7：在预警线附近震荡不重复报。
+
+    序列比原来长了两根，是因为预警现在也要采样点确认（常规时段 2 个）：
+    前四根来回穿越 64.19 这条线，每次都在下一根就掉回线外，攒不满确认；
+    64.25 → 64.30 才是第一次连着站住两根，报一条。之后 64.28 仍在线内侧、
+    64.10 掉回线外，都不再报。**一条，不是两条**——这就是验收标准 7 要的。
+    """
     lv = levels.compute(_bars(), warn_dist=0.01)
     state = _state()
     kinds = []
-    for last in (64.20, 64.15, 64.22, 64.18, 64.25, 64.10):
+    for last in (64.20, 64.15, 64.22, 64.18, 64.25, 64.30, 64.28, 64.10):
         got = alerts.evaluate("601138.SH", _quote(last, 64.25), lv, state,
                               "cn", avg_volume=9e7, elapsed_minutes=120,
                               today="2026-09-04")

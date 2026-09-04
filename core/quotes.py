@@ -31,6 +31,7 @@ UW **没有「当前价」接口**——`/info`、`/quote`、`/price`、`/spot`
 """
 import datetime
 import math
+import sys
 
 from core import akshare, session, uw
 
@@ -66,11 +67,16 @@ def cn_quotes(tickers: list[str]) -> dict[str, dict]:
     if not wanted:
         return {}
 
+    # 走 akshare 模块的公开函数，不越层去调它的私有 `_get`：超时该给多少
+    # （快照 60 秒、小时线 20 秒）是那个模块自己的事，这里不该知道。
     try:
-        rows = akshare._get("stock_zh_a_spot", {})
-    except Exception:
+        rows = akshare.spot_snapshot()
+    except Exception as exc:
+        # spot_snapshot() 承诺不抛异常，这个 except 是防御性的；
+        # 真抛出来了也只能哑掉 A股这一路，不能让整轮盯盘死掉。
+        sys.stderr.write("A股实时价取不到：%r\n" % (exc,))
         return {}
-    if not isinstance(rows, list):
+    if not rows:
         return {}
 
     out = {}
@@ -114,9 +120,16 @@ def us_quotes(tickers: list[str]) -> dict[str, dict]:
     if not paths:
         return {}
 
+    # 用 K 线专用的那个超时，不用默认的 20 秒。`core/uw.py` 已经吃过一次
+    # 这个亏：拉 K 线实测单次 12.9~14.0 秒，贴着 20 秒，一次网络抖动就
+    # 整条失败——所以那边专门定了 OHLC_TIMEOUT（至少 30 秒），这里直接用它。
     try:
-        payloads = uw.get_many(list(paths.keys()))
-    except Exception:
+        payloads = uw.get_many(list(paths.keys()), timeout=uw.OHLC_TIMEOUT)
+    except Exception as exc:
+        # get_many 内部每条都吞了异常，这个 except 是防御性的；
+        # 真抛出来了也只能哑掉美股这一路。不出声的话，盯盘会在
+        # 「进程还活着、但什么都没在看」的状态下一直跑下去。
+        sys.stderr.write("美股实时价取不到（UW）：%r\n" % (exc,))
         return {}
 
     out = {}
@@ -149,8 +162,16 @@ def us_quotes(tickers: list[str]) -> dict[str, dict]:
 
         # 只用最新交易日的数据
         if not latest_us_date or latest_us_date not in rows_by_us_date:
-            # 没有日期信息，就用全部行的兜底策略
-            latest_rows = rows
+            # 一根都解析不出日期（上游把 start_time 换成时间戳、或改了
+            # 字段名），只用最新那一根，**绝不退回去扫全部**。
+            #
+            # 扫全部的话「当天最高价」会静悄悄变成「一个月最高价」，而
+            # 「假突破」的判定条件正是「当天最高价越过关键位、现价又跌回
+            # 下方」——一个月最高价几乎必然高于任何一道近档阻力，于是每只
+            # 美股持仓每天都会误报假突破。宁可保守到只有一根，也不能让
+            # 「当天」悄悄变成「一个月」。这也跟本仓库取数层的一贯规矩
+            # 一致：取不到就返回空/最小集，不拿更宽的数据凑。
+            latest_rows = rows[:1]
         else:
             latest_rows = rows_by_us_date[latest_us_date]
 

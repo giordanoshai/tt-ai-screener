@@ -21,6 +21,10 @@
 一刻才报**；如果价格本来就在附近磨蹭，一声不响。
 这一条把预警从 27 条压到 17 条，是降噪最有效的一招。
 
+穿过之后还要**连着站住几个采样点**（常规 2 个、盘前 3 个）才推，
+跟到位判定用同一道闸。盘前尤其需要：那时候几百股就能打出一根孤立的
+假价格，而预警线比关键位还低 1%，是最容易被它穿过的一道线。
+
 ## 盘中量比必须按时间折算
 
 这是实现时最容易翻车的地方。盘中成交量是累计值，上午 10 点只跑了
@@ -44,10 +48,10 @@ ACTIONABLE = ("有效突破", "假突破", "跌破")
 #: 进到关键位的 ±0.5% 以内就算「碰到」。
 TOUCH_BAND = 0.005
 
-#: 同一个位的到位判定，多少天内不重复。
+#: 同一个位的到位判定，多少**交易日**内不重复。周末不算数，见 _on_cooldown。
 FIRE_COOLDOWN_DAYS = 5
 
-#: 同一个位的接近预警，多少天内不重复。预警冷却更长——
+#: 同一个位的接近预警，多少**交易日**内不重复。预警冷却更长——
 #: 「快到坎了」这件事说一遍就够，说三遍就是噪音。
 WARN_COOLDOWN_DAYS = 10
 
@@ -72,6 +76,14 @@ def intraday_volume_ratio(volume: float, avg_volume: float,
 
     不折算的话，开盘半小时的成交量除以全天均量永远是个很小的数，
     「有效突破」永远判不出来——这是设计文档 5.1 节点名的翻车点。
+
+    **盘前和盘后这里必然返回 None，是有意的，不是漏了。**
+    `session.SESSION_MINUTES` 只有 `cn` 和 `us_rth` 两档，盘前盘后查不到
+    「全天多少分钟」，所以量比算不出来，`classify()` 那边的「有效突破」
+    也就永远判不出来。理由是这两段根本没有可比的均量口径：盘前只占全天
+    成交量 1%~2%、盘后 17%~23%，拿它们去跟 20 日全天均量比，算出来的
+    「放量」是个没有意义的数。盘后的「假突破」和「跌破」照常判——
+    那两类只看价格，不需要量能。
     """
     total = session_mod.SESSION_MINUTES.get(session_name)
     if not total or not avg_volume or elapsed_minutes < SKIP_OPEN_MINUTES:
@@ -120,6 +132,17 @@ def crossed_warn_line(side: str, warn_line: float,
     return prev_last > warn_line >= last
 
 
+def _past_warn_line(side: str, warn_line: float, quote: dict) -> bool:
+    """现价还站在预警线的内侧吗（阻力：线上方；支撑：线下方）。
+
+    穿过预警线之后要连着站住几个采样点才算数，靠这个函数判断「还站着」。
+    """
+    last = quote.get("last")
+    if not last:
+        return False
+    return last >= warn_line if side == "resistance" else last <= warn_line
+
+
 def _touched(side: str, price: float, quote: dict) -> bool:
     if side == "resistance":
         high = quote.get("high") or quote.get("last") or 0
@@ -132,8 +155,38 @@ def _key(ticker: str, price: float) -> str:
     return "%s|%.2f" % (ticker, price)
 
 
+def _trading_days_between(prev: datetime.date, now: datetime.date) -> int:
+    """prev 到 now 之间隔了几个**交易日**。只跳周末，不管节假日。
+
+    自己数，不引入第三方日历库：一个只需要「跳过周六周日」的计算，
+    不值得为它多一个依赖。
+
+    节假日不管是有意的——多等一两天是保守方向（少报几条），
+    而维护一张年年要更新的节假日表，成本远高于它换来的那一两条提醒。
+    """
+    gap = (now - prev).days
+    if gap <= 0:
+        return 0
+    if gap > 60:
+        return gap          # 隔了两个月，必然早就出冷却了，不必逐日数
+    count = 0
+    day = prev
+    for _ in range(gap):
+        day += datetime.timedelta(days=1)
+        if day.weekday() < 5:          # 5=周六、6=周日，不算交易日
+            count += 1
+    return count
+
+
 def _on_cooldown(store: dict, key: str, today: str, days: int) -> bool:
-    """同一个位在冷却期内不重复报。存日期字符串，够用且好读。"""
+    """同一个位在冷却期内不重复报。存日期字符串，够用且好读。
+
+    **按交易日数，不按自然日。** 按自然日的话周五报过的位下周三就解冻了
+    （+5 天），而设计文档要的是 5 个交易日、也就是下周五。差别不小：
+    那组「45 个交易日、单只票 35 条、47% 的天在响」的实测噪音数据是在
+    交易日口径下跑出来的，换成自然日实际噪音会高出约 40%——一个吵的提醒
+    工具，用户两天就静音，等于没有。
+    """
     last_day = store.get(key)
     if not last_day:
         return False
@@ -142,7 +195,7 @@ def _on_cooldown(store: dict, key: str, today: str, days: int) -> bool:
         now = datetime.date.fromisoformat(today)
     except ValueError:
         return False
-    return (now - prev).days < days
+    return _trading_days_between(prev, now) < days
 
 
 def evaluate(ticker: str, quote: dict, levels: dict, state: dict,
@@ -172,8 +225,28 @@ def evaluate(ticker: str, quote: dict, levels: dict, state: dict,
         side, price = item["side"], item["price"]
         key = _key(ticker, price)
 
-        # ---- 接近预警：穿过预警线的那一刻 ----
+        # ---- 接近预警：穿过预警线，而且连着站住 need_ticks 个采样点 ----
+        #
+        # 「连续几个采样点确认」是设计文档列的**通用**规则，盘前专门要 3 个，
+        # 理由是盘前成交量只占全天 1%~2%，几百股就能打出一根孤立的假价格。
+        # 可预警线比关键位还低 1%，恰恰是最容易被那根假价格穿过的一道线——
+        # 只穿一次就推，等于把最需要确认的那条路径漏在了闸门外面。
+        #
+        # 计数用带 "|warn" 后缀的 key，跟下面到位判定的计数分开存，
+        # 免得同一个位的两种判定互相清零。
+        warn_key = key + "|warn"
         if crossed_warn_line(side, item["warn_line"], prev_last, quote):
+            ticks[warn_key] = 1                    # 刚从外面穿进来，开始攒
+        elif ticks.get(warn_key) and _past_warn_line(
+                side, item["warn_line"], quote):
+            ticks[warn_key] += 1                   # 还站在线内侧，接着攒
+        else:
+            # 掉回线外了（或压根没穿过）：一根孤立的插针到此为止，
+            # 之前攒的确认作废。这正是这道闸要挡的东西。
+            ticks.pop(warn_key, None)
+
+        if ticks.get(warn_key, 0) >= need_ticks:
+            ticks.pop(warn_key, None)
             if not _on_cooldown(state.setdefault("warned", {}), key,
                                 today, WARN_COOLDOWN_DAYS):
                 state["warned"][key] = today

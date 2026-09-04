@@ -29,5 +29,11 @@ changelog.md
 # 2026-08-29 被 `git add -A` 误提交过一次（未推送，已回退）。
 scratch/
 .api/
+
+# 盯盘（watchdog.py）的去重状态：哪个位在哪天报过、今天推了几条。
+# 每台机器各跑各的，服务器上那份才是真的，本机调试跑一次就会落一个，
+# 进了版本库只会互相覆盖。默认就落在仓库根目录（见 config.WATCHDOG_STATE_FILE），
+# 不写在这里的话 `git add -A` 随手就能把它带进去——2026-08-29 真发生过一次。
+.watchdog_state.json
 swing_trade_setups_zh.md
 scratch_test_batch.jsonl

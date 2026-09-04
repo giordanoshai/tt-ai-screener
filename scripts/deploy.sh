@@ -18,6 +18,8 @@
 #    `git push server <分支>` 再上去 `git fetch /home/tao/git/tt-trading-mcp.git`。
 # 2. tt-mcp 是【用户级】systemd 服务，跟这台机器上的 sos / v5-telegram 一个路子。
 #    systemctl 必须带 --user，漏了会去找系统级的同名服务，报 not found。
+# 3. tt-watchdog（盯盘守护进程）也要一起重启。它跟 tt-mcp 是两个独立进程，
+#    只重启 tt-mcp 的话，部署完新代码盯盘还在跑旧的，而且**没有任何提示**。
 set -euo pipefail
 
 HOST="tao@192.168.1.38"
@@ -36,10 +38,11 @@ ssh "${HOST}" "cd ${DIR} \
   && GIT_TERMINAL_PROMPT=0 git fetch origin \
   && git checkout -B ${BRANCH} origin/${BRANCH} \
   && .venv/bin/pip install -q -r requirements.txt \
-  && systemctl --user restart tt-mcp"
+  && systemctl --user restart tt-mcp \
+  && { systemctl --user restart tt-watchdog || echo '  !! tt-watchdog 重启失败（多半是还没装），盯盘仍在跑旧代码；装法见 scripts/tt-watchdog.service 顶部注释'; }"
 
 echo "==> 验证"
-ssh "${HOST}" "systemctl --user is-active tt-mcp; cd ${DIR} && git log --oneline -1"
+ssh "${HOST}" "systemctl --user is-active tt-mcp; systemctl --user is-active tt-watchdog; cd ${DIR} && git log --oneline -1"
 # 服务绑的是 0.0.0.0，这里仍然走 127.0.0.1，确认是服务自己在应答
 ssh "${HOST}" "curl -s -o /dev/null -w '  首页      %{http_code}  (应 200)\n' http://127.0.0.1:8766/"
 ssh "${HOST}" "curl -s -o /dev/null -w '  错 token  %{http_code}  (应 401)\n' 'http://127.0.0.1:8766/mcp?token=WRONG'"

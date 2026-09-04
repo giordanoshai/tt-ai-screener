@@ -282,6 +282,10 @@ TG_PROXY=...               # 服务器在国内，Telegram 要走代理，形如
 WATCHDOG_INTERVAL=60       # 盯盘每轮间隔秒数
 WATCHDOG_WARN_DIST=0.01    # 预警线距关键位多远（小数），默认提前 1%
 WATCHDOG_PREMARKET=1       # 美股盘前要不要盯，默认要
+WATCHDOG_STATE_FILE=...    # 盯盘的去重状态文件（哪个位哪天报过、今天推了几条）。
+                            # 不配就落在仓库根目录的 .watchdog_state.json，
+                            # 已在 .gitignore 里——每台机器各跑各的，不该进版本库。
+                            # 进程重启靠它才不会重复轰炸用户
 UW_API_TOKEN=...           # Unusual Whales（期权异动 + 美股小时线）。历史遗留键名
                             # UW_T_ENDPOINT / UW_T_KEY 也认，config.py 两套都读。
                             # 不配也不会坏，但美股小时线会退回库里那 247 只，

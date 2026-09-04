@@ -25,6 +25,11 @@ MCP 服务是给 Claude.ai 用的。用户重启它、改代码、它偶尔崩�
 用法：
     python watchdog.py            # 一直跑
     python watchdog.py --once     # 只跑一轮，调试用
+
+服务器上由**用户级 systemd** 托管（`scripts/tt-watchdog.service`）：
+崩了自动拉起、机器重启自动起来、日志进 journal 自动轮转。
+每一轮的摘要写在 stderr，看日志用
+`journalctl --user -u tt-watchdog -f`。
 """
 import argparse
 import datetime
@@ -46,12 +51,49 @@ BARS_LIMIT = 200
 #: 键是 "票|市场|日期"，换天了整个清掉。
 _levels_cache: dict = {}
 
+#: 某个市场连续多少轮一只报价都拿不到，就推一条 Telegram 告警。
+#: 60 秒一轮，10 轮 = 10 分钟：足够跳过一次网络抖动，又不至于让
+#: 「进程还在、其实什么都没在看」这个状态闷上半天没人知道。
+QUOTE_FAIL_ALERT_ROUNDS = 10
+
 
 def empty_state() -> dict:
     # daily 形如 {"date": "2026-09-04", "total": 3, "by_ticker": {"票": 2}}，
     # 换天自动清零。它是保险丝，见 _within_daily_cap。
+    # quote_fail 形如 {"CN": 3}：某个市场连续几轮没拿到报价，见
+    # _track_quote_failures。落地存是有意的——进程被 systemd 拉起重来
+    # 之后，如果 AKTools 还是没好，不该从头再数 10 轮。
     return {"fired": {}, "warned": {}, "prev_last": {}, "ticks": {},
-            "daily": {}}
+            "daily": {}, "quote_fail": {}}
+
+
+def _log(now_utc: datetime.datetime, text: str) -> None:
+    """往 stderr 写一行带时间戳的摘要（北京时间）。systemd 自动收进 journal。
+
+    盯盘最典型的故障不是崩溃，是「进程还活着、但什么都没在看」——
+    光看进程在不在完全分辨不出来。所以每一轮都留一行：哪个时段、
+    读到几只持仓、拿到几条报价、推了几条。出事时能直接看出断在哪一步。
+    """
+    stamp = now_utc.astimezone(session_mod.CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    sys.stderr.write("[%s] %s\n" % (stamp, text))
+
+
+def _market_label(market: str) -> str:
+    return "A股" if (market or "").upper() == "CN" else "美股"
+
+
+def _today_for(market: str, now_utc: datetime.datetime) -> str:
+    """这一刻对这个市场来说算「哪一天」。A股按北京日期，美股按**美东日期**。
+
+    两个市场不能都用北京日期：北京零点正好是美东中午 12:00（夏令时），
+    落在美股常规时段的正中间。用北京日期的话，每天盘中会发生两件事——
+    每日配额闸原地清零（一只美股上午 4 条、下午再 4 条，实际上限是设计
+    说的两倍），关键位缓存也被清空重算，每只美股持仓白白多跑一遍日线查询。
+    """
+    if (market or "").upper() == "CN":
+        return now_utc.astimezone(session_mod.CN_TZ).date().isoformat()
+    return now_utc.astimezone(
+        session_mod._us_tz(now_utc.date())).date().isoformat()
 
 
 def _within_daily_cap(state: dict, ticker: str, today: str) -> bool:
@@ -164,6 +206,34 @@ def _levels_for(ticker: str, market: str, today: str) -> dict:
     return _levels_cache[key]
 
 
+def _track_quote_failures(state: dict, wanted: dict, quote_map: dict,
+                          now_utc: datetime.datetime) -> None:
+    """数每个市场连续多少轮一只报价都没拿到，到阈值推一条 Telegram。
+
+    这是「进程还在、其实什么都没在看」这个失败模式的唯一出口：取价失败
+    本身是静默的（取不到就返回空），不主动告警的话，AKTools 慢了几秒、
+    UW 换了鉴权，用户是不会知道的——他只会以为今天恰好没什么行情。
+
+    推完就清零，避免每轮刷一条。
+    """
+    counters = state.setdefault("quote_fail", {})
+    for market, tickers in wanted.items():
+        if any(t in quote_map for t in tickers):
+            counters.pop(market, None)          # 拿到了，从头再数
+            continue
+        counters[market] = counters.get(market, 0) + 1
+        if counters[market] < QUOTE_FAIL_ALERT_ROUNDS:
+            continue
+        counters[market] = 0
+        label = _market_label(market)
+        _log(now_utc, "%s 连续 %d 轮一只报价都没拿到，已告警"
+             % (label, QUOTE_FAIL_ALERT_ROUNDS))
+        notify.send(
+            "盯盘告警：%s 连续 %d 轮一只报价都拿不到。\n"
+            "进程还活着，但这个市场实际上已经没在盯了。"
+            % (label, QUOTE_FAIL_ALERT_ROUNDS))
+
+
 def _us_session_of(quote: dict, active: list[str]) -> str:
     """美股这一刻算哪个时段。优先信 UW 分钟线自带的 market_time
     （r/pr/po），它比按时间猜准——盘前盘后的边界在数据里是现成的。"""
@@ -188,9 +258,13 @@ def run_once(state: dict, now_utc: datetime.datetime | None = None) -> list[dict
 
     try:
         positions = load_positions() or []
-    except Exception:
+    except Exception as exc:
+        # 读不到持仓这一轮就等于什么都没盯。以前这里是静默 return，
+        # 数据库连不上时外面看不出任何异常。
+        _log(now_utc, "读持仓失败，这一轮跳过：%r" % (exc,))
         return []
     if not positions:
+        _log(now_utc, "%s | 没有持仓，无事可做" % "+".join(active))
         return []
 
     us_open = any(s.startswith("us_") for s in active)
@@ -203,16 +277,23 @@ def run_once(state: dict, now_utc: datetime.datetime | None = None) -> list[dict
             continue
         by_market.setdefault(market, []).append(row["ticker"])
     if not by_market:
+        _log(now_utc, "%s | 持仓里没有这个时段该盯的票" % "+".join(active))
         return []
 
     try:
-        quote_map = quotes.get(by_market)
-    except Exception:
-        return []
+        quote_map = quotes.get(by_market) or {}
+    except Exception as exc:
+        # quotes.get 承诺不抛（每一路自己吞了异常），这是防御性的一层。
+        _log(now_utc, "取价失败，这一轮跳过：%r" % (exc,))
+        quote_map = {}
+
+    # 连续多轮取不到报价要告警——静默失败正是这个功能最危险的失败方式。
+    _track_quote_failures(state, by_market, quote_map, now_utc)
     if not quote_map:
+        _log(now_utc, "%s | 持仓 %d | 报价 0 | 推送 0"
+             % ("+".join(active), len(positions)))
         return []
 
-    today = now_utc.astimezone(session_mod.CN_TZ).date().isoformat()
     pos_by_ticker = {r["ticker"]: r for r in positions}
     fired = []
 
@@ -221,10 +302,15 @@ def run_once(state: dict, now_utc: datetime.datetime | None = None) -> list[dict
         if not row:
             continue
         market = (row.get("market") or "US").upper()
+        # 「今天」按市场分别算：美股用美东日期，A股用北京日期。见 _today_for。
+        today = _today_for(market, now_utc)
         name = "cn" if market == "CN" else _us_session_of(quote, active)
         try:
             cached = _levels_for(ticker, market, today)
-        except Exception:
+        except Exception as exc:
+            # 算不出关键位，这只票这一轮就没有可比的坎。以前是静默 continue，
+            # 于是「某只票的日线查询一直在失败」可以一整天没人发现。
+            _log(now_utc, "%s 算不出关键位，跳过：%r" % (ticker, exc))
             continue
         got = alerts.evaluate(
             ticker, quote, cached["levels"], state, name,
@@ -237,10 +323,17 @@ def run_once(state: dict, now_utc: datetime.datetime | None = None) -> list[dict
                 # 推送真的失败了（代理挂了、token 失效……）。这时候
                 # alerts.evaluate() 已经把这条报警计入冷却、
                 # _within_daily_cap() 也已经把配额记掉了——如果就这么
-                # 算了，就变成「已经进了 5 天冷却、占了今日配额，但
-                # 用户手机上什么都没有」，恰好是 config.py 里点名要
+                # 算了，就变成「已经进了 5 个交易日冷却、占了今日配额，
+                # 但用户手机上什么都没有」，恰好是 config.py 里点名要
                 # 避免的「以为在盯盘、其实什么都没发」。所以推送失败
-                # 必须把这两笔记录都撤销，让下一轮能重试。
+                # 必须把这两笔记录都撤销。
+                #
+                # 撤销的是冷却和配额，**不是确认计数**：core/alerts.py
+                # 在 fire 的那一刻已经把 ticks 清零了，这里也不去恢复它。
+                # 所以实际行为不是「下一轮立刻重试」，而是价格得再连续
+                # 命中 2 次（盘前 3 次）攒够确认才会重推，也就是 2~3 分钟
+                # 之后。这是可以接受的：推送失败通常是代理或网络的问题，
+                # 隔两分钟再来一次比原地猛敲更合适；而该重试的确实重试了。
                 #
                 # key 的拼法必须跟 core/alerts.py 的 _key() 保持一致
                 # （"%s|%.2f" % (ticker, price)）——那是私有函数，
@@ -260,7 +353,25 @@ def run_once(state: dict, now_utc: datetime.datetime | None = None) -> list[dict
                 continue          # 失败的不进 fired，避免主循环把它当成功打印
             fired.append(alert)
 
+    _log(now_utc, "%s | 持仓 %d | 报价 %d | 推送 %d" % (
+        "+".join(active), len(positions), len(quote_map), len(fired)))
     return fired
+
+
+def startup_notice() -> str:
+    """启动时推的那条消息：让用户立刻知道它活着、而且盯的是哪几只。
+
+    没有这条的话，「进程在跑」和「进程真的在盯」用户分不出来——
+    而这个功能最典型的故障恰恰是后者悄悄没了。
+    """
+    try:
+        positions = load_positions() or []
+    except Exception as exc:
+        return "盯盘已启动，但读不到持仓：%r" % (exc,)
+    cn = sum(1 for r in positions
+             if (r.get("market") or "US").upper() == "CN")
+    return "盯盘已启动，当前盯 %d 只（A股 %d / 美股 %d）" % (
+        len(positions), cn, len(positions) - cn)
 
 
 def main() -> None:
@@ -280,12 +391,17 @@ def main() -> None:
     state = load_state(path)
 
     if args.once:
+        # --once 是调试用的干跑，不推启动通知——调一次代码就给用户手机
+        # 发一条，是另一种刷屏。
         got = run_once(state)
         save_state(path, state)
         print("推了 %d 条" % len(got))
         return
 
     print("盯盘启动，每 %d 秒一轮。Ctrl-C 停止。" % config.WATCHDOG_INTERVAL)
+    # 启动就报到。用户看到这条才知道「它活着、盯着这几只」，
+    # 而不是只能去服务器上看进程还在不在。
+    notify.send(startup_notice())
     while True:
         try:
             got = run_once(state)

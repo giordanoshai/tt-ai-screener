@@ -9,7 +9,11 @@
 * 盘中量比必须按时间折算，否则「有效突破」永远判不出来。
 * 预警必须是「穿越触发」，在预警线附近磨蹭不能反复报。
 * 盘前不判「有效突破」，因为盘前成交量只占全天 1%~2%，量能不可比。
+* 接近预警同样要采样点确认，一根孤立的插针穿过预警线不算数。
+* 冷却期数交易日，不数自然日——周末不该把冷却提前两天解除。
 """
+import datetime
+
 from core import alerts
 
 
@@ -122,16 +126,24 @@ class TestEvaluateDedup:
         lv = {"resistance": [_level(64.84, "resistance")], "support": []}
         state["prev_last"] = {"601138.SH": 63.90}
 
+        # 穿过预警线只算第一个确认点，常规时段要连着站住两个才推。
         first = alerts.evaluate("601138.SH", _quote(64.25), lv, state,
                                 "cn", avg_volume=8e7, elapsed_minutes=60,
                                 today="2026-09-04")
-        assert [a["kind"] for a in first] == ["接近预警"]
-
-        state["prev_last"]["601138.SH"] = 63.90   # 假装又从远处走回来
+        assert first == [], "穿一次线不够，还要再站住一个采样点"
         second = alerts.evaluate("601138.SH", _quote(64.25), lv, state,
                                  "cn", avg_volume=8e7, elapsed_minutes=61,
                                  today="2026-09-04")
-        assert second == [], "冷却期内同一个位不该重复报"
+        assert [a["kind"] for a in second] == ["接近预警"]
+
+        # 假装价格跑远了又走回来，重新攒够确认——冷却期内仍然不该再报。
+        state["prev_last"]["601138.SH"] = 63.90
+        for elapsed in (62, 63):
+            again = alerts.evaluate("601138.SH", _quote(64.25), lv, state,
+                                    "cn", avg_volume=8e7,
+                                    elapsed_minutes=elapsed,
+                                    today="2026-09-04")
+            assert again == [], "冷却期内同一个位不该重复报"
 
     def test_confirm_ticks_required_in_premarket(self):
         """盘前要连续 3 个采样点确认，前两次不报。"""
@@ -160,6 +172,74 @@ class TestEvaluateDedup:
         assert [a["kind"] for a in second] == ["跌破"]
 
 
+class TestWarnNeedsConfirmation:
+    """接近预警也要采样点确认——盘前尤其要，那里最容易出孤立的假价格。
+
+    盘前成交量只占全天 1%~2%，几百股就能把价格打出去一大截；而预警线
+    比关键位还低 1%，是最容易被一根插针穿过的一道线。
+    """
+
+    def test_premarket_needs_three_samples(self):
+        """盘前要连着 3 个采样点站在预警线内侧才推，前两次不推。"""
+        state = _state()
+        lv = {"resistance": [_level(200.0, "resistance")], "support": []}
+        state["prev_last"] = {"AAPL": 196.0}      # 预警线 198.0，起点在线外
+
+        # 第 1 根穿过预警线，第 2 根还站着，都不该推
+        for last in (198.5, 198.6):
+            got = alerts.evaluate("AAPL", _quote(last, session="pr"), lv,
+                                  state, "us_pre", avg_volume=1e6,
+                                  elapsed_minutes=100, today="2026-09-04")
+            assert got == [], "盘前只站住两个采样点还不够"
+
+        third = alerts.evaluate("AAPL", _quote(198.7, session="pr"), lv,
+                                state, "us_pre", avg_volume=1e6,
+                                elapsed_minutes=100, today="2026-09-04")
+        assert [a["kind"] for a in third] == ["接近预警"]
+
+    def test_isolated_spike_never_warns(self):
+        """一根孤立的插针穿过预警线又掉回去——一条都不该推。
+
+        这正是加这道闸要挡的东西：盘前几百股就能打出这么一根。
+        """
+        state = _state()
+        lv = {"resistance": [_level(200.0, "resistance")], "support": []}
+        state["prev_last"] = {"AAPL": 196.0}
+        kinds = []
+        for last in (198.5, 196.2, 196.1, 198.4, 196.0):   # 穿一下就掉回去
+            got = alerts.evaluate("AAPL", _quote(last, session="pr"), lv,
+                                  state, "us_pre", avg_volume=1e6,
+                                  elapsed_minutes=100, today="2026-09-04")
+            kinds.extend(a["kind"] for a in got)
+        assert kinds == [], "插针不该报，实际 %r" % kinds
+
+
+class TestCooldownCountsTradingDays:
+    """冷却期数的是**交易日**，不是自然日。
+
+    按自然日的话，周五报过的位下周三（+5 天）就解冻了，比设计文档说的
+    5 个交易日早两天。设计阶段那组「45 个交易日、单只票 35 条、47% 的天
+    在响」的噪音实测就是交易日口径跑出来的。
+    """
+
+    def test_friday_level_still_cooling_on_wednesday(self):
+        """周五 09-04 报过，下周三 09-09 只隔了 3 个交易日，还在冷却。"""
+        store = {"601138.SH|64.84": "2026-09-04"}
+        assert alerts._on_cooldown(store, "601138.SH|64.84",
+                                   "2026-09-09", alerts.FIRE_COOLDOWN_DAYS)
+
+    def test_friday_level_released_next_friday(self):
+        """下周五 09-11 正好隔满 5 个交易日，解除冷却。"""
+        store = {"601138.SH|64.84": "2026-09-04"}
+        assert not alerts._on_cooldown(store, "601138.SH|64.84",
+                                       "2026-09-11", alerts.FIRE_COOLDOWN_DAYS)
+
+    def test_weekend_is_not_a_trading_day(self):
+        """周五到周一只算 1 个交易日，中间的周六周日不算。"""
+        assert alerts._trading_days_between(
+            datetime.date(2026, 9, 4), datetime.date(2026, 9, 7)) == 1
+
+
 class TestRealCase20260904:
     """验收标准：601138 在 2026-09-04 必须推两条，先预警再假突破。"""
 
@@ -170,10 +250,14 @@ class TestRealCase20260904:
               "support": [_level(62.16, "support", label="半年低04-30")]}
         state["prev_last"] = {"601138.SH": 63.20}   # 昨收，在预警线之外
 
-        # 盘中涨到 64.20，穿过预警线 64.19
+        # 盘中涨到 64.20，穿过预警线 64.19；常规时段要两个采样点确认，
+        # 所以第一根只是攒确认，站住第二根才推。
+        assert alerts.evaluate("601138.SH", _quote(64.20, high=64.20),
+                               lv, state, "cn", avg_volume=9e7,
+                               elapsed_minutes=60, today="2026-09-04") == []
         first = alerts.evaluate("601138.SH", _quote(64.20, high=64.20),
                                 lv, state, "cn", avg_volume=9e7,
-                                elapsed_minutes=60, today="2026-09-04")
+                                elapsed_minutes=61, today="2026-09-04")
         assert [a["kind"] for a in first] == ["接近预警"]
         assert round(first[0]["price"], 2) == 64.84
 

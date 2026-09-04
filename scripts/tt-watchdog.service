@@ -1,0 +1,40 @@
+# 盯盘守护进程的用户级 systemd 服务，装在 ~/.config/systemd/user/ 下。
+#
+# 跟 tt-mcp.service 同一个路子（这台服务器上 sos / sos-autotrader /
+# v5-telegram 也都是用户级，tao 已开 linger，开机自动拉起用户服务）。
+# 操作时 systemctl 一定要带 --user，漏了会去找同名的系统级服务，报 not found。
+#
+# 为什么必须托管，不能 nohup 挂后台：
+#   1. 机器重启后 nohup 起的进程不会自己回来，而盯盘断了是**静默**的——
+#      用户不会收到「今天没提醒是因为进程没起来」这种消息。
+#   2. 崩了没人拉起。Restart=always + RestartSec=30 兜住这一条。
+#   3. nohup 的日志文件不轮转，一直长。交给 journal 自动管。
+#
+# 装和看日志：
+#   systemctl --user enable --now tt-watchdog
+#   journalctl --user -u tt-watchdog -f
+#
+# 日志**不写文件**，跟 tt-mcp 不一样，是有意的：盯盘每轮写一行摘要
+# （20 个交易小时 ≈ 1200 行/天），交给 journal 轮转比自己攒一个越来越大的
+# watchdog.log 省心。
+
+[Unit]
+Description=TT Trading Watchdog (盯盘关键位提醒)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tao/tt-trading-mcp
+ExecStart=/home/tao/tt-trading-mcp/.venv/bin/python watchdog.py
+# 外部接口（AKTools / UW / Telegram）抽风时进程可能整个退出，
+# 必须自动拉起。30 秒是留给「上游正在重启」的缓冲——盯盘一轮 60 秒，
+# 抢在下一轮之前回来就不算漏。
+Restart=always
+RestartSec=30
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONIOENCODING=utf-8"
+
+[Install]
+WantedBy=default.target

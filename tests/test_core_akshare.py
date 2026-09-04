@@ -163,3 +163,42 @@ class TestNeverRaises:
             rows = ak.hourly("600519.SH", bars=3)
         assert len(rows) == 3
         assert [r["close"] for r in rows] == [8.0, 9.0, 10.0]
+
+
+class TestSpotSnapshot:
+    """A股全市场快照——盯盘的实时价就靠它，一趟拿回全市场。"""
+
+    def test_calls_the_sina_endpoint(self, monkeypatch):
+        """必须走新浪的 stock_zh_a_spot。2026-09-04 实测这台 AKTools 上
+        所有 _em（东方财富）后缀接口全部 500。"""
+        monkeypatch.setattr(ak.config, "AKSHARE_BASE_URL", "http://x:8080")
+        with patch.object(ak, "_get", return_value=[]) as spy:
+            ak.spot_snapshot()
+        assert spy.call_args[0][0] == "stock_zh_a_spot"
+
+    def test_uses_a_longer_timeout_than_hourly(self, monkeypatch):
+        """快照实测 15 秒，20 秒只剩 5 秒余量；而这台 AKTools 跟 tt-data-hub
+        的采集任务是同一个服务，采集跑起来时会明显更慢。"""
+        monkeypatch.setattr(ak.config, "AKSHARE_BASE_URL", "http://x:8080")
+        with patch.object(ak, "_get", return_value=[]) as spy:
+            ak.spot_snapshot()
+        assert spy.call_args.kwargs["timeout"] == ak.SPOT_TIMEOUT_SECONDS
+        assert ak.SPOT_TIMEOUT_SECONDS > ak.TIMEOUT_SECONDS
+
+    def test_hourly_timeout_is_unchanged(self, monkeypatch):
+        """给 _get 加超时参数不能改变 hourly() 既有的行为：它仍然不传，
+        走 TIMEOUT_SECONDS 那 20 秒。"""
+        monkeypatch.setattr(ak.config, "AKSHARE_BASE_URL", "http://x:8080")
+        with patch.object(ak, "_get", return_value=[]) as spy:
+            ak.hourly("600519.SH")
+        assert spy.call_args.kwargs.get("timeout") is None
+
+    def test_failure_returns_empty_list_not_raise(self, monkeypatch):
+        """跟本模块其他函数一个规矩：取不到返回空，不抛异常。"""
+        monkeypatch.setattr(ak.config, "AKSHARE_BASE_URL", "http://x:8080")
+        with patch.object(ak, "_get", side_effect=OSError("超时")):
+            assert ak.spot_snapshot() == []
+
+    def test_not_configured_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(ak.config, "AKSHARE_BASE_URL", "")
+        assert ak.spot_snapshot() == []
