@@ -65,6 +65,35 @@ LANG_UI = os.getenv("LANG_UI", "en")
 # 没配这个地址也不会坏，只是 A股小时线退回库里那 150 只。
 AKSHARE_BASE_URL = os.getenv("AKSHARE_BASE_URL", "")
 
+# 盯盘守护进程（watchdog.py）。跟 MCP 服务分开跑，互不拖累。
+#
+# Telegram 机器人是复用用户已有的那个，token 和 chat id 得自己填进 .env——
+# 代码不猜、也不去别的项目里找。没配就直接报错退出，不静默不推送：
+# 一个「以为在盯盘、其实什么都没发」的进程比没有更糟。
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+
+# 服务器在国内，Telegram 要走代理。形如 http://127.0.0.1:7890。
+# 留空表示直连。
+TG_PROXY = os.getenv("TG_PROXY", "")
+
+# 每轮间隔（秒）。一轮实测：A股快照 15 秒 + 美股 6 只并发 14 秒，
+# 60 秒绰绰有余。
+WATCHDOG_INTERVAL = int(os.getenv("WATCHDOG_INTERVAL", "60"))
+
+# 预警线距关键位多远（小数，0.01 = 1%）。这个值是比出来的：
+# 601138 在 2026-09-04 昨收 63.20、开盘 63.84，退 2% 的预警线落在 63.54，
+# 开盘就已越过，等于一开盘就叫；退 1% 落在 64.19，盘中真涨上去才触发。
+WATCHDOG_WARN_DIST = float(os.getenv("WATCHDOG_WARN_DIST", "0.01"))
+
+# 盘前要不要盯。盘前成交量只占全天 1%~2%，信号成色差，
+# 但财报和突发消息常在那时候发酵，默认还是盯（门槛自动提高）。
+WATCHDOG_PREMARKET = os.getenv("WATCHDOG_PREMARKET", "1") not in ("0", "false", "")
+
+# 去重状态存哪。进程重启不该重复轰炸用户，所以要落地。
+WATCHDOG_STATE_FILE = os.getenv(
+    "WATCHDOG_STATE_FILE", str(BASE_DIR / ".watchdog_state.json"))
+
 # MCP remote server
 MCP_PORT = int(os.getenv("MCP_PORT", "8766"))
 MCP_TOKEN = os.getenv("MCP_TOKEN", "")
