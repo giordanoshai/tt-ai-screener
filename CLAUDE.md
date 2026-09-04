@@ -59,6 +59,7 @@ This is the canonical list of tools this server exposes (12 tools). Each tool ma
 ```
 tt-trading-mcp/
   main.py                # Unified entrypoint (web + MCP, or MCP stdio)
+  watchdog.py            # 盯盘守护进程，独立于 MCP 跑。python watchdog.py [--once]
   server.py              # MCP server — registers all 12 tools, token auth
   config.py              # Postgres URLs, fallback AI env vars, MCP port/token
   ai_client.py           # OpenAI/Anthropic-compatible AI client; reads config/models.json
@@ -82,6 +83,17 @@ tt-trading-mcp/
     uw.py                       # Unusual Whales 实时接口客户端（期权异动/警报/美股小时线），
                                  # 带浏览器 UA。小时线用 3M 档，只留盘中那一档，取不到返回空
     akshare.py                   # 自建 AKTools 实时客户端。只做 A股小时线，取不到返回空
+    levels.py                    # 关键位计算：从日线找头顶的坎和脚下的坎。
+                                 # 【用收盘价找位，不用最高价】——插针不算数，
+                                 # 收得住才算数。纯函数，不碰库不碰网
+    session.py                   # 交易时段：A股只有盘中，美股有盘前盘后，
+                                 # 一天要盯 20 小时。冬令时美股三段各顺延 1 小时
+    quotes.py                    # 实时价，两个市场两条路：A股走新浪全市场快照
+                                 # （一趟 15 秒拿 5555 只），美股走 UW 1 分钟线
+                                 # 并发拉。【AKTools 上东财源全部 500，只能用新浪】
+    alerts.py                    # 报警判定：只推有效突破/假突破/跌破三类，
+                                 # 预警穿越触发。盘中量比必须按时间折算
+    notify.py                    # Telegram 推送，_post 单独抽出来给测试换
   tools/
     compact.py           # 交出去之前压一压：小数按字段截断、时间只留日期。
                          # 量级混着放，加字段前先确认是百分点还是小数
@@ -264,6 +276,12 @@ AKSHARE_BASE_URL=...       # 自建 AKTools（AKShare 的 HTTP 封装），跟 t
                             # 同一个服务，形如 http://127.0.0.1:8080/api/public。
                             # 只用于 A股小时线的【实时】取数，见 core/akshare.py。
                             # 不配也不会坏，只是 A股小时线退回库里那 150 只
+TG_BOT_TOKEN=...           # 盯盘推送用的 Telegram 机器人（复用已有的那个）
+TG_CHAT_ID=...             # 推给谁
+TG_PROXY=...               # 服务器在国内，Telegram 要走代理，形如 http://127.0.0.1:7890
+WATCHDOG_INTERVAL=60       # 盯盘每轮间隔秒数
+WATCHDOG_WARN_DIST=0.01    # 预警线距关键位多远（小数），默认提前 1%
+WATCHDOG_PREMARKET=1       # 美股盘前要不要盯，默认要
 UW_API_TOKEN=...           # Unusual Whales（期权异动 + 美股小时线）。历史遗留键名
                             # UW_T_ENDPOINT / UW_T_KEY 也认，config.py 两套都读。
                             # 不配也不会坏，但美股小时线会退回库里那 247 只，
