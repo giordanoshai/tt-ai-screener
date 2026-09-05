@@ -32,6 +32,17 @@ UW_API_TOKEN = os.getenv("UW_API_TOKEN") or os.getenv("UW_T_KEY", "")
 # 给到 20 秒是留给网络抖动的余量；超了就当这一路没有，走降级。
 UW_TIMEOUT = float(os.getenv("UW_TIMEOUT", "20"))
 
+# UW 要出国。2026-09-05 之前这一路一行代理配置都没有，靠开发机上碰巧
+# 设着的 HTTP_PROXY 环境变量在走——MCP 由 Claude Desktop 以子进程拉起、
+# 或者服务器上用 systemd / 计划任务跑的时候，那个变量不一定继承得到，
+# 掉了也没人知道（core/uw.py 吞掉一切异常，只表现成「数据全是空的」）。
+#
+# 形如 http://127.0.0.1:1081（服务器）/ http://127.0.0.1:1080（开发机）。
+# 【必须是 HTTP 代理，不能是 SOCKS】，跟 TG_PROXY 同一个理由：Python
+# 标准库的 urllib 不支持 SOCKS，配了也是白配。配错了 core/uw.py 会明确
+# 报错，不静默。留空 = 保持原样，跟随系统的 HTTP_PROXY / HTTPS_PROXY。
+UW_PROXY = os.getenv("UW_PROXY", "")
+
 # AI 模型的正式配置在 config/models.json（原来是 DuckDB 的 ai_models 表，
 # 迁库时漏了，线上没有）。**密钥不在那个 JSON 里**：每个模型只写一个
 # api_key_env 字段指明环境变量名（ANTHROPIC_API_KEY / DASHSCOPE_API_KEY /

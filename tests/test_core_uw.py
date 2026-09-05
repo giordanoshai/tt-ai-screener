@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """UW 实时客户端。纯函数部分离线测，联网部分只做冒烟。"""
+import urllib.error
+
 import pytest
 
+import config
 from core import uw
 
 
@@ -234,3 +237,91 @@ def test_hourly_without_a_token_does_not_call_the_api(monkeypatch):
     monkeypatch.setattr(uw, "available", lambda: False)
     monkeypatch.setattr(uw, "get", lambda *a, **k: pytest.fail("不该发请求"))
     assert uw.hourly("AAPL") == []
+
+
+# ---------------- 出网走哪条路 ----------------
+
+@pytest.fixture
+def spy_fetch(monkeypatch):
+    """把真正发请求那层换成录音机，只记下「这一趟打算走哪个代理」。"""
+    seen = {}
+
+    def fake(request, timeout, proxy):
+        seen["proxy"] = proxy
+        seen["timeout"] = timeout
+        return {"data": [{"ok": 1}]}
+
+    monkeypatch.setattr(uw, "_fetch", fake)
+    monkeypatch.setattr(uw, "available", lambda: True)
+    return seen
+
+
+class TestProxy:
+    """UW 的请求要出国。原来这一路完全没有代理配置，靠机器上碰巧存在的
+    HTTP_PROXY 环境变量在走——换台机器（服务器上的 systemd、Claude Desktop
+    拉起来的 MCP 子进程）就可能悄悄变成直连，而 get() 吞掉一切异常，
+    表现只是「期权数据怎么全是空的」。所以配置要显式，配错要出声。"""
+
+    def test_configured_proxy_reaches_the_request(self, monkeypatch, spy_fetch):
+        monkeypatch.setattr(config, "UW_PROXY", "http://127.0.0.1:1081")
+        assert uw.get("/api/whatever") == [{"ok": 1}]
+        assert spy_fetch["proxy"] == "http://127.0.0.1:1081"
+
+    def test_bare_address_gets_a_scheme(self, monkeypatch, spy_fetch):
+        """漏写 http:// 是最常见的配错，补上而不是让它静默失效。"""
+        monkeypatch.setattr(config, "UW_PROXY", "127.0.0.1:1081")
+        uw.get("/api/whatever")
+        assert spy_fetch["proxy"] == "http://127.0.0.1:1081"
+
+    def test_unset_means_follow_the_environment(self, monkeypatch, spy_fetch):
+        """没配就是原来的行为：跟随系统的 HTTP_PROXY，不强行改成直连。"""
+        monkeypatch.setattr(config, "UW_PROXY", "")
+        uw.get("/api/whatever")
+        assert spy_fetch["proxy"] == ""
+
+    def test_socks_proxy_fails_loudly_instead_of_silently(
+            self, monkeypatch, capsys):
+        """标准库不支持 SOCKS。不能假装直连——那会超时十几秒然后返回
+        None，看日志根本不知道该改什么。"""
+        monkeypatch.setattr(config, "UW_PROXY", "socks5://127.0.0.1:1080")
+        monkeypatch.setattr(uw, "available", lambda: True)
+        monkeypatch.setattr(uw, "_fetch",
+                            lambda *a, **k: pytest.fail("配错了还发什么请求"))
+        uw.reset_warnings()
+
+        assert uw.get("/api/whatever") is None
+
+        warned = capsys.readouterr().err
+        assert "SOCKS" in warned and "UW_PROXY" in warned
+
+    def test_the_same_misconfiguration_only_warns_once(
+            self, monkeypatch, capsys):
+        """一轮盯盘要调几十次接口，同一个配错不该刷几十行。"""
+        monkeypatch.setattr(config, "UW_PROXY", "socks5://127.0.0.1:1080")
+        monkeypatch.setattr(uw, "available", lambda: True)
+        uw.reset_warnings()
+
+        for _ in range(5):
+            uw.get("/api/whatever")
+
+        assert capsys.readouterr().err.count("SOCKS") == 1
+
+
+class TestFailuresAreVisible:
+
+    def test_a_dead_request_says_so_on_stderr(self, monkeypatch, capsys):
+        """取不到还是返回 None（调用方的降级契约不变），但要留下痕迹，
+        不然「代理掉了」和「这只票没有期权数据」长得一模一样。"""
+        monkeypatch.setattr(config, "UW_PROXY", "http://127.0.0.1:1081")
+        monkeypatch.setattr(uw, "available", lambda: True)
+
+        def boom(*a, **k):
+            raise urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(uw, "_fetch", boom)
+        uw.reset_warnings()
+
+        assert uw.get("/api/whatever") is None
+
+        warned = capsys.readouterr().err
+        assert "127.0.0.1:1081" in warned

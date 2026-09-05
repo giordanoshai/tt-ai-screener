@@ -94,6 +94,10 @@ tt-trading-mcp/
     alerts.py                    # 报警判定：只推有效突破/假突破/跌破三类，
                                  # 预警穿越触发。盘中量比必须按时间折算
     notify.py                    # Telegram 推送，_post 单独抽出来给测试换
+    net.py                       # 出网公共设施：代理地址规范化 + opener 构造。
+                                 # uw.py 和 notify.py 共用，两边都要挡同样的
+                                 # 配错（漏协议头、配成 SOCKS）。akshare.py
+                                 # 不用它——那边要的是【绕开】代理
   tools/
     compact.py           # 交出去之前压一压：小数按字段截断、时间只留日期。
                          # 量级混着放，加字段前先确认是百分点还是小数
@@ -299,6 +303,16 @@ UW_API_TOKEN=...           # Unusual Whales（期权异动 + 美股小时线）�
                             # UW_T_ENDPOINT / UW_T_KEY 也认，config.py 两套都读。
                             # 不配也不会坏，但美股小时线会退回库里那 247 只，
                             # 而那份数据自 2026-09-03 起不再每天更新（上游改成了按需）
+UW_PROXY=...               # UW 接口出国用的代理。开发机 http://127.0.0.1:1080，
+                            # 服务器 http://127.0.0.1:1081——两台端口不一样。
+                            # 【必须是 HTTP 代理，不能是 SOCKS】，跟 TG_PROXY
+                            # 同一个限制（urllib 不支持 SOCKS）。配成 SOCKS 会被
+                            # core/uw.py 挡下并明确报错，不静默直连。
+                            # 留空 = 跟随系统 HTTP_PROXY/HTTPS_PROXY 环境变量，
+                            # 这是 2026-09-05 之前唯一的走法：那天之前 core/uw.py
+                            # 一行代理配置都没有，全靠开发机上碰巧设着的环境变量。
+                            # systemd、计划任务、Claude Desktop 拉起的 MCP 子进程
+                            # 都不一定继承得到，所以正式部署要显式写上
 MCP_PORT=8766
 MCP_TOKEN=...              # auto-generated on first run
 MCP_ALLOWED_HOSTS=...      # 逗号分隔。MCP SDK 的 Host 白名单默认只放行

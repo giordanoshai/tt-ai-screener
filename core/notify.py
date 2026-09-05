@@ -23,6 +23,7 @@ import urllib.parse
 import urllib.request
 
 import config
+from core import net
 
 #: 推送标题的来源标识。这个 Telegram 机器人是跟别的系统共用的
 #: （交易执行那套发出来的是「【SOS】✅ 已买入 · …」），所以每条消息
@@ -142,30 +143,10 @@ def _warn(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-def normalize_proxy(proxy: str):
-    """把配置里的代理地址规范成 urllib 认得的样子。
-
-    返回 `""` 表示直连（合法配置），返回 `None` 表示**这个代理根本用不了**，
-    调用方必须明确报错，不能假装直连。
-
-    两种配错要在这里挡住，都是 2026-09-04 首次冒烟真实踩到的：
-
-    1. **没写协议头**（`127.0.0.1:7890`）。urllib 会把冒号前面的
-       `127.0.0.1` 当成协议名去解析，代理配置直接失效、退化成直连，
-       然后连 Telegram 超时。补一个 `http://` 就好。
-
-    2. **SOCKS 代理**（`socks5://…`）。**Python 标准库不支持 SOCKS**，
-       `urllib.request.ProxyHandler` 只认 HTTP/HTTPS 代理。配了也是白配，
-       表现跟第一种一样是静默超时。这里直接挡下并说清原因——多数代理软件
-       同时开着 HTTP 端口，换一个端口就行，不值得为此引入新依赖。
-    """
-    text = (proxy or "").strip()
-    if not text:
-        return ""                       # 空 = 直连，合法
-    scheme = text.split("://", 1)[0].lower() if "://" in text else ""
-    if scheme.startswith("socks"):
-        return None                     # 标准库用不了，交给调用方报错
-    return text if scheme else "http://" + text
+#: 代理地址的规范化搬到了 `core/net.py`——UW 那一路也要用同一套规则，
+#: 不能有第二份实现。这里保留同名重新导出，别处 `notify.normalize_proxy(...)`
+#: 的写法不用改。
+normalize_proxy = net.normalize_proxy
 
 
 def _post(url: str, data: bytes, proxy: str):
@@ -173,9 +154,9 @@ def _post(url: str, data: bytes, proxy: str):
 
     单独抽出来只为一件事：测试里能整体换掉，绝不真发消息。
     """
-    handler = urllib.request.ProxyHandler(
-        {"http": proxy, "https": proxy} if proxy else {})
-    opener = urllib.request.build_opener(handler)
+    # 没配代理 = 强制直连，连环境变量里的也绕开。推送走哪条路只由 .env
+    # 一处说了算，见 `core/net.build_opener` 里 env_when_empty 那段。
+    opener = net.build_opener(proxy)
     request = urllib.request.Request(
         url, data=data,
         headers={"Content-Type": "application/x-www-form-urlencoded"})

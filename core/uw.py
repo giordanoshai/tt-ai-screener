@@ -8,9 +8,20 @@
 ATR 库里已经算好了，查一次 0.1 秒；换成实时要调 2000 多次日线接口，
 并发 20 路也要 15 分钟，在对话里等不到。
 
+## 「中转」和「代理」是两个东西，别搞混
+
+底下会反复出现两个容易混为一谈的词，先说清楚：
+
+* **中转**：`.env` 里那个 `https://ai-tool.indevs.in/unusualwhales`，
+  是 UW 官方接口的转发站，不直连官方域名。它挡在 Cloudflare 后面。
+* **代理**：`UW_PROXY`，本机的翻墙代理（开发机 1080，服务器 1081），
+  用来把请求送出国。见下面 `get()` 的注释。
+
+下面第 1 条说的是中转站的脾气，跟代理没关系。
+
 ## 两个必须知道的坑
 
-1. **必须带浏览器 User-Agent。** 代理挡在 Cloudflare 后面，Python 默认的
+1. **必须带浏览器 User-Agent。** 中转站挡在 Cloudflare 后面，Python 默认的
    `Python-urllib/3.12` 会被当成爬虫，直接 403（页面里写的是 Error 1010）。
    这跟 token 没关系，换任何鉴权写法都救不了。
 2. **`/api/alerts` 返回的 `symbol` 是期权合约代码**（`NVDA261002P00190000`），
@@ -38,11 +49,13 @@ import concurrent.futures
 import datetime
 import json
 import math
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
 import config
+from core import net
 
 try:
     from zoneinfo import ZoneInfo
@@ -55,7 +68,7 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/126.0.0.0 Safari/537.36")
 
-#: 并发取多只票时的线程数。6 只持仓一轮 4 秒左右，再高对代理不礼貌。
+#: 并发取多只票时的线程数。6 只持仓一轮 4 秒左右，再高对中转站不礼貌。
 MAX_WORKERS = 6
 
 #: 期权合约代码（OCC 格式）里，股票代码之后就是 6 位到期日。
@@ -69,7 +82,7 @@ _OCC_TAIL_LEN = 15
 #:   * 1M 档只有 **138 根**盘中线，撑不起 `tools/hourly.py` 的 MAX_BARS=200；
 #:     3M 档有 390 根，留足了假期和停牌缺根的余量。
 #:   * 换小窗口省不到时间——1M 档 12.9 秒、3M 档 14.0 秒，耗时几乎全是
-#:     代理那边的固定开销，跟传多少行没什么关系。所以也别为了「快一点」
+#:     中转站那边的固定开销，跟传多少行没什么关系。所以也别为了「快一点」
 #:     改回 1M，只会换来一条永远算不出来的 200 小时均线。
 #: 同样别往上加档：更大的窗口纯粹多传数据，这里最多只用 200 根。
 #: `tt-data-hub` 的 `hub/jobs/us_hourly.py` 用的是同一个档位。
@@ -101,21 +114,73 @@ def _to_float(value, default: float = 0.0) -> float:
         return default
 
 
-def _fetch(request: urllib.request.Request, timeout: float):
+#: 已经喊过的话，喊过就不再喊。一轮盯盘要调几十次接口，同一个配错
+#: 刷几十行的话，日志就没人看了，等于又回到了静默失败。
+_WARNED: set[str] = set()
+
+
+def reset_warnings() -> None:
+    """清空「喊过了」的记录。给测试用，也给长跑进程留个手动复位的口子。"""
+    _WARNED.clear()
+
+
+def _warn_once(key: str, message: str) -> None:
+    """同一件事只往 stderr 喊一次。
+
+    走 stderr 不是随便选的：MCP 的 stdio 模式下 stdout 是协议通道，
+    往那儿写一个字都会把连接搞坏。`core/notify.py` 也是这个规矩。
+    """
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    print(message, file=sys.stderr)
+
+
+def _fetch(request: urllib.request.Request, timeout: float, proxy: str):
     """真正发请求的那一层。异常照抛，由 `get()` 统一吞掉。
 
     单独抽出来只为一件事：测试里能整体换掉。跑测试的机器上配着真密钥，
     不拦的话每个用例都会静悄悄地发真实请求，结果随线上行情变化——
     同一份代码今天绿明天红。见 `tests/conftest.py`。
+
+    `proxy` 为空串时跟随系统的 `HTTP_PROXY`，也就是这一路一直以来的
+    行为，见 `get()` 里那段注释。
     """
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    opener = net.build_opener(proxy, env_when_empty=True)
+    with opener.open(request, timeout=timeout) as response:
         return json.loads(response.read())
 
 
 def get(path: str, params: dict | None = None,
         timeout: float | None = None) -> list[dict] | None:
-    """调一个接口，返回 data 数组。任何失败都返回 None，不抛。"""
+    """调一个接口，返回 data 数组。任何失败都返回 None，不抛。
+
+    ## 出网走哪条路
+
+    UW 要出国。2026-09-05 之前这一路**没有任何代理配置**——用的是
+    `urllib.request.urlopen`，而它自己会去读 `HTTP_PROXY` 环境变量，
+    开发机上那个变量一直设着，所以「碰巧」一直是走代理的。
+
+    碰巧不算数：MCP 由 Claude Desktop 以子进程拉起、或者服务器上用
+    systemd / 计划任务跑的时候，那些变量不一定继承得到。一旦掉了，
+    这里每个接口都返回 None，而调用方只会表现成「期权数据怎么全是空的」
+    「美股小时线怎么又退回库里了」——库里那份从 2026-09-03 起就不再更新，
+    等于拿着越来越旧的数据当实时用，还看不出根因。
+
+    所以给了显式的 `UW_PROXY`：配了就走它，留空才跟随环境变量。
+    """
     if not available():
+        return None
+
+    proxy = net.normalize_proxy(config.UW_PROXY)
+    if proxy is None:
+        # 配了 SOCKS。不能假装直连——那会超时十几秒再返回 None，
+        # 看日志完全不知道该改什么。跟 `core/notify.py` 同一个处理。
+        _warn_once("proxy:socks",
+                   "UW 取不到数据：UW_PROXY 配的是 SOCKS 代理（%s），"
+                   "而 Python 标准库的 urllib 只支持 HTTP/HTTPS 代理。"
+                   "请改配代理软件的 HTTP 端口（多数软件两个端口同时开着）。"
+                   % config.UW_PROXY)
         return None
 
     url = config.UW_API_BASE + path
@@ -128,8 +193,14 @@ def get(path: str, params: dict | None = None,
         "User-Agent": BROWSER_UA,   # 少了这行就是 403，见模块注释
     })
     try:
-        payload = _fetch(request, timeout or config.UW_TIMEOUT)
-    except Exception:
+        payload = _fetch(request, timeout or config.UW_TIMEOUT, proxy)
+    except Exception as exc:
+        # 返回值仍然是 None——调用方的降级契约一个字都没变。但要留下痕迹：
+        # 「代理断了」和「这只票本来就没有期权数据」在 None 面前长得
+        # 一模一样，不说一声就永远分不出来。按异常类型去重，一类只喊一次。
+        _warn_once("fetch:%s" % type(exc).__name__,
+                   "UW 请求失败（%s）：%r。后续同类失败不再重复提示。"
+                   % ("经代理 " + proxy if proxy else "跟随系统代理设置", exc))
         return None
 
     if isinstance(payload, list):
