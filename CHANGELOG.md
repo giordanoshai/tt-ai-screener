@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+### [2026-11-18] 合并 `TTAiTradingSystem` 的 27 个 MCP 工具至 `tt-trading-mcp`
+* **新增 (Added)**:
+  - 新增 [tools/_common.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tools/_common.py)，抽取 `dump_json`、`normalize_direction`、`calc_mfe_capture_rate`、`resolve_market` 等公共辅助函数。
+  - 新增 [tools/trade_journal.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tools/trade_journal.py)（7 个工具：`get_recent_trades`、`get_recent_trades_light`、`get_trade_details`、`get_strategy_templates`、`get_strategy_signals`、`get_option_ohlcv`、`get_option_market_snapshots`）。
+  - 新增 [tools/journal_notes.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tools/journal_notes.py)（10 个工具：`get_recent_notes`、`get_daily_trade_notes`、`create_note`、`update_note`、`get_trader_daily_logs`、`create_or_update_trader_daily_log`、`get_trade_emotions`、`get_trading_rules`、`get_energy_schedules`、`get_activity_sessions`）。
+  - 新增 [tools/market_context.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tools/market_context.py)（10 个工具：`get_latest_market_breadth`、`get_market_regime_history`、`get_daily_news_summary`、`search_stock_news`、`get_news_sentiment_summary`、`search_stocks_meta`、`get_stock_ohlcv`、`get_stock_fundamentals`、`get_system_logs`、`analyze_server_status`）。
+  - 在 [config.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/config.py) 新增 `TTAI_LOG_DIR` 配置项；新增 [PLAN.md](file:///d:/Dev_project/Python_Project/tt-trading-mcp/PLAN.md) 与 [tests/test_merged_tools.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tests/test_merged_tools.py)。
+* **修改 (Changed)**:
+  - 在 [server.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/server.py) 注册全部 27 个新工具（服务总工具数增至 40 个），并剔除与本仓库重复的 6 个旧版自选/选股工具。
+  - 更新 [tests/test_main.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tests/test_main.py)、[AGENTS.md](file:///d:/Dev_project/Python_Project/tt-trading-mcp/AGENTS.md) 与 [README.md](file:///d:/Dev_project/Python_Project/tt-trading-mcp/README.md)。
+
+### [2026-11-18] 精简 `review_tonight_trades` 返回结构并新增该 MCP 工具
+* **新增 (Added)**:
+  - 新增 [tools/review_tonight_trades.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tools/review_tonight_trades.py) 并在 [server.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/server.py) 注册为 MCP 工具 `review_tonight_trades`。
+  - 支持按美东时间 (`America/New_York`) 交易日窗口（默认取当前美东日期，自动处理冬夏令时）从 `ftt_spread_trades`（垂直价差）和 `ftt_trades`（单腿期权）读取开/平仓记录。
+  - 新增测试 [tests/test_review_tonight_trades.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tests/test_review_tonight_trades.py)。
+* **修改 (Changed)**:
+  - 精简 `review_tonight_trades` 返回体：公共口径（`account`、`tz`、`unit`）收敛到 `summary`，逐笔明细移除重复字段与空/默认布尔标记、当日时间压缩为 `HH:MM:SS`、各腿成交价压缩为 `legs_in` / `legs_out`（`{side: fill_price}`）。
+  - 同步更新 [tests/test_main.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tests/test_main.py) 的注册工具清单及 [AGENTS.md](file:///d:/Dev_project/Python_Project/tt-trading-mcp/AGENTS.md)、[README.md](file:///d:/Dev_project/Python_Project/tt-trading-mcp/README.md) 文档。
+
 ### [2026-09-05] UW 的代理从「碰巧有」改成「明着配」
 
 UW 的接口要出国，但这一路一行代理配置都没有——`core/uw.py` 用的是

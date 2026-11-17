@@ -18,6 +18,40 @@ from tools.scan_swing import scan_swing
 from tools.analyze_ticker import analyze_ticker
 from tools.detect_catalysts import detect_catalysts
 from tools.watch_positions import watch_positions
+from tools.review_tonight_trades import review_tonight_trades
+from tools.trade_journal import (
+    get_recent_trades,
+    get_recent_trades_light,
+    get_trade_details,
+    get_strategy_templates,
+    get_strategy_signals,
+    get_option_ohlcv,
+    get_option_market_snapshots,
+)
+from tools.journal_notes import (
+    get_recent_notes,
+    get_daily_trade_notes,
+    create_note,
+    update_note,
+    get_trader_daily_logs,
+    create_or_update_trader_daily_log,
+    get_trade_emotions,
+    get_trading_rules,
+    get_energy_schedules,
+    get_activity_sessions,
+)
+from tools.market_context import (
+    get_latest_market_breadth,
+    get_market_regime_history,
+    get_daily_news_summary,
+    search_stock_news,
+    get_news_sentiment_summary,
+    search_stocks_meta,
+    get_stock_ohlcv,
+    get_stock_fundamentals,
+    get_system_logs,
+    analyze_server_status,
+)
 
 # streamable_http_path 默认是 "/mcp"，而这个应用又把它整个 Mount 在 "/mcp"
 # 底下，两段路径会叠起来，真实地址变成 "/mcp/mcp"——跟 README、CLAUDE.md
@@ -50,6 +84,7 @@ mcp.tool()(scan_swing)           # 盘后找值得做的波段机会
 mcp.tool()(analyze_ticker)       # 单独一只票的完整体检
 mcp.tool()(detect_catalysts)     # 出了什么事，跟我有没有关系
 mcp.tool()(watch_positions)      # 持仓上有没有要立刻处理的信号
+mcp.tool()(review_tonight_trades)  # 今晚（美东当日）FT 交易复盘与明细
 
 # 选股（长线，本轮没动）
 mcp.tool()(screen_stocks)
@@ -63,6 +98,39 @@ mcp.tool()(remove_from_watchlist)
 mcp.tool()(list_positions)
 mcp.tool()(add_position)
 mcp.tool()(remove_position)
+
+# 交易复盘与期权流水（由 TTAiTradingSystem 合并）
+mcp.tool()(get_recent_trades)
+mcp.tool()(get_recent_trades_light)
+mcp.tool()(get_trade_details)
+mcp.tool()(get_strategy_templates)
+mcp.tool()(get_strategy_signals)
+mcp.tool()(get_option_ohlcv)
+mcp.tool()(get_option_market_snapshots)
+
+# 交易笔记、心理日志、情绪与风控规则
+mcp.tool()(get_recent_notes)
+mcp.tool()(get_daily_trade_notes)
+mcp.tool()(create_note)
+mcp.tool()(update_note)
+mcp.tool()(get_trader_daily_logs)
+mcp.tool()(create_or_update_trader_daily_log)
+mcp.tool()(get_trade_emotions)
+mcp.tool()(get_trading_rules)
+mcp.tool()(get_energy_schedules)
+mcp.tool()(get_activity_sessions)
+
+# 市场广度、新闻、基础行情查询与运维诊断
+mcp.tool()(get_latest_market_breadth)
+mcp.tool()(get_market_regime_history)
+mcp.tool()(get_daily_news_summary)
+mcp.tool()(search_stock_news)
+mcp.tool()(get_news_sentiment_summary)
+mcp.tool()(search_stocks_meta)
+mcp.tool()(get_stock_ohlcv)
+mcp.tool()(get_stock_fundamentals)
+mcp.tool()(get_system_logs)
+mcp.tool()(analyze_server_status)
 
 # 下线的三个：
 #   analyze_watchlist -> scan_swing(scope="pool")

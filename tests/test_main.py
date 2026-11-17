@@ -88,9 +88,22 @@ class TestServerTools:
         "analyze_ticker",
         "detect_catalysts",
         "watch_positions",
+        "review_tonight_trades",
         "screen_stocks",
         "list_watchlist", "add_to_watchlist", "remove_from_watchlist",
         "list_positions", "add_position", "remove_position",
+        # 合并自 TTAiTradingSystem 的 27 个工具
+        "get_recent_trades", "get_recent_trades_light", "get_trade_details",
+        "get_strategy_templates", "get_strategy_signals",
+        "get_option_ohlcv", "get_option_market_snapshots",
+        "get_recent_notes", "get_daily_trade_notes", "create_note", "update_note",
+        "get_trader_daily_logs", "create_or_update_trader_daily_log",
+        "get_trade_emotions", "get_trading_rules",
+        "get_energy_schedules", "get_activity_sessions",
+        "get_latest_market_breadth", "get_market_regime_history",
+        "get_daily_news_summary", "search_stock_news", "get_news_sentiment_summary",
+        "search_stocks_meta", "get_stock_ohlcv", "get_stock_fundamentals",
+        "get_system_logs", "analyze_server_status",
     }
 
     def test_registered_tools(self):

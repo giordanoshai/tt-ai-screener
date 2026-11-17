@@ -124,3 +124,7 @@ MCP_TOKEN = os.getenv("MCP_TOKEN", "")
 #   MCP_ALLOWED_HOSTS=192.168.1.38:*,mcp.example.com
 MCP_ALLOWED_HOSTS = [h.strip() for h in
                      os.getenv("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+
+# 合并 TTAiTradingSystem 运维工具后，日志默认读取相邻目录或环境变量 TTAI_LOG_DIR
+TTAI_LOG_DIR = os.getenv(
+    "TTAI_LOG_DIR", str(BASE_DIR.parent / "TTAiTradingSystem" / "logs"))
