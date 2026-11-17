@@ -65,6 +65,26 @@ def test_real_spread_trades_and_summary_math():
     with_cancelled = _run(date="2026-11-17", include_cancelled=True)
     assert len(with_cancelled["trades"]) == len(trades) + summary["cancelled"]
 
+    # 当晚交易日志（notes.daily_trade_note=true）同时返回并清洗掉 HTML 标签
+    notes = out["trade_notes"]
+    assert summary["notes_count"] == len(notes)
+    assert len(notes) >= 1
+    assert any(n["id"] == "4fd42711-febc-43d5-acdd-1e6d7b97363b" for n in notes)
+    assert all("<p>" not in n["content"] for n in notes)
+
+
+def test_real_daily_log_included_when_present():
+    out = _run(date="2026-11-13")
+    assert out["data_gaps"] == []
+    assert "daily_log" in out
+    assert out["daily_log"]["log_date"] == "2026-11-13"
+    assert "伽马墙" in out["daily_log"]["daily_review"]
+
+
+def test_clean_html_helper():
+    assert rtt._clean_html("<p>第一行</p><p>第二行<br/>第三行</p>") == "第一行\n第二行\n第三行"
+    assert rtt._clean_html(None) == ""
+
 
 def test_real_single_leg_ftt_trades_included():
     out = _run(date="2026-11-06")
@@ -111,6 +131,8 @@ def test_one_table_failure_records_data_gap_without_crashing(monkeypatch):
     def fake_query(sql, params=None):
         if "ftt_spread_trades" in sql:
             raise RuntimeError("spread table unavailable")
+        if "from notes" in sql:
+            return []
         return [{
             "order_id": "FT-9999",
             "ticker": "QQQ",
@@ -129,8 +151,10 @@ def test_one_table_failure_records_data_gap_without_crashing(monkeypatch):
         }]
 
     monkeypatch.setattr(rtt.pg, "query", fake_query)
+    monkeypatch.setattr(rtt.pg, "query_one", lambda sql, params=None: None)
     out = _run(date="2026-11-17")
     assert len(out["data_gaps"]) == 1
     assert "ftt_spread_trades" in out["data_gaps"][0]
     assert [t["id"] for t in out["trades"]] == ["FT-9999"]
+    assert out["trade_notes"] == []
     assert out["summary"]["pnl_usd"] == 20.0

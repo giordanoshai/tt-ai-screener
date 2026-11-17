@@ -14,7 +14,9 @@
 """
 from collections import defaultdict
 from datetime import date as date_cls, datetime, time, timedelta, timezone
+import html
 import json
+import re
 from zoneinfo import ZoneInfo
 
 from db import pg
@@ -68,6 +70,47 @@ where (entry_time >= %s and entry_time < %s)
    or (exit_time  >= %s and exit_time  < %s)
 order by entry_time asc, order_id asc
 """
+
+_NOTES_SQL = """
+select
+    id,
+    content,
+    source,
+    trade_date,
+    created_at
+from notes
+where daily_trade_note = true
+  and (
+      trade_date = %s::date
+      or (trade_date is null and created_at >= %s and created_at < %s)
+  )
+order by created_at asc
+"""
+
+_DAILY_LOG_SQL = """
+select
+    log_date,
+    mood_score,
+    energy_level,
+    focus_score,
+    sleep_hours,
+    daily_review
+from trader_daily_log
+where log_date = %s::date
+order by id desc
+limit 1
+"""
+
+
+def _clean_html(raw: str | None) -> str:
+    if not raw:
+        return ""
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", raw, flags=re.IGNORECASE)
+    text = re.sub(r"</\s*(p|div|li|h[1-6])\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in text.splitlines()]
+    return "\n".join(ln for ln in lines if ln)
 
 
 def _et_day_bounds(date_str: str | None) -> tuple[date_cls, datetime, datetime]:
@@ -223,7 +266,7 @@ def _normalize_single(row: dict, target_date: date_cls) -> dict:
 
 
 def _summarize(all_trades: list[dict], target_date: date_cls,
-               cancelled_count: int) -> dict:
+               cancelled_count: int, notes_count: int = 0) -> dict:
     real_trades = [t for t in all_trades if t["status"] != "cancelled"]
     closed = [t for t in real_trades if t["status"] == "closed"]
     open_trades = [t for t in real_trades if t["status"] == "open"]
@@ -291,16 +334,31 @@ def _summarize(all_trades: list[dict], target_date: date_cls,
         "worst": {"id": worst["id"], "ticker": worst["ticker"], "pnl": worst["pnl"]} if worst else None,
         "by_ticker": by_ticker,
         "by_reason": dict(reason_counts),
+        "notes_count": notes_count,
         "note": note,
     }
 
 
+def _normalize_daily_log(row: dict | None) -> dict | None:
+    if not row:
+        return None
+    out: dict = {"log_date": str(row["log_date"])[:10]}
+    for key in ("mood_score", "energy_level", "focus_score", "sleep_hours"):
+        if row.get(key) is not None:
+            out[key] = row[key]
+    review = _clean_html(row.get("daily_review"))
+    if review:
+        out["daily_review"] = review
+    return out
+
+
 def review_tonight_trades(date: str | None = None,
                           include_cancelled: bool = False) -> str:
-    """获取美东当日（或指定日期）Firstrade (FT) 交易流水与明细。
+    """获取美东当日（或指定日期）Firstrade (FT) 交易流水与当晚交易日志。
 
     从 `ftt_spread_trades`（垂直价差）和 `ftt_trades`（单腿期权）查询美东时间
-    当日开仓或平仓的交易记录，返回汇总统计与精简逐笔明细。
+    当日开仓或平仓的交易记录，并联合读取 `notes`（`daily_trade_note=true`）与
+    `trader_daily_log` 中的当晚交易日志，返回汇总统计、精简逐笔明细与日志文本。
 
     参数:
         date: 可选，美东目标日期 `YYYY-MM-DD`，默认取当前美东日期。
@@ -314,6 +372,8 @@ def review_tonight_trades(date: str | None = None,
 
     params = (start_utc, end_utc, start_utc, end_utc)
     all_trades: list[dict] = []
+    trade_notes: list[dict] = []
+    daily_log: dict | None = None
     data_gaps: list[str] = []
 
     try:
@@ -328,6 +388,25 @@ def review_tonight_trades(date: str | None = None,
     except Exception as exc:
         data_gaps.append(f"ftt_trades 查询失败: {exc}")
 
+    try:
+        note_rows = pg.query(_NOTES_SQL, (target_date.isoformat(), start_utc, end_utc))
+        for r in note_rows:
+            trade_notes.append({
+                "id": str(r["id"]),
+                "time_et": _fmt_et(r.get("created_at"), target_date),
+                "source": r.get("source"),
+                "content": _clean_html(r.get("content")),
+            })
+    except Exception as exc:
+        data_gaps.append(f"notes 查询失败: {exc}")
+
+    try:
+        daily_log = _normalize_daily_log(
+            pg.query_one(_DAILY_LOG_SQL, (target_date.isoformat(),))
+        )
+    except Exception as exc:
+        data_gaps.append(f"trader_daily_log 查询失败: {exc}")
+
     all_trades.sort(key=lambda t: (t.pop("_sort_ts", ""), t["id"]))
     cancelled_count = sum(1 for t in all_trades if t["status"] == "cancelled")
 
@@ -335,8 +414,12 @@ def review_tonight_trades(date: str | None = None,
         t for t in all_trades if t["status"] != "cancelled"
     ]
 
-    return json.dumps({
-        "summary": _summarize(all_trades, target_date, cancelled_count),
+    payload = {
+        "summary": _summarize(all_trades, target_date, cancelled_count, len(trade_notes)),
         "trades": visible,
+        "trade_notes": trade_notes,
         "data_gaps": data_gaps,
-    }, ensure_ascii=False)
+    }
+    if daily_log is not None:
+        payload["daily_log"] = daily_log
+    return json.dumps(payload, ensure_ascii=False)

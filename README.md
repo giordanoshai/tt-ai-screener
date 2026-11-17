@@ -149,7 +149,7 @@ The server exposes 40 tools.
 - `analyze_ticker` — deep-dive technical, fundamental, and catalyst analysis for one ticker
 - `detect_catalysts` — find recent company or market catalysts and whether the move already happened
 - `watch_positions` — monitor holdings for stop-loss, earnings, option flow, and breaking signals
-- `review_tonight_trades` — review US Eastern date (`America/New_York`) vertical spread and single-leg execution records with P&L and leg fill summary
+- `review_tonight_trades` — review US Eastern date (`America/New_York`) vertical spread and single-leg execution records with P&L, leg fill summary, and that night's trading journal notes
 
 ### Screening and watchlist tools
 

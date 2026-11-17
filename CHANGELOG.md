@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+### [2026-11-18] `review_tonight_trades` 联合返回当晚交易日志
+* **新增 (Added)**:
+  - [tools/review_tonight_trades.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tools/review_tonight_trades.py) 同步查询美东当日的 `notes`（`daily_trade_note=true`，兼容 `trade_date` 或美东时区 `created_at`）与 `trader_daily_log`（按 `log_date`），清洗 HTML 标签后通过 `trade_notes` 与可选 `daily_log` 返回，并在 `summary` 增加 `notes_count`。
+  - 在 [tests/test_review_tonight_trades.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tests/test_review_tonight_trades.py) 新增当晚交易日志、`trader_daily_log` 及 HTML 清洗测试。
+* **修改 (Changed)**:
+  - 更新 [AGENTS.md](file:///d:/Dev_project/Python_Project/tt-trading-mcp/AGENTS.md) 与 [README.md](file:///d:/Dev_project/Python_Project/tt-trading-mcp/README.md) 中 `review_tonight_trades` 的说明。
+
 ### [2026-11-18] 合并 `TTAiTradingSystem` 的 27 个 MCP 工具至 `tt-trading-mcp`
 * **新增 (Added)**:
   - 新增 [tools/_common.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tools/_common.py)，抽取 `dump_json`、`normalize_direction`、`calc_mfe_capture_rate`、`resolve_market` 等公共辅助函数。
