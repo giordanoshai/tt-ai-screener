@@ -9,6 +9,7 @@
 - [x] **Step 3**: 新增 `tools/journal_notes.py`（10 个工具：`get_recent_notes`、`get_daily_trade_notes`、`create_note`、`update_note`、`get_trader_daily_logs`、`create_or_update_trader_daily_log`、`get_trade_emotions`、`get_trading_rules`、`get_energy_schedules`、`get_activity_sessions`）。
 - [x] **Step 4**: 新增 `tools/market_context.py`（10 个工具：`get_latest_market_breadth`、`get_market_regime_history`、`get_daily_news_summary`、`search_stock_news`、`get_news_sentiment_summary`、`search_stocks_meta`、`get_stock_ohlcv`、`get_stock_fundamentals`、`get_system_logs`、`analyze_server_status`），全部满足 `test_sql_rules.py` 规矩。
 - [x] **Step 5**: 在 `server.py` 注册全部 40 个工具，补充单元测试与集成测试（`tests/test_merged_tools.py`），更新 `tests/test_main.py`、`AGENTS.md`、`README.md`、`CHANGELOG.md` 并执行测试验收。
+- [x] **Step 6**: 升级 `tools/trade_journal.py` 与 `tools/review_tonight_trades.py`，支持自动识别/合并垂直与日历价差双腿与单腿，补充短合约标识 `contract` 与 `spreads`/`singles` 汇总统计，并全面精简 `get_recent_trades`、`get_recent_trades_light` 与 `get_trade_details` 返回体以降低 token 消耗。
 
 ## 剔除的重复/旧版工具（不迁入）
 - `get_user_watchlist`、`add_to_watchlist`、`add_ticker_to_watchlist`、`remove_from_watchlist`：已由本仓库 `list_watchlist` / `add_to_watchlist` / `remove_from_watchlist` 覆盖。

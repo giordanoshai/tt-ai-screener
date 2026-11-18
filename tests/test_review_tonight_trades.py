@@ -37,6 +37,8 @@ def test_real_spread_trades_and_summary_math():
     assert summary["date_et"] == "2026-11-17"
     assert summary["tz"] == "America/New_York"
     assert summary["account"] == "FT"
+    assert summary["spreads"] + summary["singles"] == summary["count"]
+    assert summary["spreads"] >= 10
     assert len(trades) == summary["count"]
     assert len(trades) >= 10
 
@@ -47,6 +49,7 @@ def test_real_spread_trades_and_summary_math():
     # 当日单时间已精简为 HH:MM:SS，且不再逐笔重复 account/currency/false 字段
     first = trades[0]
     assert len(first["in_et"]) == 8
+    assert first.get("contract") and "/" in first["contract"]
     assert "prior_day" not in first
     assert "partial_close" not in first
     assert "legs_in" in first and "legs_out" in first
@@ -93,6 +96,7 @@ def test_real_single_leg_ftt_trades_included():
     assert "FT-1926" in ids
     single = next(t for t in out["trades"] if t["id"] == "FT-1926")
     assert single["kind"] == "single"
+    assert single["contract"] == "261106 738P"
     assert single["option_code"] == "SPY261106P00738000"
     assert "self_check" in single
 

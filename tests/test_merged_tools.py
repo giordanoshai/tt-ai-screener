@@ -26,17 +26,44 @@ def test_common_helpers():
 def test_trade_journal_reads_real_db():
     recent = json.loads(tj.get_recent_trades(limit=3))
     assert len(recent) == 3
-    first_id = recent[0]["display_id"]
+    first = recent[0]
+    first_id = first["display_id"]
+    assert first["kind"] in ("spread", "single")
+    assert first.get("contract")
+    assert "user_id" not in first
+    assert "ideal_plan" not in first
+
+    spread_trade = next((t for t in recent if t["kind"] == "spread"), None)
+    if spread_trade:
+        assert len(spread_trade["leg_ids"]) == 2
+        assert len(spread_trade["legs"]) == 2
+        assert spread_trade["combo_type"] in ("VERTICAL", "CALENDAR")
 
     light = json.loads(tj.get_recent_trades_light(limit=5, status="closed", direction="L"))
     assert "schema" in light and "rows" in light
+    assert "kind" in light["schema"] and "contract" in light["schema"]
     assert len(light["rows"]) <= 5
     assert all(r[2] == "L" for r in light["rows"])
+    flags_idx = light["schema"].index("deviation_flags")
+    assert all("NO_DEVIATION" not in r[flags_idx] for r in light["rows"])
 
     details = json.loads(tj.get_trade_details(str(first_id)))
     assert details["display_id"] == first_id
+    assert details["kind"] in ("spread", "single")
     assert "executions" in details
     assert "deviation_flags" in details
+    assert "NO_DEVIATION" not in details["deviation_flags"]
+    if details["kind"] == "spread" and details.get("leg_ids"):
+        other_leg_id = details["leg_ids"][1]
+        other_details = json.loads(tj.get_trade_details(str(other_leg_id)))
+        assert other_details["display_id"] == other_leg_id
+        assert set(other_details["leg_ids"]) == set(details["leg_ids"])
+        assert other_details["total_pnl"] == details["total_pnl"]
+
+    # 日历价差也能识别合并
+    ttd = json.loads(tj.get_recent_trades(limit=3, ticker="TTD"))
+    cal = next((t for t in ttd if t.get("combo_type") == "CALENDAR"), None)
+    assert cal is not None and cal["kind"] == "spread" and "/" in cal["contract"]
 
     templates = json.loads(tj.get_strategy_templates())
     assert isinstance(templates, list)

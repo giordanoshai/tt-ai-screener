@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+### [2026-11-18] 交易复盘工具支持识别/合并差价与单腿并全面精简返回体
+* **新增 (Added)**:
+  - 在 [tools/_common.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tools/_common.py) 新增 `parse_occ_code`、`short_option_contract`、`short_spread_contract`，将 OCC 长合约代码压缩为易读短串（如 `261117 652P/650P`、`261218/261113 15C`、`261106 738P`）。
+  - 在 [tools/trade_journal.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tools/trade_journal.py) 新增组合单自动识别与双腿合并逻辑：通过 `metrics.combo_info.parent_order_id` 合并 `VERTICAL` / `CALENDAR` 双腿为单一逻辑交易（按 `LONG_ASSET` / `SHORT_ASSET` 计算净入/出场价、净盈亏、净收益率与 R 倍数），同时兼容历史 `option_code` 斜杠差价记录与 `single` 单腿，并在查询条件修正按整体 `strategy_direction_view` 过滤方向。
+  - `get_trade_details` 新增支持传入任意一腿 `display_id`、UUID 或 `parent_order_id`，自动拉齐配对腿与全部 `executions`。
+  - 在 [tools/review_tonight_trades.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tools/review_tonight_trades.py) 的 `summary` 增加 `spreads` / `singles` 笔数统计，并在逐笔明细补充 `contract` 简称字段。
+* **修改 (Changed)**:
+  - 全面精简 `get_recent_trades`、`get_recent_trades_light` 与 `get_trade_details` 返回结构：剔除 `user_id`、`strategy_template_id`、冗长 `ideal_plan` 规则、11 板块 ETF 明细、`NO_DEVIATION` 占位标签、`indicator_history` 与原始面部特征点等低价值字段；`get_recent_trades_light` 的 `schema` 新增 `kind`（`vertical`/`calendar`/`single`）与 `contract`。
+  - 更新 [tests/test_merged_tools.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tests/test_merged_tools.py)、[tests/test_review_tonight_trades.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tests/test_review_tonight_trades.py)、[PLAN.md](file:///d:/Dev_project/Python_Project/tt-trading-mcp/PLAN.md)、[AGENTS.md](file:///d:/Dev_project/Python_Project/tt-trading-mcp/AGENTS.md) 与 [README.md](file:///d:/Dev_project/Python_Project/tt-trading-mcp/README.md)。
+
 ### [2026-11-18] `review_tonight_trades` 联合返回当晚交易日志
 * **新增 (Added)**:
   - [tools/review_tonight_trades.py](file:///d:/Dev_project/Python_Project/tt-trading-mcp/tools/review_tonight_trades.py) 同步查询美东当日的 `notes`（`daily_trade_note=true`，兼容 `trade_date` 或美东时区 `created_at`）与 `trader_daily_log`（按 `log_date`），清洗 HTML 标签后通过 `trade_notes` 与可选 `daily_log` 返回，并在 `summary` 增加 `notes_count`。

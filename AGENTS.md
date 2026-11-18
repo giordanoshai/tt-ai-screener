@@ -26,7 +26,7 @@ This is the canonical list of tools this server exposes (40 tools). Each tool ma
 | `analyze_ticker` | `ticker`(required), `horizon='both'` | 单独一只票的完整体检：日线趋势 + 小时线买卖点位（原 `get_hourly_setup` 并入这里）、基本面（仅中线档展开）、近两周新闻情绪、期权资金流向、**期权贵不贵（IV 排名）+ 期权量比 + 未平仓量变化**、gamma 墙、财报日、内部人买卖、国会交易（汇总 + 最近三笔）；A股换成主力资金、龙虎榜、板块强弱。走实时接口，取不到自动退回数据库缓存 |
 | `detect_catalysts` | `scope='positions'`, `hours=24`, `min_significance='Medium'` | 最近出了什么事，跟我的票有没有关系，股价反应过了没有（已经涨完的利好是风险，纹丝不动的利好才是机会）。一条新闻只算一个事件，不按命中的票数重复扇出；会标出是不是「大盘综述」并降低排序优先级。`scope`: `positions`/`watchlist`/`market`。另附一条大盘背景：全市场高管近 5 天是在买还是在卖 |
 | `watch_positions` | `hours=24` | 持仓上有没有需要立刻处理的信号：价格触发（跌破均线/止损、创20日新低）、财报临近、期权异动、突发消息，外加 UW 实时警报命中持仓的部分。**没事就说没事**，不制造噪音；同一只票的多笔期权异动合并成一条，不按笔数刷屏 |
-| `review_tonight_trades` | `date=None`, `include_cancelled=False` | 复盘美东当日（或指定美东日期 `YYYY-MM-DD`）Firstrade (`FT`) 交易记录：从 `ftt_spread_trades` 与 `ftt_trades` 联合拉取开平仓明细、每腿成交价、`total_pnl`、持仓时长、平仓原因、策略模板与 `self_check` 自检标记，并附带当晚交易日志（`notes.daily_trade_note=true` 与 `trader_daily_log`） |
+| `review_tonight_trades` | `date=None`, `include_cancelled=False` | 复盘美东当日（或指定美东日期 `YYYY-MM-DD`）Firstrade (`FT`) 交易记录：从 `ftt_spread_trades` 与 `ftt_trades` 联合拉取开平仓明细、每腿成交价、`contract` 短合约名、`summary` 含 `spreads`/`singles` 计数、`total_pnl`、持仓时长、平仓原因、策略模板与 `self_check` 自检标记，并附带当晚交易日志（`notes.daily_trade_note=true` 与 `trader_daily_log`） |
 
 ### Screening
 | Tool | Params | Description |
@@ -50,9 +50,9 @@ This is the canonical list of tools this server exposes (40 tools). Each tool ma
 ### 交易复盘与流水（由 TTAiTradingSystem 合并迁入，共 7 个）
 | Tool | Params | Description |
 |---|---|---|
-| `get_recent_trades` | `limit=10`, `status`, `start_date`, `end_date`, `trade_type`, `ticker`, `direction` | 查询 `trades` 最近交易记录（同一天仅保留首条 `daily_market_snapshot`） |
-| `get_recent_trades_light` | `limit=500`, ... | 极简 `schema+rows` 结构，含 `mfe_capture`、`deviation_flags`、`regime`、`review_note` |
-| `get_trade_details` | `trade_id`(required) | 按 `display_id` 或 UUID 查单笔交易全貌，附 `executions` 与偏差标签 |
+| `get_recent_trades` | `limit=10`, `status`, `start_date`, `end_date`, `trade_type`, `ticker`, `direction` | 查询 `trades` 最近交易记录，自动识别并合并垂直/日历价差双腿（附 `kind`/`combo_type`/`contract`/`legs`）并精简冗余字段（同日仅首条保留精简 `market`） |
+| `get_recent_trades_light` | `limit=500`, ... | 极简 `schema+rows` 结构，自动合并价差双腿，含 `kind`（`vertical`/`calendar`/`single`）、`contract`、过滤掉 `NO_DEVIATION` 的 `deviation_flags`、`mfe_capture`、`regime`、`review_note` |
+| `get_trade_details` | `trade_id`(required) | 按 `display_id`、UUID 或 `parent_order_id` 查单笔交易全貌，自动关联价差双腿，附精简版 `executions` 与偏差标签 |
 | `get_strategy_templates` | `only_active=True` | 查询 `strategy_templates` |
 | `get_strategy_signals` | `ticker`, `strategy_name`, `signal_quality`, `limit=50` | 查询 `strategy_signals` |
 | `get_option_ohlcv` | `option_code`(required), `start_time`, `end_time`, `limit=500` | 查询 `option_ohlcv_1min` |

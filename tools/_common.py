@@ -2,10 +2,61 @@
 """迁移工具共用的序列化、方向映射与市场推断辅助函数。"""
 from datetime import date, datetime, time
 import json
+import re
 import uuid
 
 import config
 from tools.hourly import _infer_market
+
+_OCC_OPTION_RE = re.compile(r"^([A-Z]+)\s*(\d{6})([CP])(\d{8})$")
+
+
+def parse_occ_code(code: str | None) -> tuple[str, str, str, str] | None:
+    """解析标准 OCC 期权代码，返回 (ticker, yymmdd, right, strike_str)。"""
+    if not code:
+        return None
+    m = _OCC_OPTION_RE.match(code.strip().upper())
+    if not m:
+        return None
+    strike = f"{int(m.group(4)) / 1000.0:g}"
+    return m.group(1), m.group(2), m.group(3), strike
+
+
+def short_option_contract(code: str | None, ticker: str | None = None) -> str | None:
+    """将 OCC 期权代码或历史组合代码压缩为易读短串（如 '261106 738P'）。"""
+    if not code:
+        return None
+    s = code.strip()
+    parsed = parse_occ_code(s)
+    if parsed:
+        _, exp, right, strike = parsed
+        return f"{exp} {strike}{right}"
+    if ticker and s.upper().startswith(ticker.strip().upper() + " "):
+        return s[len(ticker.strip()) + 1:].strip()
+    return s
+
+
+def short_spread_contract(
+    buy_code: str | None,
+    sell_code: str | None,
+    ticker: str | None = None,
+) -> str | None:
+    """将双腿合约压缩为紧凑价差简称（如 '261117 652P/650P' 或 '261218/261113 15C'）。"""
+    b = parse_occ_code(buy_code)
+    s = parse_occ_code(sell_code)
+    if b and s:
+        _, b_exp, b_right, b_strike = b
+        _, s_exp, s_right, s_strike = s
+        if b_exp == s_exp:
+            return f"{b_exp} {b_strike}{b_right}/{s_strike}{s_right}"
+        if b_strike == s_strike and b_right == s_right:
+            return f"{b_exp}/{s_exp} {b_strike}{b_right}"
+        return f"{b_exp} {b_strike}{b_right}/{s_exp} {s_strike}{s_right}"
+    parts = [p for p in (
+        short_option_contract(buy_code, ticker),
+        short_option_contract(sell_code, ticker),
+    ) if p]
+    return "/".join(parts) if parts else None
 
 
 def _json_default(obj):

@@ -20,6 +20,7 @@ import re
 from zoneinfo import ZoneInfo
 
 from db import pg
+from tools._common import short_option_contract, short_spread_contract
 
 ET_TZ = ZoneInfo("America/New_York")
 
@@ -237,6 +238,7 @@ def _normalize_spread(row: dict, target_date: date_cls) -> dict:
     raw_close_legs = combo.get("close_legs") or []
     item.update({
         "right": row.get("option_right"),
+        "contract": short_spread_contract(row.get("buy_code"), row.get("sell_code"), item["ticker"]),
         "buy": row.get("buy_code"),
         "sell": row.get("sell_code"),
         "width": row.get("width"),
@@ -261,6 +263,7 @@ def _normalize_single(row: dict, target_date: date_cls) -> dict:
         exit_price=row.get("exit_mid"),
         target_date=target_date,
     )
+    item["contract"] = short_option_contract(row.get("option_code"), item["ticker"])
     item["option_code"] = row.get("option_code")
     return item
 
@@ -270,6 +273,8 @@ def _summarize(all_trades: list[dict], target_date: date_cls,
     real_trades = [t for t in all_trades if t["status"] != "cancelled"]
     closed = [t for t in real_trades if t["status"] == "closed"]
     open_trades = [t for t in real_trades if t["status"] == "open"]
+    spreads = sum(1 for t in real_trades if t["kind"] == "spread")
+    singles = sum(1 for t in real_trades if t["kind"] == "single")
 
     pnls = [t["pnl"] for t in closed if t["pnl"] is not None]
     wins = sum(1 for p in pnls if p > 0)
@@ -321,6 +326,8 @@ def _summarize(all_trades: list[dict], target_date: date_cls,
         "account": "FT",
         "unit": "entry/exit per share (x100/contract); pnl in USD",
         "count": len(real_trades),
+        "spreads": spreads,
+        "singles": singles,
         "closed": len(closed),
         "open": len(open_trades),
         "cancelled": cancelled_count,
